@@ -1,0 +1,2 @@
+﻿inputs,total_elapsed_s,batches,batch_duration_median_s,batch_duration_p95_s,throughput_peak_per_min,errors_total
+app_log_2025-08-16T12-01-12.csv;app_log_2025-08-16T12-21-39.csv;app_log_2025-08-16T13-02-26.csv;app_log_2025-08-16T13-02-55.csv;app_log_2025-08-16T13-03-25.csv;app_log_2025-08-16T13-03-51.csv;app_log_2025-08-16T13-04-18.csv;app_log_2025-08-16T13-04-45.csv;app_log_2025-08-16T13-05-10.csv,27.0,5,5.0,14.899999999999949,,0

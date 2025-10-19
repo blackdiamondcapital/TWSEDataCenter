@@ -1,0 +1,64 @@
+backfill_missing_ranges started at 2025-10-10 17:57:40
+[17:57:40] 總共有 2084 檔股票需要檢查
+[17:57:40] 已掃描 100/2084 檔股票
+[17:57:40] 已掃描 200/2084 檔股票
+[17:57:40] 已掃描 300/2084 檔股票
+[17:57:40] 已掃描 400/2084 檔股票
+[17:57:41] 已掃描 500/2084 檔股票
+[17:57:41] 已掃描 600/2084 檔股票
+[17:57:41] 已掃描 700/2084 檔股票
+[17:57:41] 已掃描 800/2084 檔股票
+[17:57:41] 已掃描 900/2084 檔股票
+[17:57:41] 已掃描 1000/2084 檔股票
+[17:57:41] 已掃描 1100/2084 檔股票
+[17:57:41] 已掃描 1200/2084 檔股票
+[17:57:42] 已掃描 1300/2084 檔股票
+[17:57:42] 已掃描 1400/2084 檔股票
+[17:57:42] 已掃描 1500/2084 檔股票
+[17:57:42] 已掃描 1600/2084 檔股票
+[17:57:42] 已掃描 1700/2084 檔股票
+[17:57:42] 已掃描 1800/2084 檔股票
+[17:57:42] 已掃描 1900/2084 檔股票
+[17:57:42] 已掃描 2000/2084 檔股票
+[17:57:42] 已掃描 2084/2084 檔股票
+[17:57:42] 共發現 29729 個年份缺漏需要補抓
+[17:57:42] === 補抓 2010-01-01 ~ 2010-12-31 (1475 檔) ===
+[17:57:42] 批次 1/5952: ['006201.TWO', '006203.TW', '006204.TW', '006205.TW', '006206.TW']
+[17:57:42]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10636bb20>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:57:42]   ➜ 進度 1/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:57:44] 批次 2/5952: ['006207.TW', '006208.TW', '00636.TW', '00639.TW', '00643.TW']
+[17:57:44]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10636a4a0>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:57:44]   ➜ 進度 2/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:57:46] 批次 3/5952: ['00645.TW', '00646.TW', '00652.TW', '00657.TW', '00660.TW']
+[17:57:46]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10636a440>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:57:46]   ➜ 進度 3/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:57:48] 批次 4/5952: ['00661.TW', '00662.TW', '00668.TW', '00678.TW', '00690.TW']
+[17:57:48]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10636bbe0>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:57:48]   ➜ 進度 4/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:57:50] 批次 5/5952: ['00692.TW', '00700.TW', '00701.TW', '00702.TW', '00703.TW']
+[17:57:50]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10636a080>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:57:50]   ➜ 進度 5/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:57:52] 批次 6/5952: ['00709.TW', '00712.TW', '00713.TW', '00714.TW', '00717.TW']
+[17:57:52]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x1074a00a0>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:57:52]   ➜ 進度 6/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:57:54] 批次 7/5952: ['00728.TW', '00730.TW', '00731.TW', '00733.TW', '00735.TW']
+[17:57:54]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x1074a09d0>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:57:54]   ➜ 進度 7/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:57:56] 批次 8/5952: ['00736.TW', '00737.TW', '00739.TW', '00752.TW', '00757.TW']
+[17:57:56]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10636bbb0>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:57:56]   ➜ 進度 8/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:57:58] 批次 9/5952: ['00762.TW', '00770.TW', '00771.TW', '00783.TW', '00830.TW']
+[17:57:58]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10636a860>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:57:58]   ➜ 進度 9/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:58:00] 批次 10/5952: ['00850.TW', '00851.TW', '00858.TWO', '00861.TW', '00875.TW']
+[17:58:00]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x106369cf0>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:58:00]   ➜ 進度 10/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:58:02] 批次 11/5952: ['00876.TW', '00877.TWO', '00878.TW', '00881.TW', '00882.TW']
+[17:58:02]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x1074a0220>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:58:02]   ➜ 進度 11/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:58:04] 批次 12/5952: ['00885.TW', '00886.TWO', '00887.TWO', '00888.TWO', '00891.TW']
+[17:58:04]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10636a8c0>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:58:04]   ➜ 進度 12/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
+[17:58:07] 批次 13/5952: ['00892.TW', '00893.TW', '00894.TW', '00895.TW', '00896.TW']
+[17:58:07]   ✗ HTTP 請求錯誤：HTTPConnectionPool(host='localhost', port=5003): Max retries exceeded with url: /api/update (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x10636aa10>: Failed to establish a new connection: [Errno 61] Connection refused'))
+[17:58:07]   ➜ 進度 13/5952 批；成功 0 檔，跳過 0 檔，失敗 0 檔，累計寫入 0 筆
