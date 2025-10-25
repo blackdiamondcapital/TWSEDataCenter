@@ -1,0 +1,219 @@
+name: Weekly Full Refresh
+
+on:
+  schedule:
+    # 每週日 02:00 執行（UTC 時間 18:00 = 台北時間 02:00）
+    - cron: '0 18 * * 0'
+  
+  # 允許手動觸發
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  weekly-refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install psycopg2-binary requests pandas numpy beautifulsoup4 lxml
+    
+    - name: Weekly full data refresh
+      env:
+        NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+      run: |
+        python3 << 'PYTHON_SCRIPT'
+        import os
+        import sys
+        import time
+        import requests
+        import psycopg2
+        from psycopg2.extras import execute_values
+        from datetime import datetime, date, timedelta
+        
+        print("=" * 80)
+        print("🔄 開始執行每週完整資料回補任務")
+        print("=" * 80)
+        print(f"⏰ 執行時間：{datetime.now()}")
+        print()
+        
+        NEON_DB_URL = os.environ.get('NEON_DATABASE_URL')
+        
+        if not NEON_DB_URL:
+            print("❌ 錯誤：未設定 NEON_DATABASE_URL")
+            sys.exit(1)
+        
+        try:
+            conn = psycopg2.connect(NEON_DB_URL)
+            cur = conn.cursor()
+            print("✅ 已連接到 Neon 資料庫")
+            print()
+            
+        except Exception as e:
+            print(f"❌ 資料庫連線失敗：{e}")
+            sys.exit(1)
+        
+        def fetch_twse_data(target_date):
+            """抓取上市股票資料"""
+            date_str = target_date.strftime('%Y%m%d')
+            url = f'https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date_str}&type=ALLBUT0999'
+            
+            try:
+                response = requests.get(url, timeout=30)
+                data = response.json()
+                
+                if data.get('stat') != 'OK':
+                    return []
+                
+                records = []
+                for row in data.get('data9', []):
+                    try:
+                        symbol = row[0].strip()
+                        if not symbol.isdigit():
+                            continue
+                        
+                        open_price = float(row[5].replace(',', '')) if row[5] != '--' else None
+                        high_price = float(row[6].replace(',', '')) if row[6] != '--' else None
+                        low_price = float(row[7].replace(',', '')) if row[7] != '--' else None
+                        close_price = float(row[8].replace(',', '')) if row[8] != '--' else None
+                        volume = int(row[2].replace(',', '')) if row[2] != '--' else 0
+                        transaction_count = int(row[3].replace(',', '')) if row[3] != '--' else 0
+                        
+                        if close_price:
+                            records.append((
+                                symbol, target_date, open_price, high_price,
+                                low_price, close_price, volume, transaction_count
+                            ))
+                    except:
+                        continue
+                
+                return records
+            except:
+                return []
+        
+        def fetch_tpex_data(target_date):
+            """抓取上櫃股票資料"""
+            year = target_date.year - 1911
+            month = target_date.month
+            day = target_date.day
+            date_str = f'{year}/{month:02d}/{day:02d}'
+            
+            url = f'https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={date_str}&se=AL'
+            
+            try:
+                response = requests.get(url, timeout=30)
+                data = response.json()
+                
+                if data.get('aaData') is None:
+                    return []
+                
+                records = []
+                for row in data.get('aaData', []):
+                    try:
+                        symbol = row[0].strip()
+                        if not symbol.isdigit():
+                            continue
+                        
+                        close_price = float(row[2].replace(',', '')) if row[2] != '-' else None
+                        open_price = float(row[4].replace(',', '')) if row[4] != '-' else None
+                        high_price = float(row[5].replace(',', '')) if row[5] != '-' else None
+                        low_price = float(row[6].replace(',', '')) if row[6] != '-' else None
+                        volume = int(row[7].replace(',', '')) * 1000 if row[7] != '-' else 0
+                        
+                        if close_price:
+                            records.append((
+                                symbol, target_date, open_price, high_price,
+                                low_price, close_price, volume, 0
+                            ))
+                    except:
+                        continue
+                
+                return records
+            except:
+                return []
+        
+        # 回補過去 7 天的資料
+        try:
+            total_records = 0
+            end_date = date.today()
+            start_date = end_date - timedelta(days=7)
+            
+            print(f"📅 回補期間：{start_date} 至 {end_date}")
+            print()
+            
+            current_date = start_date
+            while current_date <= end_date:
+                print(f"📊 處理日期：{current_date}")
+                
+                # 抓取資料
+                twse_records = fetch_twse_data(current_date)
+                time.sleep(3)
+                tpex_records = fetch_tpex_data(current_date)
+                time.sleep(3)
+                
+                all_records = twse_records + tpex_records
+                
+                if all_records:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO stock_prices 
+                        (symbol, date, open_price, high_price, low_price, 
+                         close_price, volume, transaction_count)
+                        VALUES %s
+                        ON CONFLICT (symbol, date) 
+                        DO UPDATE SET
+                            open_price = EXCLUDED.open_price,
+                            high_price = EXCLUDED.high_price,
+                            low_price = EXCLUDED.low_price,
+                            close_price = EXCLUDED.close_price,
+                            volume = EXCLUDED.volume,
+                            transaction_count = EXCLUDED.transaction_count
+                        """,
+                        all_records
+                    )
+                    conn.commit()
+                    total_records += len(all_records)
+                    print(f"  ✅ 同步 {len(all_records)} 筆資料")
+                else:
+                    print(f"  ⚠️  無資料（非交易日）")
+                
+                current_date += timedelta(days=1)
+            
+            print()
+            print(f"✅ 回補完成！總計同步 {total_records} 筆資料")
+            print("=" * 80)
+            print("🎉 每週回補任務執行完成！")
+            print("=" * 80)
+            
+        except Exception as e:
+            print(f"❌ 執行過程發生錯誤：{e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+            
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+        PYTHON_SCRIPT
+    
+    - name: Send notification on failure
+      if: failure()
+      run: |
+        echo "❌ 每週回補失敗，請檢查日誌"
+        echo "Run ID: ${{ github.run_id }}"
