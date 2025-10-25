@@ -80,14 +80,9 @@ jobs:
             print("❌ 錯誤：未設定 NEON_DATABASE_URL")
             sys.exit(1)
         
-        try:
-            conn = psycopg2.connect(NEON_DB_URL)
-            cur = conn.cursor()
-            print("✅ 已連接到 Neon 資料庫", flush=True)
-            print(flush=True)
-        except Exception as e:
-            print(f"❌ 資料庫連線失敗：{e}")
-            sys.exit(1)
+        # 先不連線，等抓取完資料再連
+        conn = None
+        cur = None
         
         # 取得股票清單
         def get_stock_symbols():
@@ -257,8 +252,19 @@ jobs:
                 print("✅ 測試完成（無資料更新）")
                 sys.exit(0)
             
+            # 抓取完成後才連接資料庫
             print()
-            print(f"📦 準備同步 {len(all_records)} 筆資料到 Neon 資料庫...")
+            print("🔌 連接 Neon 資料庫...", flush=True)
+            try:
+                conn = psycopg2.connect(NEON_DB_URL)
+                cur = conn.cursor()
+                print("✅ 已連接到 Neon 資料庫", flush=True)
+            except Exception as e:
+                print(f"❌ 資料庫連線失敗：{e}")
+                sys.exit(1)
+            
+            print()
+            print(f"📦 準備同步 {len(all_records)} 筆資料到 Neon 資料庫...", flush=True)
             
             # 分批插入，每批 1000 筆
             batch_size = 1000
