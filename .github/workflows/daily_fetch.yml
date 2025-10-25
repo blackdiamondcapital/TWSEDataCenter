@@ -83,8 +83,9 @@ jobs:
             # 取得上市股票
             twse_symbols = []
             try:
+                print("  ⏳ 正在抓取上市股票清單（約需 15-30 秒）...")
                 url = 'https://isin.twse.com.tw/isin/C_public.jsp?strMode=2'
-                response = requests.get(url, headers=headers, timeout=30)
+                response = requests.get(url, headers=headers, timeout=60)
                 response.encoding = 'big5'
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
@@ -112,9 +113,16 @@ jobs:
                     cols = row.find_all('td')
                     if len(cols) >= 5:
                         code_name = cols[0].text.strip()
-                        if '\u3000' in code_name:
+                        security_type = cols[1].text.strip() if len(cols) > 1 else ''
+                        
+                        # 只取股票，排除 ETF、權證、債券等
+                        # 排除條件：包含 ETF、DR、TDR、認購、認售、債券、受益證券
+                        exclude_keywords = ['ETF', 'DR', 'TDR', '認購', '認售', '債券', '受益證券', '基金']
+                        is_excluded = any(keyword in security_type for keyword in exclude_keywords)
+                        
+                        if '\u3000' in code_name and not is_excluded:
                             parts = code_name.split('\u3000')
-                            if len(parts) == 2 and parts[0].isdigit():
+                            if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
                                 tpex_symbols.append(parts[0])
                 print(f"✅ 上櫃股票：{len(tpex_symbols)} 檔")
             except Exception as e:
@@ -152,10 +160,8 @@ jobs:
                             date_parts = row[0].split('/')
                             if len(date_parts) == 3:
                                 year_roc = int(date_parts[0]) + 1911
-                                month_val = int(date_parts[1])
                                 day_val = int(date_parts[2])
                                 trade_date = date(year_roc, month_val, day_val)
-                                
                                 # 只取目標日期
                                 if trade_date == target_date:
                                     volume = int(row[1].replace(',', '')) if row[1] != '--' else 0
@@ -163,17 +169,14 @@ jobs:
                                     high_price = float(row[4].replace(',', '')) if row[4] != '--' else None
                                     low_price = float(row[5].replace(',', '')) if row[5] != '--' else None
                                     close_price = float(row[6].replace(',', '')) if row[6] != '--' else None
-                                    transaction_count = int(row[8].replace(',', '')) if len(row) > 8 and row[8] != '--' else 0
                                     
                                     if close_price and 0 < close_price < 30000:
                                         return (symbol, target_date, open_price, high_price,
-                                                low_price, close_price, volume, transaction_count)
-                        except (ValueError, IndexError):
-                            continue
-            except:
-                pass
-            
-            return None
+                                                low_price, close_price, volume)
+                            except (ValueError, IndexError):
+                                continue
+                        except:
+                            pass
         
         # ========================================
         # 主要執行流程
@@ -253,29 +256,41 @@ jobs:
             print()
             print(f"📦 準備同步 {len(all_records)} 筆資料到 Neon 資料庫...")
             
-            # 4. 批次插入到 Neon 資料庫
-            execute_values(
-                cur,
-                """
-                INSERT INTO stock_prices 
-                (symbol, date, open_price, high_price, low_price, 
-                 close_price, volume, transaction_count)
-                VALUES %s
-                ON CONFLICT (symbol, date) 
-                DO UPDATE SET
-                    open_price = EXCLUDED.open_price,
-                    high_price = EXCLUDED.high_price,
-                    low_price = EXCLUDED.low_price,
-                    close_price = EXCLUDED.close_price,
-                    volume = EXCLUDED.volume,
-                    transaction_count = EXCLUDED.transaction_count
-                """,
-                all_records
-            )
+            # 4. 分批插入到 Neon 資料庫，每批 1000 筆
+            batch_size = 1000
+            total_inserted = 0
             
-            conn.commit()
+            for i in range(0, len(all_records), batch_size):
+                batch = all_records[i:i + batch_size]
+                
+                try:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO stock_prices 
+                        (symbol, date, open_price, high_price, low_price, 
+                         close_price, volume)
+                        VALUES %s
+                        ON CONFLICT (symbol, date) 
+                        DO UPDATE SET
+                            open_price = EXCLUDED.open_price,
+                            high_price = EXCLUDED.high_price,
+                            low_price = EXCLUDED.low_price,
+                            close_price = EXCLUDED.close_price,
+                            volume = EXCLUDED.volume
+                        """,
+                        batch
+                    )
+                    
+                    conn.commit()
+                    total_inserted += len(batch)
+                    print(f"  已同步: {total_inserted}/{len(all_records)} 筆")
+                    
+                except Exception as e:
+                    print(f"  ⚠️  批次 {i//batch_size + 1} 失敗: {e}")
+                    conn.rollback()
             
-            print(f"✅ 成功同步 {len(all_records)} 筆資料到 Neon")
+            print(f"✅ 成功同步 {total_inserted} 筆資料到 Neon")
             print()
             print("=" * 80)
             print("🎉 GitHub Actions 任務執行完成！")
