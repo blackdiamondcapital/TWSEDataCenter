@@ -52,17 +52,17 @@ jobs:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
         
-        print("=" * 80)
-        print("🧪 批次抓取歷史資料")
-        print("=" * 80)
+        print("=" * 80, flush=True)
+        print("🧪 批次抓取歷史資料", flush=True)
+        print("=" * 80, flush=True)
         
         start_date_str = os.environ.get('START_DATE')
         end_date_str = os.environ.get('END_DATE')
         start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
         end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
         
-        print(f"📅 日期範圍：{start_date} 至 {end_date}")
-        print(f"⏰ 執行時間：{datetime.now()}")
+        print(f"📅 日期範圍：{start_date} 至 {end_date}", flush=True)
+        print(f"⏰ 執行時間：{datetime.now()}", flush=True)
         
         # 計算日期範圍
         date_range = []
@@ -71,8 +71,8 @@ jobs:
             date_range.append(current)
             current += timedelta(days=1)
         
-        print(f"📆 共 {len(date_range)} 天")
-        print()
+        print(f"📆 共 {len(date_range)} 天", flush=True)
+        print(flush=True)
         
         NEON_DB_URL = os.environ.get('NEON_DATABASE_URL')
         
@@ -83,8 +83,8 @@ jobs:
         try:
             conn = psycopg2.connect(NEON_DB_URL)
             cur = conn.cursor()
-            print("✅ 已連接到 Neon 資料庫")
-            print()
+            print("✅ 已連接到 Neon 資料庫", flush=True)
+            print(flush=True)
         except Exception as e:
             print(f"❌ 資料庫連線失敗：{e}")
             sys.exit(1)
@@ -92,7 +92,7 @@ jobs:
         # 取得股票清單
         def get_stock_symbols():
             """取得上市上櫃股票清單"""
-            print("📋 取得股票清單...")
+            print("📋 取得股票清單...", flush=True)
             headers = {'User-Agent': 'Mozilla/5.0'}
             
             # 取得上市股票
@@ -111,7 +111,7 @@ jobs:
                             parts = code_name.split('\u3000')
                             if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
                                 twse_symbols.append(parts[0])
-                print(f"✅ 上市股票：{len(twse_symbols)} 檔")
+                print(f"✅ 上市股票：{len(twse_symbols)} 檔", flush=True)
             except Exception as e:
                 print(f"⚠️  無法取得上市清單: {e}")
             
@@ -131,7 +131,7 @@ jobs:
                             parts = code_name.split('\u3000')
                             if len(parts) == 2 and parts[0].isdigit():
                                 tpex_symbols.append(parts[0])
-                print(f"✅ 上櫃股票：{len(tpex_symbols)} 檔")
+                print(f"✅ 上櫃股票：{len(tpex_symbols)} 檔", flush=True)
             except Exception as e:
                 print(f"⚠️  無法取得上櫃清單: {e}")
             
@@ -210,8 +210,8 @@ jobs:
                 print("❌ 無法取得股票清單")
                 sys.exit(1)
             
-            print(f"\n📊 準備抓取 {len(all_symbols)} 檔股票，共 {len(date_range)} 天")
-            print()
+            print(f"\n📊 準備抓取 {len(all_symbols)} 檔股票，共 {len(date_range)} 天", flush=True)
+            print(flush=True)
             
             # 2. 使用併發抓取
             all_records = []
@@ -225,7 +225,7 @@ jobs:
                         all_records.extend(results)
                 return len(results)
             
-            print("📥 使用併發抓取（10 併發）...")
+            print("📥 使用併發抓取（10 併發）...", flush=True)
             success_stocks = 0
             total_records = 0
             
@@ -241,10 +241,10 @@ jobs:
                     
                     # 每100檔顯示進度
                     if i % 100 == 0:
-                        print(f"  進度: {i}/{len(all_symbols)}, 成功: {success_stocks} 檔, 資料: {total_records} 筆")
+                        print(f"  進度: {i}/{len(all_symbols)}, 成功: {success_stocks} 檔, 資料: {total_records} 筆", flush=True)
             
-            print(f"\n✅ 完成：{success_stocks} / {len(all_symbols)} 檔")
-            print(f"📦 總計抓取：{len(all_records)} 筆資料")
+            print(f"\n✅ 完成：{success_stocks} / {len(all_symbols)} 檔", flush=True)
+            print(f"📦 總計抓取：{len(all_records)} 筆資料", flush=True)
             
             if not all_records:
                 print("⚠️  無資料可同步（可能是非交易日）")
