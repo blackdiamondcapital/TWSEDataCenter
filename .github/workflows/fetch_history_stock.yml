@@ -129,8 +129,12 @@ jobs:
                         code_name = cols[0].text.strip()
                         security_type = cols[1].text.strip() if len(cols) > 1 else ''
                         
-                        # 只取股票，排除 ETF、權證等
-                        if '\u3000' in code_name and '股票' in security_type:
+                        # 只取股票，排除 ETF、權證、債券等
+                        # 排除條件：包含 ETF、DR、TDR、認購、認售、債券、受益證券
+                        exclude_keywords = ['ETF', 'DR', 'TDR', '認購', '認售', '債券', '受益證券', '基金']
+                        is_excluded = any(keyword in security_type for keyword in exclude_keywords)
+                        
+                        if '\u3000' in code_name and not is_excluded:
                             parts = code_name.split('\u3000')
                             if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
                                 tpex_symbols.append(parts[0])
@@ -187,12 +191,11 @@ jobs:
                                         high_price = float(row[4].replace(',', '')) if row[4] != '--' else None
                                         low_price = float(row[5].replace(',', '')) if row[5] != '--' else None
                                         close_price = float(row[6].replace(',', '')) if row[6] != '--' else None
-                                        transaction_count = int(row[8].replace(',', '')) if len(row) > 8 and row[8] != '--' else 0
                                         
                                         if close_price and 0 < close_price < 30000:
                                             results.append((
                                                 symbol, trade_date, open_price, high_price,
-                                                low_price, close_price, volume, transaction_count
+                                                low_price, close_price, volume
                                             ))
                             except (ValueError, IndexError):
                                 continue
@@ -262,7 +265,7 @@ jobs:
                 """
                 INSERT INTO stock_prices 
                 (symbol, date, open_price, high_price, low_price, 
-                 close_price, volume, transaction_count)
+                 close_price, volume)
                 VALUES %s
                 ON CONFLICT (symbol, date) 
                 DO UPDATE SET
@@ -270,8 +273,7 @@ jobs:
                     high_price = EXCLUDED.high_price,
                     low_price = EXCLUDED.low_price,
                     close_price = EXCLUDED.close_price,
-                    volume = EXCLUDED.volume,
-                    transaction_count = EXCLUDED.transaction_count
+                    volume = EXCLUDED.volume
                 """,
                 all_records
             )
