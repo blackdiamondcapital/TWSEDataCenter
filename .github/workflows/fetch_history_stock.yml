@@ -127,9 +127,12 @@ jobs:
                     cols = row.find_all('td')
                     if len(cols) >= 5:
                         code_name = cols[0].text.strip()
-                        if '\u3000' in code_name:
+                        security_type = cols[1].text.strip() if len(cols) > 1 else ''
+                        
+                        # 只取股票，排除 ETF、權證等
+                        if '\u3000' in code_name and '股票' in security_type:
                             parts = code_name.split('\u3000')
-                            if len(parts) == 2 and parts[0].isdigit():
+                            if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
                                 tpex_symbols.append(parts[0])
                 print(f"✅ 上櫃股票：{len(tpex_symbols)} 檔", flush=True)
             except Exception as e:
