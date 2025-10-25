@@ -260,27 +260,41 @@ jobs:
             print()
             print(f"📦 準備同步 {len(all_records)} 筆資料到 Neon 資料庫...")
             
-            execute_values(
-                cur,
-                """
-                INSERT INTO stock_prices 
-                (symbol, date, open_price, high_price, low_price, 
-                 close_price, volume)
-                VALUES %s
-                ON CONFLICT (symbol, date) 
-                DO UPDATE SET
-                    open_price = EXCLUDED.open_price,
-                    high_price = EXCLUDED.high_price,
-                    low_price = EXCLUDED.low_price,
-                    close_price = EXCLUDED.close_price,
-                    volume = EXCLUDED.volume
-                """,
-                all_records
-            )
+            # 分批插入，每批 1000 筆
+            batch_size = 1000
+            total_inserted = 0
             
-            conn.commit()
+            for i in range(0, len(all_records), batch_size):
+                batch = all_records[i:i + batch_size]
+                
+                try:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO stock_prices 
+                        (symbol, date, open_price, high_price, low_price, 
+                         close_price, volume)
+                        VALUES %s
+                        ON CONFLICT (symbol, date) 
+                        DO UPDATE SET
+                            open_price = EXCLUDED.open_price,
+                            high_price = EXCLUDED.high_price,
+                            low_price = EXCLUDED.low_price,
+                            close_price = EXCLUDED.close_price,
+                            volume = EXCLUDED.volume
+                        """,
+                        batch
+                    )
+                    
+                    conn.commit()
+                    total_inserted += len(batch)
+                    print(f"  已同步: {total_inserted}/{len(all_records)} 筆", flush=True)
+                    
+                except Exception as e:
+                    print(f"  ⚠️  批次 {i//batch_size + 1} 失敗: {e}")
+                    conn.rollback()
             
-            print(f"✅ 成功同步 {len(all_records)} 筆資料到 Neon")
+            print(f"✅ 成功同步 {total_inserted} 筆資料到 Neon")
             print()
             print("=" * 80)
             print("🎉 測試完成！")
