@@ -1,12 +1,16 @@
-name: Test Fetch Historical Data
+name: Fetch Historical Data Range
 
 on:
   workflow_dispatch:
     inputs:
-      target_date:
-        description: '目標日期 (YYYY-MM-DD)'
+      start_date:
+        description: '開始日期 (YYYY-MM-DD)'
         required: true
-        default: '2025-10-24'
+        default: '2025-10-01'
+      end_date:
+        description: '結束日期 (YYYY-MM-DD)'
+        required: true
+        default: '2025-10-25'
 
 env:
   TZ: Asia/Taipei
@@ -14,14 +18,14 @@ env:
 jobs:
   test-fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60  # 支援日期範圍抓取，需要更多時間
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
     
@@ -33,7 +37,8 @@ jobs:
     - name: Fetch historical data
       env:
         NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-        TARGET_DATE: ${{ github.event.inputs.target_date }}
+        START_DATE: ${{ github.event.inputs.start_date }}
+        END_DATE: ${{ github.event.inputs.end_date }}
       run: |
         python3 << 'PYTHON_SCRIPT'
         import os
@@ -42,17 +47,31 @@ jobs:
         import requests
         import psycopg2
         from psycopg2.extras import execute_values
-        from datetime import datetime, date
+        from datetime import datetime, date, timedelta
+        from bs4 import BeautifulSoup
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
         
         print("=" * 80)
-        print("🧪 測試抓取歷史資料")
+        print("🧪 批次抓取歷史資料")
         print("=" * 80)
         
-        target_date_str = os.environ.get('TARGET_DATE')
-        target_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+        start_date_str = os.environ.get('START_DATE')
+        end_date_str = os.environ.get('END_DATE')
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
         
-        print(f"📅 目標日期：{target_date}")
+        print(f"📅 日期範圍：{start_date} 至 {end_date}")
         print(f"⏰ 執行時間：{datetime.now()}")
+        
+        # 計算日期範圍
+        date_range = []
+        current = start_date
+        while current <= end_date:
+            date_range.append(current)
+            current += timedelta(days=1)
+        
+        print(f"📆 共 {len(date_range)} 天")
         print()
         
         NEON_DB_URL = os.environ.get('NEON_DATABASE_URL')
@@ -70,105 +89,162 @@ jobs:
             print(f"❌ 資料庫連線失敗：{e}")
             sys.exit(1)
         
-        def fetch_twse_data(target_date):
-            """抓取上市股票資料"""
-            print("📊 開始抓取上市股票資料 (TWSE)...")
+        # 取得股票清單
+        def get_stock_symbols():
+            """取得上市上櫃股票清單"""
+            print("📋 取得股票清單...")
+            headers = {'User-Agent': 'Mozilla/5.0'}
             
-            date_str = target_date.strftime('%Y%m%d')
-            url = f'https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date_str}&type=ALLBUT0999'
-            
+            # 取得上市股票
+            twse_symbols = []
             try:
-                response = requests.get(url, timeout=30)
-                response.raise_for_status()
-                data = response.json()
+                url = 'https://isin.twse.com.tw/isin/C_public.jsp?strMode=2'
+                response = requests.get(url, headers=headers, timeout=30)
+                response.encoding = 'big5'
+                soup = BeautifulSoup(response.text, 'html.parser')
                 
-                if data.get('stat') != 'OK':
-                    print(f"⚠️  上市股票資料尚未公布或非交易日")
-                    return []
-                
-                records = []
-                for row in data.get('data9', []):
-                    try:
-                        symbol = row[0].strip()
-                        if not symbol.isdigit():
-                            continue
-                        
-                        open_price = float(row[5].replace(',', '')) if row[5] != '--' else None
-                        high_price = float(row[6].replace(',', '')) if row[6] != '--' else None
-                        low_price = float(row[7].replace(',', '')) if row[7] != '--' else None
-                        close_price = float(row[8].replace(',', '')) if row[8] != '--' else None
-                        volume = int(row[2].replace(',', '')) if row[2] != '--' else 0
-                        transaction_count = int(row[3].replace(',', '')) if row[3] != '--' else 0
-                        
-                        if close_price:
-                            records.append((
-                                symbol, target_date, open_price, high_price,
-                                low_price, close_price, volume, transaction_count
-                            ))
-                    except (ValueError, IndexError):
-                        continue
-                
-                print(f"✅ 上市股票：成功抓取 {len(records)} 筆資料")
-                return records
-                
+                for row in soup.find_all('tr'):
+                    cols = row.find_all('td')
+                    if len(cols) >= 5:
+                        code_name = cols[0].text.strip()
+                        if '\u3000' in code_name:
+                            parts = code_name.split('\u3000')
+                            if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
+                                twse_symbols.append(parts[0])
+                print(f"✅ 上市股票：{len(twse_symbols)} 檔")
             except Exception as e:
-                print(f"❌ 抓取上市股票資料失敗：{e}")
-                return []
+                print(f"⚠️  無法取得上市清單: {e}")
+            
+            # 取得上櫃股票  
+            tpex_symbols = []
+            try:
+                url = 'https://isin.twse.com.tw/isin/C_public.jsp?strMode=4'
+                response = requests.get(url, headers=headers, timeout=30)
+                response.encoding = 'big5'
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                for row in soup.find_all('tr'):
+                    cols = row.find_all('td')
+                    if len(cols) >= 5:
+                        code_name = cols[0].text.strip()
+                        if '\u3000' in code_name:
+                            parts = code_name.split('\u3000')
+                            if len(parts) == 2 and parts[0].isdigit():
+                                tpex_symbols.append(parts[0])
+                print(f"✅ 上櫃股票：{len(tpex_symbols)} 檔")
+            except Exception as e:
+                print(f"⚠️  無法取得上櫃清單: {e}")
+            
+            return twse_symbols, tpex_symbols
         
-        def fetch_tpex_data(target_date):
-            """抓取上櫃股票資料"""
-            print("📊 開始抓取上櫃股票資料 (TPEX)...")
+        # 抓取單檔股票在日期範圍內的資料
+        def fetch_stock_range_data(symbol, target_dates):
+            """抓取單檔股票在指定日期範圍內的資料"""
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            results = []
             
-            year = target_date.year - 1911
-            month = target_date.month
-            day = target_date.day
-            date_str = f'{year}/{month:02d}/{day:02d}'
+            # 按月份分組日期
+            months_to_fetch = {}
+            for d in target_dates:
+                month_key = (d.year, d.month)
+                if month_key not in months_to_fetch:
+                    months_to_fetch[month_key] = []
+                months_to_fetch[month_key].append(d)
             
-            url = f'https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={date_str}&se=AL'
-            
-            try:
-                response = requests.get(url, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                
-                if data.get('aaData') is None:
-                    print(f"⚠️  上櫃股票資料尚未公布或非交易日")
-                    return []
-                
-                records = []
-                for row in data.get('aaData', []):
-                    try:
-                        symbol = row[0].strip()
-                        if not symbol.isdigit():
-                            continue
-                        
-                        close_price = float(row[2].replace(',', '')) if row[2] != '-' else None
-                        open_price = float(row[4].replace(',', '')) if row[4] != '-' else None
-                        high_price = float(row[5].replace(',', '')) if row[5] != '-' else None
-                        low_price = float(row[6].replace(',', '')) if row[6] != '-' else None
-                        volume = int(row[7].replace(',', '')) * 1000 if row[7] != '-' else 0
-                        
-                        if close_price:
-                            records.append((
-                                symbol, target_date, open_price, high_price,
-                                low_price, close_price, volume, 0
-                            ))
-                    except (ValueError, IndexError):
+            # 逐月抓取
+            for (year, month), dates in months_to_fetch.items():
+                try:
+                    url = 'https://www.twse.com.tw/exchangeReport/STOCK_DAY'
+                    params = {
+                        'response': 'json',
+                        'date': f'{year}{month:02d}01',
+                        'stockNo': symbol
+                    }
+                    
+                    response = requests.get(url, params=params, headers=headers, timeout=10)
+                    if response.status_code != 200:
                         continue
-                
-                print(f"✅ 上櫃股票：成功抓取 {len(records)} 筆資料")
-                return records
-                
-            except Exception as e:
-                print(f"❌ 抓取上櫃股票資料失敗：{e}")
-                return []
+                    
+                    data = response.json()
+                    if data.get('stat') == 'OK' and data.get('data'):
+                        for row in data['data']:
+                            try:
+                                # 解析日期
+                                date_parts = row[0].split('/')
+                                if len(date_parts) == 3:
+                                    year_roc = int(date_parts[0]) + 1911
+                                    month_val = int(date_parts[1])
+                                    day_val = int(date_parts[2])
+                                    trade_date = date(year_roc, month_val, day_val)
+                                    
+                                    # 只取目標日期範圍內的資料
+                                    if trade_date in dates:
+                                        volume = int(row[1].replace(',', '')) if row[1] != '--' else 0
+                                        open_price = float(row[3].replace(',', '')) if row[3] != '--' else None
+                                        high_price = float(row[4].replace(',', '')) if row[4] != '--' else None
+                                        low_price = float(row[5].replace(',', '')) if row[5] != '--' else None
+                                        close_price = float(row[6].replace(',', '')) if row[6] != '--' else None
+                                        transaction_count = int(row[8].replace(',', '')) if len(row) > 8 and row[8] != '--' else 0
+                                        
+                                        if close_price and 0 < close_price < 30000:
+                                            results.append((
+                                                symbol, trade_date, open_price, high_price,
+                                                low_price, close_price, volume, transaction_count
+                                            ))
+                            except (ValueError, IndexError):
+                                continue
+                    
+                    time.sleep(0.3)
+                    
+                except:
+                    pass
+            
+            return results
         
         try:
-            twse_records = fetch_twse_data(target_date)
-            time.sleep(3)
-            tpex_records = fetch_tpex_data(target_date)
+            # 1. 取得股票清單
+            twse_symbols, tpex_symbols = get_stock_symbols()
+            all_symbols = twse_symbols + tpex_symbols
             
-            all_records = twse_records + tpex_records
+            if not all_symbols:
+                print("❌ 無法取得股票清單")
+                sys.exit(1)
+            
+            print(f"\n📊 準備抓取 {len(all_symbols)} 檔股票，共 {len(date_range)} 天")
+            print()
+            
+            # 2. 使用併發抓取
+            all_records = []
+            lock = threading.Lock()
+            
+            def fetch_and_collect(symbol):
+                """併發抓取單檔股票"""
+                results = fetch_stock_range_data(symbol, date_range)
+                if results:
+                    with lock:
+                        all_records.extend(results)
+                return len(results)
+            
+            print("📥 使用併發抓取（10 併發）...")
+            success_stocks = 0
+            total_records = 0
+            
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {executor.submit(fetch_and_collect, symbol): symbol 
+                          for symbol in all_symbols}
+                
+                for i, future in enumerate(as_completed(futures), 1):
+                    count = future.result()
+                    if count > 0:
+                        success_stocks += 1
+                        total_records += count
+                    
+                    # 每100檔顯示進度
+                    if i % 100 == 0:
+                        print(f"  進度: {i}/{len(all_symbols)}, 成功: {success_stocks} 檔, 資料: {total_records} 筆")
+            
+            print(f"\n✅ 完成：{success_stocks} / {len(all_symbols)} 檔")
+            print(f"📦 總計抓取：{len(all_records)} 筆資料")
             
             if not all_records:
                 print("⚠️  無資料可同步（可能是非交易日）")
