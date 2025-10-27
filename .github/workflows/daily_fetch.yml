@@ -34,8 +34,9 @@ jobs:
     - name: Fetch stock data and sync to Neon
       env:
         NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        PYTHONUNBUFFERED: 1
       run: |
-        python3 << 'PYTHON_SCRIPT'
+        python3 -u << 'PYTHON_SCRIPT'
         import os
         import sys
         import time
@@ -47,12 +48,16 @@ jobs:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
         
-        print("=" * 80)
-        print("🚀 開始執行 GitHub Actions 股價資料抓取任務")
-        print("=" * 80)
-        print(f"⏰ 執行時間：{datetime.now()}")
-        print(f"📅 目標日期：{date.today()}")
-        print()
+        # 強制即時輸出
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        print("=" * 80, flush=True)
+        print("🚀 開始執行 GitHub Actions 股價資料抓取任務", flush=True)
+        print("=" * 80, flush=True)
+        print(f"⏰ 執行時間：{datetime.now()}", flush=True)
+        print(f"📅 目標日期：{date.today()}", flush=True)
+        print(flush=True)
         
         # 連接 Neon 資料庫
         NEON_DB_URL = os.environ.get('NEON_DATABASE_URL')
@@ -63,13 +68,14 @@ jobs:
             sys.exit(1)
         
         try:
+            print("🔌 正在連接 Neon 資料庫...", flush=True)
             conn = psycopg2.connect(NEON_DB_URL)
             cur = conn.cursor()
-            print("✅ 已連接到 Neon 資料庫")
-            print()
+            print("✅ 已連接到 Neon 資料庫", flush=True)
+            print(flush=True)
             
         except Exception as e:
-            print(f"❌ 資料庫連線失敗：{e}")
+            print(f"❌ 資料庫連線失敗：{e}", flush=True)
             sys.exit(1)
         
         # ========================================
@@ -77,13 +83,13 @@ jobs:
         # ========================================
         def get_stock_symbols():
             """取得上市上櫃股票清單"""
-            print("📋 取得股票清單...")
+            print("📋 取得股票清單...", flush=True)
             headers = {'User-Agent': 'Mozilla/5.0'}
             
             # 取得上市股票
             twse_symbols = []
             try:
-                print("  ⏳ 正在抓取上市股票清單（約需 15-30 秒）...")
+                print("  ⏳ 正在抓取上市股票清單（約需 15-30 秒）...", flush=True)
                 url = 'https://isin.twse.com.tw/isin/C_public.jsp?strMode=2'
                 response = requests.get(url, headers=headers, timeout=60)
                 response.encoding = 'big5'
@@ -97,9 +103,9 @@ jobs:
                             parts = code_name.split('\u3000')
                             if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
                                 twse_symbols.append(parts[0])
-                print(f"✅ 上市股票：{len(twse_symbols)} 檔")
+                print(f"✅ 上市股票：{len(twse_symbols)} 檔", flush=True)
             except Exception as e:
-                print(f"⚠️  無法取得上市清單: {e}")
+                print(f"⚠️  無法取得上市清單: {e}", flush=True)
             
             # 取得上櫃股票  
             tpex_symbols = []
@@ -213,7 +219,7 @@ jobs:
                 time.sleep(0.3)
                 return result is not None
             
-            print("📥 使用併發抓取上市股票（10 併發）...")
+            print("📥 使用併發抓取上市股票（10 併發）...", flush=True)
             success_count = 0
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {executor.submit(fetch_and_collect, symbol, True): symbol 
@@ -223,15 +229,17 @@ jobs:
                     if future.result():
                         success_count += 1
                     
-                    if i % 100 == 0:
-                        print(f"  進度: {i}/{len(twse_symbols)}, 成功: {success_count}")
+                    # 每50檔顯示一次進度
+                    if i % 50 == 0 or i == len(twse_symbols):
+                        print(f"  進度: {i}/{len(twse_symbols)}, 成功: {success_count}", flush=True)
+                        sys.stdout.flush()
             
-            print(f"✅ 上市股票完成：{success_count} / {len(twse_symbols)} 檔")
+            print(f"✅ 上市股票完成：{success_count} / {len(twse_symbols)} 檔", flush=True)
             
             twse_count = success_count
             success_count = 0
             
-            print("\n📥 使用併發抓取上櫃股票（10 併發）...")
+            print("\n📥 使用併發抓取上櫃股票（10 併發）...", flush=True)
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {executor.submit(fetch_and_collect, symbol, False): symbol 
                           for symbol in tpex_symbols}
@@ -240,11 +248,13 @@ jobs:
                     if future.result():
                         success_count += 1
                     
-                    if i % 100 == 0:
-                        print(f"  進度: {i}/{len(tpex_symbols)}, 成功: {success_count}")
+                    # 每50檔顯示一次進度
+                    if i % 50 == 0 or i == len(tpex_symbols):
+                        print(f"  進度: {i}/{len(tpex_symbols)}, 成功: {success_count}", flush=True)
+                        sys.stdout.flush()
             
-            print(f"✅ 上櫃股票完成：{success_count} / {len(tpex_symbols)} 檔")
-            print(f"\n📦 總計抓取：{len(all_records)} 筆資料")
+            print(f"✅ 上櫃股票完成：{success_count} / {len(tpex_symbols)} 檔", flush=True)
+            print(f"\n📦 總計抓取：{len(all_records)} 筆資料", flush=True)
             
             # 3. 檢查是否有資料
             if not all_records:
@@ -283,17 +293,18 @@ jobs:
                     
                     conn.commit()
                     total_inserted += len(batch)
-                    print(f"  已同步: {total_inserted}/{len(all_records)} 筆")
+                    print(f"  已同步: {total_inserted}/{len(all_records)} 筆", flush=True)
+                    sys.stdout.flush()
                     
                 except Exception as e:
-                    print(f"  ⚠️  批次 {i//batch_size + 1} 失敗: {e}")
+                    print(f"  ⚠️  批次 {i//batch_size + 1} 失敗: {e}", flush=True)
                     conn.rollback()
             
-            print(f"✅ 成功同步 {total_inserted} 筆資料到 Neon")
-            print()
-            print("=" * 80)
-            print("🎉 GitHub Actions 任務執行完成！")
-            print("=" * 80)
+            print(f"✅ 成功同步 {total_inserted} 筆資料到 Neon", flush=True)
+            print(flush=True)
+            print("=" * 80, flush=True)
+            print("🎉 GitHub Actions 任務執行完成！", flush=True)
+            print("=" * 80, flush=True)
             
         except Exception as e:
             print(f"❌ 執行過程發生錯誤：{e}")
