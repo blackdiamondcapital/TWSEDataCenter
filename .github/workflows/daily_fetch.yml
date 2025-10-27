@@ -138,50 +138,91 @@ jobs:
         # ========================================
         # 函數：抓取單檔股票資料
         # ========================================
-        def fetch_stock_month_data(symbol, target_date, is_twse=True):
-            """抓取單檔股票當月資料"""
+        def fetch_stock_data_single_day(symbol, target_date, is_twse=True):
+            """抓取單檔股票單日資料"""
             year = target_date.year
             month = target_date.month
-            
-            url = 'https://www.twse.com.tw/exchangeReport/STOCK_DAY'
-            params = {
-                'response': 'json',
-                'date': f'{year}{month:02d}01',
-                'stockNo': symbol
-            }
+            day = target_date.day
             
             headers = {'User-Agent': 'Mozilla/5.0'}
             
             try:
-                response = requests.get(url, params=params, headers=headers, timeout=10)
-                if response.status_code != 200:
-                    return None
-                
-                data = response.json()
-                if data.get('stat') == 'OK' and data.get('data'):
-                    for row in data['data']:
-                        try:
-                            # 解析日期
-                            date_parts = row[0].split('/')
-                            if len(date_parts) == 3:
-                                year_roc = int(date_parts[0]) + 1911
-                                month_val = int(date_parts[1])
-                                day_val = int(date_parts[2])
-                                trade_date = date(year_roc, month_val, day_val)
-                                
-                                # 只取目標日期
-                                if trade_date == target_date:
-                                    volume = int(row[1].replace(',', '')) if row[1] != '--' else 0
-                                    open_price = float(row[3].replace(',', '')) if row[3] != '--' else None
-                                    high_price = float(row[4].replace(',', '')) if row[4] != '--' else None
-                                    low_price = float(row[5].replace(',', '')) if row[5] != '--' else None
-                                    close_price = float(row[6].replace(',', '')) if row[6] != '--' else None
+                if is_twse:
+                    # 上市：使用月資料 API
+                    url = 'https://www.twse.com.tw/exchangeReport/STOCK_DAY'
+                    params = {
+                        'response': 'json',
+                        'date': f'{year}{month:02d}01',
+                        'stockNo': symbol
+                    }
+                    
+                    response = requests.get(url, params=params, headers=headers, timeout=10)
+                    if response.status_code != 200:
+                        return None
+                    
+                    data = response.json()
+                    if data.get('stat') == 'OK' and data.get('data'):
+                        for row in data['data']:
+                            try:
+                                date_parts = row[0].split('/')
+                                if len(date_parts) == 3:
+                                    year_roc = int(date_parts[0]) + 1911
+                                    month_val = int(date_parts[1])
+                                    day_val = int(date_parts[2])
+                                    trade_date = date(year_roc, month_val, day_val)
                                     
-                                    if close_price and 0 < close_price < 30000:
-                                        return (symbol, target_date, open_price, high_price,
-                                                low_price, close_price, volume)
-                        except (ValueError, IndexError):
-                            continue
+                                    if trade_date == target_date:
+                                        volume = int(row[1].replace(',', '')) if row[1] != '--' else 0
+                                        open_price = float(row[3].replace(',', '')) if row[3] != '--' else None
+                                        high_price = float(row[4].replace(',', '')) if row[4] != '--' else None
+                                        low_price = float(row[5].replace(',', '')) if row[5] != '--' else None
+                                        close_price = float(row[6].replace(',', '')) if row[6] != '--' else None
+                                        
+                                        if close_price and 0 < close_price < 30000:
+                                            return (symbol, target_date, open_price, high_price,
+                                                    low_price, close_price, volume)
+                            except (ValueError, IndexError):
+                                continue
+                else:
+                    # 上櫃：使用日資料 API（正確的 API）
+                    roc_date = f'{year-1911}/{month:02d}/{day:02d}'
+                    url = 'https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php'
+                    params = {
+                        'l': 'zh-tw',
+                        'd': roc_date,
+                        'se': 'AL'
+                    }
+                    
+                    response = requests.get(url, params=params, headers=headers, timeout=10)
+                    if response.status_code != 200:
+                        return None
+                    
+                    data = response.json()
+                    
+                    # 檢查 tables 格式（上櫃 API 返回格式）
+                    if data.get('tables') and len(data['tables']) > 0:
+                        table_data = data['tables'][0].get('data', [])
+                        
+                        for row in table_data:
+                            try:
+                                stock_symbol = row[0].strip()
+                                if stock_symbol != symbol:
+                                    continue
+                                
+                                # row[0]=代號, row[1]=名稱, row[2]=收盤, row[3]=漲跌
+                                # row[4]=開盤, row[5]=最高, row[6]=最低, row[7]=成交量
+                                close_price = float(row[2].replace(',', '')) if row[2] not in ['-', '----', ''] else None
+                                open_price = float(row[4].replace(',', '')) if row[4] not in ['-', '----', ''] else None
+                                high_price = float(row[5].replace(',', '')) if row[5] not in ['-', '----', ''] else None
+                                low_price = float(row[6].replace(',', '')) if row[6] not in ['-', '----', ''] else None
+                                volume = int(row[7].replace(',', '')) if row[7] not in ['-', '0', ''] else 0
+                                
+                                if close_price and 0 < close_price < 30000:
+                                    return (symbol, target_date, open_price, high_price,
+                                            low_price, close_price, volume)
+                            except (ValueError, IndexError):
+                                continue
+                            
             except Exception:
                 pass
             
@@ -212,7 +253,7 @@ jobs:
             
             def fetch_and_collect(symbol, is_twse):
                 """併發抓取單檔股票"""
-                result = fetch_stock_month_data(symbol, today, is_twse)
+                result = fetch_stock_data_single_day(symbol, today, is_twse)
                 if result:
                     with lock:
                         all_records.append(result)
@@ -258,12 +299,24 @@ jobs:
             
             # 3. 檢查是否有資料
             if not all_records:
-                print("⚠️  今日無資料可同步（可能是非交易日或資料尚未公布）")
-                print("✅ 任務完成（無資料更新）")
+                print("⚠️  今日無資料可同步（可能是非交易日或資料尚未公布）", flush=True)
+                print("✅ 任務完成（無資料更新）", flush=True)
                 sys.exit(0)
             
-            print()
-            print(f"📦 準備同步 {len(all_records)} 筆資料到 Neon 資料庫...")
+            print(flush=True)
+            print(f"📦 準備同步 {len(all_records)} 筆資料到 Neon 資料庫...", flush=True)
+            
+            # 重新連接資料庫（避免超時）
+            try:
+                cur.close()
+                conn.close()
+                print("🔄 重新連接資料庫...", flush=True)
+                conn = psycopg2.connect(NEON_DB_URL)
+                cur = conn.cursor()
+                print("✅ 資料庫重新連接成功", flush=True)
+            except Exception as e:
+                print(f"❌ 重新連接失敗：{e}", flush=True)
+                sys.exit(1)
             
             # 4. 分批插入到 Neon 資料庫
             batch_size = 1000
