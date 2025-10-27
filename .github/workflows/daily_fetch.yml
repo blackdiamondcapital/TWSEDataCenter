@@ -14,7 +14,7 @@ env:
 jobs:
   fetch-stock-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # 使用 10 併發，預計 10 分鐘內完成
+    timeout-minutes: 30
     
     steps:
     - name: Checkout code
@@ -116,7 +116,6 @@ jobs:
                         security_type = cols[1].text.strip() if len(cols) > 1 else ''
                         
                         # 只取股票，排除 ETF、權證、債券等
-                        # 排除條件：包含 ETF、DR、TDR、認購、認售、債券、受益證券
                         exclude_keywords = ['ETF', 'DR', 'TDR', '認購', '認售', '債券', '受益證券', '基金']
                         is_excluded = any(keyword in security_type for keyword in exclude_keywords)
                         
@@ -160,8 +159,10 @@ jobs:
                             date_parts = row[0].split('/')
                             if len(date_parts) == 3:
                                 year_roc = int(date_parts[0]) + 1911
+                                month_val = int(date_parts[1])
                                 day_val = int(date_parts[2])
                                 trade_date = date(year_roc, month_val, day_val)
+                                
                                 # 只取目標日期
                                 if trade_date == target_date:
                                     volume = int(row[1].replace(',', '')) if row[1] != '--' else 0
@@ -173,10 +174,12 @@ jobs:
                                     if close_price and 0 < close_price < 30000:
                                         return (symbol, target_date, open_price, high_price,
                                                 low_price, close_price, volume)
-                            except (ValueError, IndexError):
-                                continue
-                        except:
-                            pass
+                        except (ValueError, IndexError):
+                            continue
+            except Exception:
+                pass
+            
+            return None
         
         # ========================================
         # 主要執行流程
@@ -207,7 +210,7 @@ jobs:
                 if result:
                     with lock:
                         all_records.append(result)
-                time.sleep(0.3)  # 減少延遲，因為有併發控制
+                time.sleep(0.3)
                 return result is not None
             
             print("📥 使用併發抓取上市股票（10 併發）...")
@@ -220,7 +223,6 @@ jobs:
                     if future.result():
                         success_count += 1
                     
-                    # 每100檔顯示進度
                     if i % 100 == 0:
                         print(f"  進度: {i}/{len(twse_symbols)}, 成功: {success_count}")
             
@@ -238,7 +240,6 @@ jobs:
                     if future.result():
                         success_count += 1
                     
-                    # 每100檔顯示進度
                     if i % 100 == 0:
                         print(f"  進度: {i}/{len(tpex_symbols)}, 成功: {success_count}")
             
@@ -246,8 +247,6 @@ jobs:
             print(f"\n📦 總計抓取：{len(all_records)} 筆資料")
             
             # 3. 檢查是否有資料
-            all_records = all_records
-            
             if not all_records:
                 print("⚠️  今日無資料可同步（可能是非交易日或資料尚未公布）")
                 print("✅ 任務完成（無資料更新）")
@@ -256,7 +255,7 @@ jobs:
             print()
             print(f"📦 準備同步 {len(all_records)} 筆資料到 Neon 資料庫...")
             
-            # 4. 分批插入到 Neon 資料庫，每批 1000 筆
+            # 4. 分批插入到 Neon 資料庫
             batch_size = 1000
             total_inserted = 0
             
@@ -322,5 +321,5 @@ jobs:
       if: failure()
       run: |
         echo "❌ 資料抓取失敗，請檢查日誌"
-        echo "Run ID: ${{ github.run_id }}"
+        echo "Run ID: ${{ github.run_id }}" 
         echo "Run Number: ${{ github.run_number }}"
