@@ -3,7 +3,7 @@ name: Daily Stock Data Fetch
 on:
   schedule:
     # 每天晚上 9:40 執行（台北時間 21:40 = UTC 13:40）
-    - cron: '40 13 * * *'  # 每天 21:40 (台北時間)
+    - cron: '42 13 * * *'  # 每天 21:40 (台北時間)
   
   # 允許手動觸發（推薦用於測試）
   workflow_dispatch:
