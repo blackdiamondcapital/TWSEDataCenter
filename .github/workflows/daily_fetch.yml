@@ -2,11 +2,11 @@ name: Daily Stock Data Fetch
 
 on:
   schedule:
-    # ⚠️ 警告：每分鐘執行可能導致 API 限流或 IP 被封鎖
-    # 建議改為每日執行：'0 8 * * 1-5'
-    - cron: '* * * * *'  # 每分鐘執行（不建議）
+    # GitHub Actions 最短間隔為 5 分鐘
+    # ⚠️ 警告：頻繁執行可能導致 API 限流或 IP 被封鎖
+    - cron: '*/5 * * * *'  # 每 5 分鐘執行一次
   
-  # 允許手動觸發
+  # 允許手動觸發（推薦用於測試）
   workflow_dispatch:
 
 env:
