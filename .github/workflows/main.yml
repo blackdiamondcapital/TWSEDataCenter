@@ -29,8 +29,8 @@ on:
         required: false
         default: '0'
   schedule:
-    # 每天 23:00 自動執行（在股價抓取完成後）
-    - cron: '0 15 * * *'  # UTC 15:00 = 台北時間 23:00
+    # 每天 14:30 自動執行
+    - cron: '30 6 * * *'  # UTC 06:30 = 台北時間 14:30
 
 env:
   TZ: Asia/Taipei
@@ -216,8 +216,11 @@ jobs:
                     cur.execute(sql_check, params_check)
                     existing_dates = {row['date'] for row in cur.fetchall()}
                     
-                    # 過濾掉已存在的日期
-                    df = df[~df.index.date.isin(existing_dates)]
+                    # 修正：使用 pd.Series 來處理 isin 操作
+                    if existing_dates:
+                        date_series = pd.Series(df.index.date)
+                        mask = ~date_series.isin(existing_dates)
+                        df = df[mask]
                     
                     if df.empty:
                         return 0
