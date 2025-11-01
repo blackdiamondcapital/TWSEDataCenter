@@ -82,7 +82,10 @@ jobs:
         SYMBOL = os.environ.get('SYMBOL', '').strip()
         START_DATE = os.environ.get('START_DATE', '').strip() or None
         END_DATE = os.environ.get('END_DATE', '').strip() or None
-        LIMIT = int(os.environ.get('LIMIT', '0'))
+        try:
+            LIMIT = int(os.environ.get('LIMIT', '0'))
+        except Exception:
+            LIMIT = 0
         
         print(f"📋 模式：{MODE}")
         if SYMBOL:
@@ -202,7 +205,7 @@ jobs:
                 if df.empty:
                     return 0
                 
-                # 3. 如果是 fill_missing 模式，檢查已存在的日期
+                # 3. 如果是 fill_missing 模式，檢查已存在的日期（修正：用 DatetimeIndex 比對）
                 if MODE == 'fill_missing':
                     params_check = [symbol]
                     sql_check = "SELECT date FROM stock_returns WHERE symbol = %s"
@@ -214,12 +217,12 @@ jobs:
                         params_check.append(END_DATE)
                     
                     cur.execute(sql_check, params_check)
-                    existing_dates = {row['date'] for row in cur.fetchall()}
+                    existing_dates = [row['date'] for row in cur.fetchall()]  # list of date
                     
-                    # 修正：使用 pd.Series 來處理 isin 操作
                     if existing_dates:
-                        date_series = pd.Series(df.index.date)
-                        mask = ~date_series.isin(existing_dates)
+                        existing_dates_idx = pd.DatetimeIndex(sorted(existing_dates))
+                        # df.index 是 DatetimeIndex，normalize() 取日期層級
+                        mask = ~df.index.normalize().isin(existing_dates_idx)
                         df = df[mask]
                     
                     if df.empty:
@@ -318,15 +321,15 @@ jobs:
                     if i % 50 == 0:
                         print(f"  進度: {i}/{len(symbols)}, 成功: {success_count} 檔, 寫入: {total_written} 筆")
                 
-                print(f"\n✅ 完成：{success_count}/{len(symbols)} 檔")
-                print(f"📦 總計寫入：{total_written} 筆報酬率\n")
+                print(f\"\\n✅ 完成：{success_count}/{len(symbols)} 檔\")
+                print(f\"📦 總計寫入：{total_written} 筆報酬率\\n\")
             
-            print("=" * 80)
-            print("🎉 報酬率計算完成！")
-            print("=" * 80)
+            print(\"=\" * 80)
+            print(\"🎉 報酬率計算完成！\")
+            print(\"=\" * 80)
             
         except Exception as e:
-            print(f"❌ 執行過程發生錯誤：{e}")
+            print(f\"❌ 執行過程發生錯誤：{e}\")
             import traceback
             traceback.print_exc()
             sys.exit(1)
