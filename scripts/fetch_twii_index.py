@@ -3,8 +3,6 @@
 
 import os
 import sys
-import json
-import time
 import logging
 from datetime import date, datetime
 import requests
@@ -21,12 +19,14 @@ logger = logging.getLogger(__name__)
 
 FMTQIK_URL = "https://www.twse.com.tw/exchangeReport/FMTQIK"
 
+
 def parse_roc_date(roc_str: str):
     try:
         year, month, day = roc_str.split("/")
         return date(int(year) + 1911, int(month), int(day))
     except Exception:
         return None
+
 
 def safe_float(value):
     if value in (None, "", "--", "---"):
@@ -36,13 +36,15 @@ def safe_float(value):
     except Exception:
         return None
 
+
 def safe_volume(value):
     if value in (None, "", "--", "---"):
         return 0
     try:
-        return int(value.replace(",", "")) * 1000  # 份量單位：千
+        return int(value.replace(",", "")) * 1000  # 單位：千
     except Exception:
         return 0
+
 
 def fetch_twii_for_day(target: date):
     logger.info("Fetch TWII for %s", target)
@@ -78,6 +80,7 @@ def fetch_twii_for_day(target: date):
     logger.info("No TWII row for %s", target)
     return None
 
+
 def upsert_twii_record(conn, record):
     sql = """
         INSERT INTO stock_prices
@@ -94,10 +97,12 @@ def upsert_twii_record(conn, record):
         execute_values(cur, sql, [record])
     conn.commit()
 
+
 def main():
     logger.info("=" * 80)
     logger.info("🚀 Start TWII fetch job at %s", datetime.now())
     target = date.today()
+    logger.info("📅 抓取日期：%s", target)
 
     url = os.getenv("NEON_DATABASE_URL")
     if not url:
@@ -123,6 +128,7 @@ def main():
         sys.exit(1)
 
     logger.info("🎉 TWII job finished successfully")
+
 
 if __name__ == "__main__":
     main()
