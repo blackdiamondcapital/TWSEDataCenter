@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import logging
 import os
 import sys
-import logging
 from datetime import date, datetime
-import requests
+
 import psycopg2
+import requests
 from psycopg2.extras import execute_values
 
 LOG_PATH = "twii_index.log"
+
+handlers = [
+    logging.FileHandler(LOG_PATH, encoding="utf-8"),
+    logging.StreamHandler(sys.stdout),
+]
 logging.basicConfig(
-    filename=LOG_PATH,
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
+    handlers=handlers,
 )
 logger = logging.getLogger(__name__)
 
