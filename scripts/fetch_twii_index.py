@@ -132,18 +132,9 @@ def upsert_twii_return(conn, record):
             else:
                 logger.warning("Previous close is zero for %s on %s", symbol, target_date)
         else:
-            logger.info(
-                "No previous close for %s before %s; skip daily return",
-                symbol,
-                target_date,
-            )
+            logger.info("No previous close for %s before %s; skip daily return", symbol, target_date)
     except (InvalidOperation, psycopg2.Error) as exc:
-        logger.exception(
-            "Failed to compute daily return for %s on %s: %s",
-            symbol,
-            target_date,
-            exc,
-        )
+        logger.exception("Failed to compute daily return for %s on %s: %s", symbol, target_date, exc)
         daily_return = None
 
     try:
@@ -168,12 +159,7 @@ def upsert_twii_return(conn, record):
             logger.info("⚠️ TWII daily return unavailable for %s", target_date)
     except psycopg2.Error as exc:
         conn.rollback()
-        logger.exception(
-            "Upsert TWII return failed for %s on %s: %s",
-            symbol,
-            target_date,
-            exc,
-        )
+        logger.exception("Upsert TWII return failed for %s on %s: %s", symbol, target_date, exc)
 
 
 def main():
