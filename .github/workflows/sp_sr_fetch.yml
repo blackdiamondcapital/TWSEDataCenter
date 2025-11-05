@@ -398,11 +398,11 @@ jobs:
                 print(f"❌ 重新連接失敗：{e}", flush=True)
                 sys.exit(1)
 
-            # 確保 stock_prices 表存在（首次執行時避免因表不存在而失敗）
+            # 確保 tw_stock_prices 表存在（首次執行時避免因表不存在而失敗）
             try:
                 cur.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS stock_prices (
+                    CREATE TABLE IF NOT EXISTS tw_stock_prices (
                         id SERIAL PRIMARY KEY,
                         symbol VARCHAR(20) NOT NULL,
                         date DATE NOT NULL,
@@ -418,16 +418,16 @@ jobs:
                 )
                 cur.execute(
                     """
-                    CREATE UNIQUE INDEX IF NOT EXISTS stock_prices_symbol_date_idx
-                    ON stock_prices(symbol, date);
+                    CREATE UNIQUE INDEX IF NOT EXISTS tw_stock_prices_symbol_date_idx
+                    ON tw_stock_prices(symbol, date);
                     """
                 )
                 conn.commit()
             except Exception as e:
-                print(f"⚠️ 建立 stock_prices 表失敗: {e}", flush=True)
+                print(f"⚠️ 建立 tw_stock_prices 表失敗: {e}", flush=True)
                 conn.rollback()
 
-            # 4. 分批插入到 Neon 資料庫（stock_prices）
+            # 4. 分批插入到 Neon 資料庫（tw_stock_prices）
             batch_size = 1000
             total_inserted = 0
 
@@ -438,7 +438,7 @@ jobs:
                     execute_values(
                         cur,
                         """
-                        INSERT INTO stock_prices 
+                        INSERT INTO tw_stock_prices 
                         (symbol, date, open_price, high_price, low_price, close_price, volume)
                         VALUES %s
                         ON CONFLICT (symbol, date) 
@@ -461,16 +461,16 @@ jobs:
                     print(f"  ⚠️  批次 {i//batch_size + 1} 失敗: {e}", flush=True)
                     conn.rollback()
 
-            print(f"✅ 成功同步 {total_inserted} 筆資料到 stock_prices", flush=True)
+            print(f"✅ 成功同步 {total_inserted} 筆資料到 tw_stock_prices", flush=True)
 
-            # 5. 建立/更新 stock_returns 並計算今日報酬率（daily/weekly/monthly）
+            # 5. 建立/更新 tw_stock_returns 並計算今日報酬率（daily/weekly/monthly）
             try:
-                print("\n🧮 計算並回寫今日報酬率到 stock_returns...", flush=True)
+                print("\n🧮 計算並回寫今日報酬率到 tw_stock_returns...", flush=True)
 
                 # 建表（若不存在）
                 cur.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS stock_returns (
+                    CREATE TABLE IF NOT EXISTS tw_stock_returns (
                         id SERIAL PRIMARY KEY,
                         symbol VARCHAR(20) NOT NULL,
                         date DATE NOT NULL,
@@ -486,12 +486,12 @@ jobs:
                 )
                 cur.execute(
                     """
-                    CREATE UNIQUE INDEX IF NOT EXISTS stock_returns_symbol_date_idx
-                    ON stock_returns(symbol, date);
+                    CREATE UNIQUE INDEX IF NOT EXISTS tw_stock_returns_symbol_date_idx
+                    ON tw_stock_returns(symbol, date);
                     """
                 )
 
-                # 使用視窗函數由 stock_prices 計算今日 rolling 報酬率
+                # 使用視窗函數由 tw_stock_prices 計算今日 rolling 報酬率
                 cur.execute(
                     """
                     WITH s AS (
@@ -504,13 +504,13 @@ jobs:
                             LAG(close_price, 21)  OVER (PARTITION BY symbol ORDER BY date) AS prev_21,
                             LAG(close_price, 63)  OVER (PARTITION BY symbol ORDER BY date) AS prev_63,
                             LAG(close_price, 252) OVER (PARTITION BY symbol ORDER BY date) AS prev_252
-                        FROM stock_prices
+                        FROM tw_stock_prices
                         WHERE date >= %s - INTERVAL '1000 days' AND date <= %s
                     ), firsts AS (
                         SELECT DISTINCT ON (symbol)
                             symbol,
                             close_price AS first_close
-                        FROM stock_prices
+                        FROM tw_stock_prices
                         ORDER BY symbol, date ASC
                     ), t AS (
                         SELECT
@@ -532,7 +532,7 @@ jobs:
                         JOIN firsts f ON f.symbol = s.symbol
                         WHERE s.date = %s
                     )
-                    INSERT INTO stock_returns (symbol, date, daily_return, weekly_return, monthly_return, quarterly_return, yearly_return, cumulative_return)
+                    INSERT INTO tw_stock_returns (symbol, date, daily_return, weekly_return, monthly_return, quarterly_return, yearly_return, cumulative_return)
                     SELECT symbol, date, daily_return, weekly_return, monthly_return, quarterly_return, yearly_return, cumulative_return
                     FROM t
                     ON CONFLICT (symbol, date) DO UPDATE SET
@@ -549,7 +549,7 @@ jobs:
                 conn.commit()
 
                 # 回報本日 rows
-                cur.execute("SELECT COUNT(*) FROM stock_returns WHERE date = %s", (today,))
+                cur.execute("SELECT COUNT(*) FROM tw_stock_returns WHERE date = %s", (today,))
                 today_count = cur.fetchone()[0]
                 print(f"✅ 今日報酬率已寫入/更新 {today_count} 筆", flush=True)
             except Exception as e:
