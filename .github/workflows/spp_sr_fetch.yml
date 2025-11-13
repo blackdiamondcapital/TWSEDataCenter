@@ -2,8 +2,9 @@ name: Daily Stock Data Fetch
 
 on:
   schedule:
-    # 每天下午 1:50 執行（台北時間 14:00 = UTC 06:00）
+    # 每天下午 1:55 執行與下午2:30（台北時間 13:55 = UTC 06:00）
     - cron: '55 5 * * *'
+    - cron: '30 6 * * *' 
   workflow_dispatch:
 
 env:
