@@ -2,7 +2,7 @@ name: TWII Index Fetch
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # 台北時間 14:00
+    - cron: '15 6 * * *'   # 台北時間 14:15
   workflow_dispatch:
 
 env:
@@ -48,4 +48,4 @@ jobs:
         if: failure()
         run: |
           echo "❌ TWII 抓取失敗，請檢查日誌"
-          echo "Run ID: ${{ github.run_id }}"
+          echo "Run ID: ${{ github.run_id }}" 這樣對嗎
