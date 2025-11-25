@@ -8,9 +8,11 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import argparse
+import requests
 import psycopg2
 from psycopg2.extras import execute_values
 import yfinance as yf
+from dotenv import load_dotenv
 
 LOG_PATH = "twii_index.log"
 
@@ -55,6 +57,41 @@ def safe_volume(value):
         return 0
 
 
+def fetch_twse_turnover_for_day(target: date):
+    """從證交所 FMTQIK 取當日加權指數成交金額(千元) -> 轉成元回傳。
+    若無法取得則回傳 None。
+    """
+    try:
+        month_anchor = target.replace(day=1)
+        params = {"response": "json", "date": month_anchor.strftime("%Y%m%d")}
+        resp = requests.get(FMTQIK_URL, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        if payload.get("stat") != "OK" or not payload.get("data"):
+            return None
+        for row in payload.get("data", []):
+            # row[0] 民國日期, row[2] 成交金額(千元)
+            try:
+                roc = row[0]
+                y, m, d = roc.split("/")
+                greg = date(int(y) + 1911, int(m), int(d))
+            except Exception:
+                continue
+            if greg != target:
+                continue
+            val = row[2] if len(row) > 2 else None
+            if val in (None, "", "--", "---"):
+                return None
+            try:
+                return int(val.replace(",", ""))
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+
 def fetch_twii_for_day(target: date):
     logger.info("Fetch ^TWII from yfinance for %s", target)
     start = target.strftime("%Y-%m-%d")
@@ -75,11 +112,13 @@ def fetch_twii_for_day(target: date):
     high_price = safe_float(row.get("High"))
     low_price = safe_float(row.get("Low"))
     close_price = safe_float(row.get("Close"))
-    volume = safe_volume(row.get("Volume"))
+    volume = fetch_twse_turnover_for_day(target) or 0
 
     if close_price is None:
         logger.warning("yfinance row missing close price for %s", target)
         return None
+
+    
 
     return (
         "^TWII",
@@ -187,9 +226,29 @@ def main():
 
     logger.info("📅 抓取日期：%s", target)
 
-    url = os.getenv("NEON_DATABASE_URL")
-    if not url:
-        logger.error("NEON_DATABASE_URL is not set")
+    load_dotenv()
+    url = os.getenv("NEON_DATABASE_URL") or os.getenv("DATABASE_URL")
+    conn = None
+    try:
+        if url:
+            conn = psycopg2.connect(url)
+        else:
+            host = os.getenv("DB_HOST", "localhost")
+            port = int(os.getenv("DB_PORT", "5432"))
+            user = os.getenv("DB_USER", "postgres")
+            password = os.getenv("DB_PASSWORD", "s8304021")
+            database = os.getenv("DB_NAME", "postgres")
+            sslmode = os.getenv("DB_SSLMODE", "prefer")
+            conn = psycopg2.connect(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                sslmode=sslmode,
+            )
+    except Exception as exc:
+        logger.exception("Database connection failed: %s", exc)
         sys.exit(1)
 
     try:
@@ -202,7 +261,6 @@ def main():
         sys.exit(1)
 
     try:
-        conn = psycopg2.connect(url)
         upsert_twii_record(conn, record)
         upsert_twii_return(conn, record)
         conn.close()
