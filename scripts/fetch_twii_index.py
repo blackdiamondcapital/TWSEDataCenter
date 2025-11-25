@@ -4,12 +4,12 @@
 import logging
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import psycopg2
-import requests
 from psycopg2.extras import execute_values
+import yfinance as yf
 
 LOG_PATH = "twii_index.log"
 
@@ -24,22 +24,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-FMTQIK_URL = "https://www.twse.com.tw/exchangeReport/FMTQIK"
-
-
-def parse_roc_date(roc_str: str):
-    try:
-        year, month, day = roc_str.split("/")
-        return date(int(year) + 1911, int(month), int(day))
-    except Exception:
-        return None
-
 
 def safe_float(value):
     if value in (None, "", "--", "---"):
         return None
     try:
-        return float(value.replace(",", ""))
+        return float(str(value).replace(",", ""))
     except Exception:
         return None
 
@@ -48,49 +38,59 @@ def safe_volume(value):
     if value in (None, "", "--", "---"):
         return 0
     try:
-        return int(value.replace(",", "")) * 1000  # 單位：千
+        # yfinance Volume 已是股數，不再乘 1000
+        return int(float(str(value).replace(",", "")))
     except Exception:
         return 0
 
 
 def fetch_twii_for_day(target: date):
-    logger.info("Fetch TWII for %s", target)
-    params = {"response": "json", "date": target.replace(day=1).strftime("%Y%m%d")}
-    resp = requests.get(FMTQIK_URL, params=params, timeout=15)
-    resp.raise_for_status()
+    """
+    使用 yfinance 抓取指定日期的 ^TWII 日K 資料。
+    回傳: (symbol, date, open, high, low, close, volume)
+    """
+    logger.info("Fetch ^TWII from yfinance for %s", target)
 
-    payload = resp.json()
-    if payload.get("stat") != "OK":
-        logger.warning("FMTQIK stat not OK: %s", payload.get("stat"))
+    start = target.strftime("%Y-%m-%d")
+    end = (target + timedelta(days=1)).strftime("%Y-%m-%d")  # yfinance end 為開區間
+
+    try:
+        ticker = yf.Ticker("^TWII")
+        df = ticker.history(start=start, end=end, auto_adjust=False)
+    except Exception as exc:
+        logger.exception("yfinance fetch failed for %s: %s", target, exc)
         return None
 
-    for row in payload.get("data", []):
-        row_date = parse_roc_date(row[0]) if row else None
-        if row_date != target:
-            continue
+    if df is None or df.empty:
+        logger.info("No ^TWII data from yfinance for %s", target)
+        return None
 
-        close_price = safe_float(row[4] if len(row) > 4 else None)
-        if close_price is None:
-            logger.warning("FMTQIK row missing close price.")
-            return None
+    row = df.iloc[0]
 
-        turnover = safe_volume(row[2] if len(row) > 2 else None)
-        return (
-            "^TWII",
-            target,
-            close_price,
-            close_price,
-            close_price,
-            close_price,
-            turnover,
-        )
-    logger.info("No TWII row for %s", target)
-    return None
+    open_price = safe_float(row.get("Open"))
+    high_price = safe_float(row.get("High"))
+    low_price = safe_float(row.get("Low"))
+    close_price = safe_float(row.get("Close"))
+    volume = safe_volume(row.get("Volume"))
+
+    if close_price is None:
+        logger.warning("yfinance row missing close price for %s", target)
+        return None
+
+    return (
+        "^TWII",
+        target,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        volume,
+    )
 
 
 def upsert_twii_record(conn, record):
     sql = """
-        INSERT INTO stock_prices
+        INSERT INTO tw_stock_prices
         (symbol, date, open_price, high_price, low_price, close_price, volume)
         VALUES %s
         ON CONFLICT (symbol, date) DO UPDATE SET
@@ -115,7 +115,7 @@ def upsert_twii_return(conn, record):
             cur.execute(
                 """
                 SELECT close_price
-                FROM stock_prices
+                FROM tw_stock_prices
                 WHERE symbol = %s AND date < %s AND close_price IS NOT NULL
                 ORDER BY date DESC
                 LIMIT 1
@@ -132,23 +132,32 @@ def upsert_twii_return(conn, record):
             else:
                 logger.warning("Previous close is zero for %s on %s", symbol, target_date)
         else:
-            logger.info("No previous close for %s before %s; skip daily return", symbol, target_date)
+            logger.info(
+                "No previous close for %s before %s; skip daily return",
+                symbol,
+                target_date,
+            )
     except (InvalidOperation, psycopg2.Error) as exc:
-        logger.exception("Failed to compute daily return for %s on %s: %s", symbol, target_date, exc)
+        logger.exception(
+            "Failed to compute daily return for %s on %s: %s",
+            symbol,
+            target_date,
+            exc,
+        )
         daily_return = None
 
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO stock_returns
+                INSERT INTO tw_stock_returns
                 (symbol, date, daily_return, weekly_return, monthly_return, cumulative_return)
                 VALUES (%s, %s, %s, NULL, NULL, NULL)
                 ON CONFLICT (symbol, date) DO UPDATE SET
                     daily_return = EXCLUDED.daily_return,
-                    weekly_return = COALESCE(EXCLUDED.weekly_return, stock_returns.weekly_return),
-                    monthly_return = COALESCE(EXCLUDED.monthly_return, stock_returns.monthly_return),
-                    cumulative_return = COALESCE(EXCLUDED.cumulative_return, stock_returns.cumulative_return)
+                    weekly_return = COALESCE(EXCLUDED.weekly_return, tw_stock_returns.weekly_return),
+                    monthly_return = COALESCE(EXCLUDED.monthly_return, tw_stock_returns.monthly_return),
+                    cumulative_return = COALESCE(EXCLUDED.cumulative_return, tw_stock_returns.cumulative_return)
                 """,
                 (symbol, target_date, daily_return),
             )
@@ -159,7 +168,12 @@ def upsert_twii_return(conn, record):
             logger.info("⚠️ TWII daily return unavailable for %s", target_date)
     except psycopg2.Error as exc:
         conn.rollback()
-        logger.exception("Upsert TWII return failed for %s on %s: %s", symbol, target_date, exc)
+        logger.exception(
+            "Upsert TWII return failed for %s on %s: %s",
+            symbol,
+            target_date,
+            exc,
+        )
 
 
 def main():
