@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '15 6 * * *'   # 台北時間 14:15
   workflow_dispatch:
+    inputs:
+      target_date:
+        description: 'Target date YYYY-MM-DD (optional)'
+        required: false
+        type: string
 
 env:
   TZ: Asia/Taipei
@@ -33,6 +38,7 @@ jobs:
         env:
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
           PYTHONUNBUFFERED: 1
+          TWII_TARGET_DATE: ${{ inputs.target_date }}   # 留空則抓今天
         run: |
           python3 -u scripts/fetch_twii_index.py
 
@@ -48,4 +54,4 @@ jobs:
         if: failure()
         run: |
           echo "❌ TWII 抓取失敗，請檢查日誌"
-          echo "Run ID: ${{ github.run_id }}" 這樣對嗎
+          echo "Run ID: ${{ github.run_id }}"
