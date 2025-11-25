@@ -7,6 +7,7 @@ import sys
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
+import argparse
 import psycopg2
 from psycopg2.extras import execute_values
 import yfinance as yf
@@ -24,6 +25,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+FMTQIK_URL = "https://www.twse.com.tw/exchangeReport/FMTQIK"
+
+
+def parse_roc_date(roc_str: str):
+    try:
+        year, month, day = roc_str.split("/")
+        return date(int(year) + 1911, int(month), int(day))
+    except Exception:
+        return None
+
 
 def safe_float(value):
     if value in (None, "", "--", "---"):
@@ -38,22 +49,16 @@ def safe_volume(value):
     if value in (None, "", "--", "---"):
         return 0
     try:
-        # yfinance Volume 已是股數，不再乘 1000
+        # yfinance Volume 已是股數，不需再乘 1000
         return int(float(str(value).replace(",", "")))
     except Exception:
         return 0
 
 
 def fetch_twii_for_day(target: date):
-    """
-    使用 yfinance 抓取指定日期的 ^TWII 日K 資料。
-    回傳: (symbol, date, open, high, low, close, volume)
-    """
     logger.info("Fetch ^TWII from yfinance for %s", target)
-
     start = target.strftime("%Y-%m-%d")
     end = (target + timedelta(days=1)).strftime("%Y-%m-%d")  # yfinance end 為開區間
-
     try:
         ticker = yf.Ticker("^TWII")
         df = ticker.history(start=start, end=end, auto_adjust=False)
@@ -66,7 +71,6 @@ def fetch_twii_for_day(target: date):
         return None
 
     row = df.iloc[0]
-
     open_price = safe_float(row.get("Open"))
     high_price = safe_float(row.get("High"))
     low_price = safe_float(row.get("Low"))
@@ -132,18 +136,9 @@ def upsert_twii_return(conn, record):
             else:
                 logger.warning("Previous close is zero for %s on %s", symbol, target_date)
         else:
-            logger.info(
-                "No previous close for %s before %s; skip daily return",
-                symbol,
-                target_date,
-            )
+            logger.info("No previous close for %s before %s; skip daily return", symbol, target_date)
     except (InvalidOperation, psycopg2.Error) as exc:
-        logger.exception(
-            "Failed to compute daily return for %s on %s: %s",
-            symbol,
-            target_date,
-            exc,
-        )
+        logger.exception("Failed to compute daily return for %s on %s: %s", symbol, target_date, exc)
         daily_return = None
 
     try:
@@ -168,18 +163,28 @@ def upsert_twii_return(conn, record):
             logger.info("⚠️ TWII daily return unavailable for %s", target_date)
     except psycopg2.Error as exc:
         conn.rollback()
-        logger.exception(
-            "Upsert TWII return failed for %s on %s: %s",
-            symbol,
-            target_date,
-            exc,
-        )
+        logger.exception("Upsert TWII return failed for %s on %s: %s", symbol, target_date, exc)
 
 
 def main():
     logger.info("=" * 80)
     logger.info("🚀 Start TWII fetch job at %s", datetime.now())
+    # 支援指定日期：優先讀取 CLI --date，其次環境變數 TWII_TARGET_DATE，否則使用今天
+    parser = argparse.ArgumentParser(description="Fetch ^TWII for a specific date (default: today)")
+    parser.add_argument("--date", "-d", dest="date_str", help="Target date in YYYY-MM-DD")
+    args = parser.parse_args()
+
     target = date.today()
+    env_date = os.getenv("TWII_TARGET_DATE")
+    try:
+        if args.date_str:
+            target = date.fromisoformat(args.date_str)
+        elif env_date:
+            target = date.fromisoformat(env_date)
+    except Exception:
+        logger.error("Invalid date format. Use YYYY-MM-DD.")
+        sys.exit(1)
+
     logger.info("📅 抓取日期：%s", target)
 
     url = os.getenv("NEON_DATABASE_URL")
