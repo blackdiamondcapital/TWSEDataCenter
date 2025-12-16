@@ -31,7 +31,7 @@ try:
     
     cursor.execute("""
         SELECT symbol, date, COUNT(*) as count
-        FROM stock_prices
+        FROM tw_stock_prices
         GROUP BY symbol, date
         HAVING COUNT(*) > 1
         ORDER BY count DESC
@@ -55,7 +55,7 @@ try:
             
             cursor.execute("""
                 SELECT id, symbol, date, created_at, open_price, close_price, volume
-                FROM stock_prices
+                FROM tw_stock_prices
                 WHERE symbol = %s AND date = %s
                 ORDER BY id;
             """, [first_dup['symbol'], first_dup['date']])
@@ -76,7 +76,7 @@ try:
     
     cursor.execute("""
         SELECT symbol, date, created_at, open_price, close_price, volume
-        FROM stock_prices
+        FROM tw_stock_prices
         ORDER BY created_at DESC
         LIMIT 20;
     """)
@@ -107,15 +107,15 @@ try:
     print("\n📈 步骤 3: 数据库统计")
     print("-" * 80)
     
-    cursor.execute("SELECT COUNT(*) as total FROM stock_prices;")
+    cursor.execute("SELECT COUNT(*) as total FROM tw_stock_prices;")
     total = cursor.fetchone()['total']
     print(f"总记录数: {total:,} 条")
     
-    cursor.execute("SELECT COUNT(DISTINCT symbol) as total FROM stock_prices;")
+    cursor.execute("SELECT COUNT(DISTINCT symbol) as total FROM tw_stock_prices;")
     symbols = cursor.fetchone()['total']
     print(f"股票数量: {symbols} 支")
     
-    cursor.execute("SELECT COUNT(DISTINCT date) as total FROM stock_prices;")
+    cursor.execute("SELECT COUNT(DISTINCT date) as total FROM tw_stock_prices;")
     dates = cursor.fetchone()['total']
     print(f"日期数量: {dates} 天")
     
@@ -125,7 +125,7 @@ try:
     
     cursor.execute("""
         SELECT date, COUNT(*) as count
-        FROM stock_prices
+        FROM tw_stock_prices
         WHERE symbol = '6488.TWO'
         GROUP BY date
         HAVING COUNT(*) > 1
@@ -144,7 +144,7 @@ try:
         # 显示最近10条
         cursor.execute("""
             SELECT date, open_price, close_price, volume, created_at
-            FROM stock_prices
+            FROM tw_stock_prices
             WHERE symbol = '6488.TWO'
             ORDER BY date DESC
             LIMIT 10;

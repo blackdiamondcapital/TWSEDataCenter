@@ -41,7 +41,7 @@ def get_symbol_year_counts(conn: psycopg2.extensions.connection, symbol: str) ->
         cur.execute(
             """
                 SELECT EXTRACT(YEAR FROM date) AS year, COUNT(*) AS count
-                FROM stock_prices
+                FROM tw_stock_prices
                 WHERE symbol = %s
                 GROUP BY EXTRACT(YEAR FROM date)
             """,
@@ -189,7 +189,7 @@ def get_incomplete_symbols() -> List[dict]:
                 COUNT(DISTINCT EXTRACT(YEAR FROM date)) AS year_count,
                 MIN(date) AS earliest,
                 MAX(date) AS latest
-            FROM stock_prices
+            FROM tw_stock_prices
             GROUP BY symbol
         )
         SELECT
@@ -227,7 +227,7 @@ def fetch_single_stock(symbol: str, idx: int, total: int, verify: bool = False) 
         cur.execute(
             """
             SELECT MIN(date) AS earliest, MAX(date) AS latest
-            FROM stock_prices
+            FROM tw_stock_prices
             WHERE symbol = %s
             """,
             (symbol,)
@@ -401,7 +401,7 @@ def verify_after_fetch(symbol: str, conn: psycopg2.extensions.connection) -> Non
                 SELECT
                     EXTRACT(YEAR FROM date) AS year,
                     COUNT(*) AS count
-                FROM stock_prices
+                FROM tw_stock_prices
                 WHERE symbol = %s
                 GROUP BY EXTRACT(YEAR FROM date)
                 ORDER BY year

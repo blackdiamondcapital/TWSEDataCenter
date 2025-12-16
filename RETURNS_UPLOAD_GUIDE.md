@@ -293,12 +293,12 @@ ERROR:returns_calc:上傳 2330.TW 報酬率到 Neon 失敗: connection timeout
 ```sql
 -- 查看已上傳的報酬率數量
 SELECT symbol, COUNT(*) as count, MIN(date) as start_date, MAX(date) as end_date
-FROM stock_returns
+FROM tw_stock_returns
 WHERE symbol = '2330.TW'
 GROUP BY symbol;
 
 -- 查看最新的報酬率數據
-SELECT * FROM stock_returns
+SELECT * FROM tw_stock_returns
 WHERE symbol = '2330.TW'
 ORDER BY date DESC
 LIMIT 10;
