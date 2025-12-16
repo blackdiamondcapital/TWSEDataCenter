@@ -19,7 +19,7 @@ DB_CONFIG = {
 def confirm_action():
     """確認用戶是否要清空資料庫"""
     print("=" * 80)
-    print("警告：此操作將清空 stock_prices 和 stock_returns 表中的所有數據！")
+    print("警告：此操作將清空 tw_stock_prices 和 tw_stock_returns 表中的所有數據！")
     print("=" * 80)
     response = input("確定要繼續嗎？(輸入 YES 確認): ")
     return response.strip() == "YES"
@@ -34,8 +34,8 @@ def truncate_tables():
         print("\n正在清空資料表...")
         
         # 清空表格但保留結構
-        cursor.execute("TRUNCATE TABLE stock_prices CASCADE;")
-        cursor.execute("TRUNCATE TABLE stock_returns CASCADE;")
+        cursor.execute("TRUNCATE TABLE tw_stock_prices CASCADE;")
+        cursor.execute("TRUNCATE TABLE tw_stock_returns CASCADE;")
         
         conn.commit()
         cursor.close()

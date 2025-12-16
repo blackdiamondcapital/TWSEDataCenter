@@ -52,7 +52,7 @@ def log(msg: str, log_path: str):
 
 
 def fetch_symbols(cursor, include_api: bool = False) -> List[str]:
-    cursor.execute("SELECT DISTINCT symbol FROM stock_prices ORDER BY symbol;")
+    cursor.execute("SELECT DISTINCT symbol FROM tw_stock_prices ORDER BY symbol;")
     symbols = [row[0] for row in cursor.fetchall() if row[0]]
     if include_api:
         try:
@@ -79,7 +79,7 @@ def detect_missing_ranges(cursor, symbols: Iterable[str], start_year: int, today
             if end < start:
                 continue
             cursor.execute(
-                "SELECT COUNT(*) FROM stock_prices WHERE symbol = %s AND date BETWEEN %s AND %s",
+                "SELECT COUNT(*) FROM tw_stock_prices WHERE symbol = %s AND date BETWEEN %s AND %s",
                 (symbol, start, end),
             )
             count = cursor.fetchone()[0]

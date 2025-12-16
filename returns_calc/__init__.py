@@ -29,7 +29,7 @@ def compute_returns(
     upload_to_neon: bool = False,
     progress_callback: Optional[callable] = None,
 ) -> dict:
-    """Compute returns and upsert into stock_returns.
+    """Compute returns and upsert into tw_stock_returns.
 
     Args:
         symbol: 指定股票代碼

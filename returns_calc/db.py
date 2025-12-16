@@ -148,7 +148,7 @@ def db_cursor(commit: bool = False, use_neon: bool = False):
 
 def ensure_tables(use_neon: bool = False):
     """
-    Ensure `stock_returns` table exists with required columns.
+    Ensure `tw_stock_returns` table exists with required columns.
     This function will also add missing columns if the table already exists.
     
     Args:
@@ -158,7 +158,7 @@ def ensure_tables(use_neon: bool = False):
         # Create table if not exists
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS stock_returns (
+            CREATE TABLE IF NOT EXISTS tw_stock_returns (
                 id SERIAL PRIMARY KEY,
                 symbol VARCHAR(20) NOT NULL,
                 date DATE NOT NULL,
@@ -184,7 +184,7 @@ def ensure_tables(use_neon: bool = False):
         ]
         for name, typ in columns:
             cur.execute(
-                f"ALTER TABLE stock_returns ADD COLUMN IF NOT EXISTS {name} {typ};"
+                f"ALTER TABLE tw_stock_returns ADD COLUMN IF NOT EXISTS {name} {typ};"
             )
 
 
@@ -196,7 +196,7 @@ def fetch_symbols(limit: int | None = None, use_neon: bool = False):
         use_neon: 是否使用 Neon 雲端資料庫
     """
     with db_cursor(use_neon=use_neon) as cur:
-        sql = "SELECT DISTINCT symbol FROM stock_prices ORDER BY symbol"
+        sql = "SELECT DISTINCT symbol FROM tw_stock_prices ORDER BY symbol"
         if limit:
             sql += " LIMIT %s"
             cur.execute(sql, [limit])
@@ -212,7 +212,7 @@ def batch_fetch_prices(symbols: list[str], start: str | None, end: str | None, u
         return {}
 
     params: list = [symbols]
-    sql = "SELECT symbol, date, close_price FROM stock_prices WHERE symbol = ANY(%s)"
+    sql = "SELECT symbol, date, close_price FROM tw_stock_prices WHERE symbol = ANY(%s)"
     if start:
         sql += " AND date >= %s"
         params.append(start)
@@ -240,7 +240,7 @@ def fetch_prices(symbol: str, start: str | None, end: str | None, use_neon: bool
         use_neon: 是否使用 Neon 雲端資料庫
     """
     params = [symbol]
-    sql = "SELECT date, close_price FROM stock_prices WHERE symbol = %s"
+    sql = "SELECT date, close_price FROM tw_stock_prices WHERE symbol = %s"
     if start:
         sql += " AND date >= %s"
         params.append(start)
@@ -259,7 +259,7 @@ def batch_fetch_existing_return_dates(symbols: list[str], start: str | None, end
         return {}
 
     params: list = [symbols]
-    sql = "SELECT symbol, date FROM stock_returns WHERE symbol = ANY(%s)"
+    sql = "SELECT symbol, date FROM tw_stock_returns WHERE symbol = ANY(%s)"
     if start:
         sql += " AND date >= %s"
         params.append(start)
@@ -288,7 +288,7 @@ def fetch_existing_return_dates(symbol: str, start: str | None, end: str | None,
         use_neon: 是否使用 Neon 雲端資料庫
     """
     params = [symbol]
-    sql = "SELECT date FROM stock_returns WHERE symbol = %s"
+    sql = "SELECT date FROM tw_stock_returns WHERE symbol = %s"
     if start:
         sql += " AND date >= %s"
         params.append(start)
@@ -337,7 +337,7 @@ def upsert_returns(records: list[dict], use_neon: bool = False):
         execute_values(
             cur,
             f"""
-            INSERT INTO stock_returns ({', '.join(cols)})
+            INSERT INTO tw_stock_returns ({', '.join(cols)})
             VALUES %s
             ON CONFLICT (symbol, date) DO UPDATE SET
               daily_return = EXCLUDED.daily_return,

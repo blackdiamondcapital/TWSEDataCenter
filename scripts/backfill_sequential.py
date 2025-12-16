@@ -58,7 +58,7 @@ def fetch_existing_summary(cursor, symbol: str):
     cursor.execute(
         """
         SELECT COUNT(*) AS count, MIN(date) AS earliest, MAX(date) AS latest
-        FROM stock_prices
+        FROM tw_stock_prices
         WHERE symbol = %s
         """,
         (symbol,),
@@ -81,7 +81,7 @@ def determine_missing_year_ranges(
     cursor.execute(
         """
         SELECT EXTRACT(YEAR FROM date)::int AS year, COUNT(*) AS count
-        FROM stock_prices
+        FROM tw_stock_prices
         WHERE symbol = %s AND date BETWEEN %s AND %s
         GROUP BY year
         """,
