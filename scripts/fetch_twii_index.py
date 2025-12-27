@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import argparse
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
-import argparse
-import requests
 import psycopg2
 from psycopg2.extras import execute_values
+import requests
 import yfinance as yf
 from dotenv import load_dotenv
 
 LOG_PATH = "twii_index.log"
+FMTQIK_URL = "https://www.twse.com.tw/exchangeReport/FMTQIK"
 
 handlers = [
     logging.FileHandler(LOG_PATH, encoding="utf-8"),
@@ -27,16 +28,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-FMTQIK_URL = "https://www.twse.com.tw/exchangeReport/FMTQIK"
-
-
-def parse_roc_date(roc_str: str):
-    try:
-        year, month, day = roc_str.split("/")
-        return date(int(year) + 1911, int(month), int(day))
-    except Exception:
-        return None
-
 
 def safe_float(value):
     if value in (None, "", "--", "---"):
@@ -47,20 +38,8 @@ def safe_float(value):
         return None
 
 
-def safe_volume(value):
-    if value in (None, "", "--", "---"):
-        return 0
-    try:
-        # yfinance Volume 已是股數，不需再乘 1000
-        return int(float(str(value).replace(",", "")))
-    except Exception:
-        return 0
-
-
 def fetch_twse_turnover_for_day(target: date):
-    """從證交所 FMTQIK 取當日加權指數成交金額(千元) -> 轉成元回傳。
-    若無法取得則回傳 None。
-    """
+    """從證交所 FMTQIK 取當日加權指數成交金額(千元) -> 轉成元回傳。若無法取得則回傳 None。"""
     try:
         month_anchor = target.replace(day=1)
         params = {"response": "json", "date": month_anchor.strftime("%Y%m%d")}
@@ -84,6 +63,7 @@ def fetch_twse_turnover_for_day(target: date):
             if val in (None, "", "--", "---"):
                 return None
             try:
+                # 原始單位為千元
                 return int(val.replace(",", ""))
             except Exception:
                 return None
@@ -117,8 +97,6 @@ def fetch_twii_for_day(target: date):
     if close_price is None:
         logger.warning("yfinance row missing close price for %s", target)
         return None
-
-    
 
     return (
         "^TWII",
@@ -205,69 +183,91 @@ def upsert_twii_return(conn, record):
         logger.exception("Upsert TWII return failed for %s on %s: %s", symbol, target_date, exc)
 
 
-def main():
-    logger.info("=" * 80)
-    logger.info("🚀 Start TWII fetch job at %s", datetime.now())
-    # 支援指定日期：優先讀取 CLI --date，其次環境變數 TWII_TARGET_DATE，否則使用今天
-    parser = argparse.ArgumentParser(description="Fetch ^TWII for a specific date (default: today)")
-    parser.add_argument("--date", "-d", dest="date_str", help="Target date in YYYY-MM-DD")
-    args = parser.parse_args()
+def resolve_date_range(args):
+    tz = timezone(timedelta(hours=8))  # Asia/Taipei
+    today = datetime.now(tz).date()
 
-    target = date.today()
-    env_date = os.getenv("TWII_TARGET_DATE")
+    start_input = args.start_date or os.getenv("TWII_START_DATE") or None
+    end_input = args.end_date or os.getenv("TWII_END_DATE") or None
+
     try:
-        if args.date_str:
-            target = date.fromisoformat(args.date_str)
-        elif env_date:
-            target = date.fromisoformat(env_date)
+        start = date.fromisoformat(start_input) if start_input else today
+        end = date.fromisoformat(end_input) if end_input else start
     except Exception:
         logger.error("Invalid date format. Use YYYY-MM-DD.")
         sys.exit(1)
 
-    logger.info("📅 抓取日期：%s", target)
+    if start > end:
+        logger.error("start_date must be <= end_date")
+        sys.exit(1)
 
+    return start, end
+
+
+def get_db_connection():
     load_dotenv()
     url = os.getenv("NEON_DATABASE_URL") or os.getenv("DATABASE_URL")
-    conn = None
     try:
         if url:
-            conn = psycopg2.connect(url)
-        else:
-            host = os.getenv("DB_HOST", "localhost")
-            port = int(os.getenv("DB_PORT", "5432"))
-            user = os.getenv("DB_USER", "postgres")
-            password = os.getenv("DB_PASSWORD", "s8304021")
-            database = os.getenv("DB_NAME", "postgres")
-            sslmode = os.getenv("DB_SSLMODE", "prefer")
-            conn = psycopg2.connect(
-                host=host,
-                port=port,
-                user=user,
-                password=password,
-                database=database,
-                sslmode=sslmode,
-            )
+            return psycopg2.connect(url)
+        host = os.getenv("DB_HOST", "localhost")
+        port = int(os.getenv("DB_PORT", "5432"))
+        user = os.getenv("DB_USER", "postgres")
+        password = os.getenv("DB_PASSWORD", "s8304021")
+        database = os.getenv("DB_NAME", "postgres")
+        sslmode = os.getenv("DB_SSLMODE", "prefer")
+        return psycopg2.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            sslmode=sslmode,
+        )
     except Exception as exc:
         logger.exception("Database connection failed: %s", exc)
         sys.exit(1)
 
-    try:
-        record = fetch_twii_for_day(target)
-        if not record:
-            logger.info("No TWII data available today.")
-            return
-    except Exception as exc:
-        logger.exception("TWII fetch failed: %s", exc)
-        sys.exit(1)
+
+def main():
+    logger.info("=" * 80)
+    logger.info("🚀 Start TWII fetch job at %s", datetime.now())
+
+    parser = argparse.ArgumentParser(description="Fetch ^TWII for a date or date range")
+    parser.add_argument("--date", "-d", dest="date_str", help="Target date in YYYY-MM-DD (deprecated, use --start-date)")
+    parser.add_argument("--start-date", dest="start_date", help="Start date YYYY-MM-DD (defaults to today)")
+    parser.add_argument("--end-date", dest="end_date", help="End date YYYY-MM-DD (defaults to start-date)")
+    args = parser.parse_args()
+
+    # backward compatible: if --date provided, use it as both start/end unless explicit start/end override
+    if args.date_str and not args.start_date:
+        args.start_date = args.date_str
+    if args.date_str and not args.end_date:
+        args.end_date = args.date_str
+
+    start_date, end_date = resolve_date_range(args)
+    logger.info("📅 抓取區間：%s -> %s", start_date, end_date)
+
+    conn = get_db_connection()
+
+    current = start_date
+    while current <= end_date:
+        try:
+            record = fetch_twii_for_day(current)
+            if not record:
+                logger.info("No TWII data available for %s", current)
+            else:
+                upsert_twii_record(conn, record)
+                upsert_twii_return(conn, record)
+                logger.info("✅ TWII data & return synced for %s", current)
+        except Exception as exc:
+            logger.exception("TWII fetch/sync failed for %s: %s", current, exc)
+        current += timedelta(days=1)
 
     try:
-        upsert_twii_record(conn, record)
-        upsert_twii_return(conn, record)
         conn.close()
-        logger.info("✅ TWII data & return synced for %s", target)
-    except Exception as exc:
-        logger.exception("Database sync failed: %s", exc)
-        sys.exit(1)
+    except Exception:
+        pass
 
     logger.info("🎉 TWII job finished successfully")
 
