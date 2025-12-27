@@ -2,7 +2,7 @@ name: TWII Index Fetch
 
 on:
   schedule:
-    - cron: '15 6 * * *'   # 台北時間 14:15（UTC+8）
+    - cron: '15 6 * * 1-5'   # 台北時間 14:15（UTC+8），僅週一到週五
   workflow_dispatch:
     inputs:
       start_date:
