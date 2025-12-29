@@ -177,6 +177,56 @@ def fetch_otc_for_day(target: date):
         )
 
     logger.info("No ^OTC data from yfinance for %s", target)
+    # fallback: TPEX openapi
+    try:
+        record = fetch_otc_from_tpex_openapi(target)
+        if record:
+            logger.info("TPEX openapi hit for ^OTC on %s", target)
+            return record
+    except Exception as exc:
+        logger.debug("TPEX openapi fallback failed for %s: %s", target, exc)
+
+    return None
+
+
+def fetch_otc_from_tpex_openapi(target: date):
+    """從櫃買中心 openapi 抓取 ^OTC 單日資料。"""
+    url = "https://www.tpex.org.tw/openapi/v1/tpex_index"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, list):
+        return None
+
+    for row in data:
+        try:
+            raw_date = str(row.get("Date"))
+            if len(raw_date) == 8:
+                trade_date = datetime.strptime(raw_date, "%Y%m%d").date()
+            else:
+                trade_date = datetime.fromisoformat(raw_date).date()
+        except Exception:
+            continue
+        if trade_date != target:
+            continue
+
+        open_price = safe_float(row.get("Open"))
+        high_price = safe_float(row.get("High"))
+        low_price = safe_float(row.get("Low"))
+        close_price = safe_float(row.get("Close"))
+        if close_price is None:
+            continue
+
+        return (
+            "^OTC",
+            trade_date,
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+            0,  # openapi 未提供成交量，填 0
+        )
+
     return None
 
 
