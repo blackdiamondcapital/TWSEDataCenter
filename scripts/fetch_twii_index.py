@@ -58,7 +58,7 @@ def safe_volume(value):
 
 
 def fetch_twse_turnover_for_day(target: date):
-    """從證交所 FMTQIK 取當日加權指數成交金額(千元) -> 轉成元回傳。
+    """從證交所 FMTQIK 取當日加權指數成交金額(千元) -> 轉成「億元」回傳。
     若無法取得則回傳 None。
     """
     try:
@@ -84,7 +84,10 @@ def fetch_twse_turnover_for_day(target: date):
             if val in (None, "", "--", "---"):
                 return None
             try:
-                return int(val.replace(",", ""))
+                # FMTQIK 單位為「千元」。
+                # 需求：存成「億元」(元 / 1e8)。計算：千元 * 1000 / 1e8 = 千元 / 1e5
+                thousand_ntd = float(val.replace(",", ""))
+                return thousand_ntd / 100_000  # 億元
             except Exception:
                 return None
         return None
