@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
+import argparse
+import requests
 import psycopg2
 from psycopg2.extras import execute_values
-import requests
 import yfinance as yf
 from dotenv import load_dotenv
 
 LOG_PATH = "twii_index.log"
-FMTQIK_URL = "https://www.twse.com.tw/exchangeReport/FMTQIK"
 
 handlers = [
     logging.FileHandler(LOG_PATH, encoding="utf-8"),
@@ -28,6 +27,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+FMTQIK_URL = "https://www.twse.com.tw/exchangeReport/FMTQIK"
+
+
+def parse_roc_date(roc_str: str):
+    try:
+        year, month, day = roc_str.split("/")
+        return date(int(year) + 1911, int(month), int(day))
+    except Exception:
+        return None
+
 
 def safe_float(value):
     if value in (None, "", "--", "---"):
@@ -38,8 +47,20 @@ def safe_float(value):
         return None
 
 
+def safe_volume(value):
+    if value in (None, "", "--", "---"):
+        return 0
+    try:
+        # yfinance Volume 已是股數，不需再乘 1000
+        return int(float(str(value).replace(",", "")))
+    except Exception:
+        return 0
+
+
 def fetch_twse_turnover_for_day(target: date):
-    """從證交所 FMTQIK 取當日加權指數成交金額(千元) -> 轉成元回傳。若無法取得則回傳 None。"""
+    """從證交所 FMTQIK 取當日加權指數成交金額(千元) -> 轉成元回傳。
+    若無法取得則回傳 None。
+    """
     try:
         month_anchor = target.replace(day=1)
         params = {"response": "json", "date": month_anchor.strftime("%Y%m%d")}
@@ -63,7 +84,6 @@ def fetch_twse_turnover_for_day(target: date):
             if val in (None, "", "--", "---"):
                 return None
             try:
-                # 原始單位為千元
                 return int(val.replace(",", ""))
             except Exception:
                 return None
@@ -98,6 +118,8 @@ def fetch_twii_for_day(target: date):
         logger.warning("yfinance row missing close price for %s", target)
         return None
 
+    
+
     return (
         "^TWII",
         target,
@@ -109,7 +131,53 @@ def fetch_twii_for_day(target: date):
     )
 
 
-def upsert_twii_record(conn, record):
+def fetch_otc_for_day(target: date):
+    """抓取櫃買指數 (^OTC) 單日資料，嘗試多個代號以提升命中率。"""
+    logger.info("Fetch ^OTC from yfinance for %s", target)
+    start = target.strftime("%Y-%m-%d")
+    end = (target + timedelta(days=1)).strftime("%Y-%m-%d")
+    candidates = ["^TWOII", "^TWO", "^OTC", "^TPEX", "OTC.TW"]
+
+    for sym in candidates:
+        try:
+            ticker = yf.Ticker(sym)
+            df = ticker.history(start=start, end=end, auto_adjust=False)
+        except Exception as exc:
+            logger.debug("yfinance fetch failed for %s (%s): %s", target, sym, exc)
+            continue
+
+        if df is None or df.empty:
+            logger.debug("No data from yfinance for %s (%s)", target, sym)
+            continue
+
+        row = df.iloc[0]
+        open_price = safe_float(row.get("Open"))
+        high_price = safe_float(row.get("High"))
+        low_price = safe_float(row.get("Low"))
+        close_price = safe_float(row.get("Close"))
+        # OTC 指數成交量 yfinance 多為 0；若缺值則填 0
+        volume = safe_volume(row.get("Volume"))
+
+        if close_price is None:
+            logger.warning("yfinance row missing close price for %s via %s", target, sym)
+            continue
+
+        logger.info("yfinance hit %s for ^OTC on %s", sym, target)
+        return (
+            "^OTC",
+            target,
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+            volume,
+        )
+
+    logger.info("No ^OTC data from yfinance for %s", target)
+    return None
+
+
+def upsert_index_record(conn, record):
     sql = """
         INSERT INTO tw_stock_prices
         (symbol, date, open_price, high_price, low_price, close_price, volume)
@@ -126,7 +194,7 @@ def upsert_twii_record(conn, record):
     conn.commit()
 
 
-def upsert_twii_return(conn, record):
+def upsert_index_return(conn, record):
     symbol, target_date, *_rest = record
     close_price = record[5]
 
@@ -175,101 +243,88 @@ def upsert_twii_return(conn, record):
             )
         conn.commit()
         if daily_return is not None:
-            logger.info("✅ TWII daily return %.6f synced for %s", daily_return, target_date)
+            logger.info("✅ %s daily return %.6f synced for %s", symbol, daily_return, target_date)
         else:
-            logger.info("⚠️ TWII daily return unavailable for %s", target_date)
+            logger.info("⚠️ %s daily return unavailable for %s", symbol, target_date)
     except psycopg2.Error as exc:
         conn.rollback()
-        logger.exception("Upsert TWII return failed for %s on %s: %s", symbol, target_date, exc)
-
-
-def resolve_date_range(args):
-    tz = timezone(timedelta(hours=8))  # Asia/Taipei
-    today = datetime.now(tz).date()
-
-    start_input = args.start_date or os.getenv("TWII_START_DATE") or None
-    end_input = args.end_date or os.getenv("TWII_END_DATE") or None
-
-    try:
-        start = date.fromisoformat(start_input) if start_input else today
-        end = date.fromisoformat(end_input) if end_input else start
-    except Exception:
-        logger.error("Invalid date format. Use YYYY-MM-DD.")
-        sys.exit(1)
-
-    if start > end:
-        logger.error("start_date must be <= end_date")
-        sys.exit(1)
-
-    return start, end
-
-
-def get_db_connection():
-    load_dotenv()
-    url = os.getenv("NEON_DATABASE_URL") or os.getenv("DATABASE_URL")
-    try:
-        if url:
-            return psycopg2.connect(url)
-        host = os.getenv("DB_HOST", "localhost")
-        port = int(os.getenv("DB_PORT", "5432"))
-        user = os.getenv("DB_USER", "postgres")
-        password = os.getenv("DB_PASSWORD", "s8304021")
-        database = os.getenv("DB_NAME", "postgres")
-        sslmode = os.getenv("DB_SSLMODE", "prefer")
-        return psycopg2.connect(
-            host=host,
-            port=port,
-            user=user,
-            password=password,
-            database=database,
-            sslmode=sslmode,
-        )
-    except Exception as exc:
-        logger.exception("Database connection failed: %s", exc)
-        sys.exit(1)
+        logger.exception("Upsert %s return failed for %s: %s", symbol, target_date, exc)
 
 
 def main():
     logger.info("=" * 80)
     logger.info("🚀 Start TWII fetch job at %s", datetime.now())
-
-    parser = argparse.ArgumentParser(description="Fetch ^TWII for a date or date range")
-    parser.add_argument("--date", "-d", dest="date_str", help="Target date in YYYY-MM-DD (deprecated, use --start-date)")
-    parser.add_argument("--start-date", dest="start_date", help="Start date YYYY-MM-DD (defaults to today)")
-    parser.add_argument("--end-date", dest="end_date", help="End date YYYY-MM-DD (defaults to start-date)")
+    # 支援指定日期：優先讀取 CLI --date，其次環境變數 TWII_TARGET_DATE，否則使用今天
+    parser = argparse.ArgumentParser(description="Fetch ^TWII for a specific date (default: today)")
+    parser.add_argument("--date", "-d", dest="date_str", help="Target date in YYYY-MM-DD")
     args = parser.parse_args()
 
-    # backward compatible: if --date provided, use it as both start/end unless explicit start/end override
-    if args.date_str and not args.start_date:
-        args.start_date = args.date_str
-    if args.date_str and not args.end_date:
-        args.end_date = args.date_str
+    target = date.today()
+    env_date = os.getenv("TWII_TARGET_DATE")
+    try:
+        if args.date_str:
+            target = date.fromisoformat(args.date_str)
+        elif env_date:
+            target = date.fromisoformat(env_date)
+    except Exception:
+        logger.error("Invalid date format. Use YYYY-MM-DD.")
+        sys.exit(1)
 
-    start_date, end_date = resolve_date_range(args)
-    logger.info("📅 抓取區間：%s -> %s", start_date, end_date)
+    logger.info("📅 抓取日期：%s", target)
 
-    conn = get_db_connection()
+    load_dotenv()
+    url = os.getenv("NEON_DATABASE_URL") or os.getenv("DATABASE_URL")
+    conn = None
+    try:
+        if url:
+            conn = psycopg2.connect(url)
+        else:
+            host = os.getenv("DB_HOST", "localhost")
+            port = int(os.getenv("DB_PORT", "5432"))
+            user = os.getenv("DB_USER", "postgres")
+            password = os.getenv("DB_PASSWORD", "s8304021")
+            database = os.getenv("DB_NAME", "postgres")
+            sslmode = os.getenv("DB_SSLMODE", "prefer")
+            conn = psycopg2.connect(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                sslmode=sslmode,
+            )
+    except Exception as exc:
+        logger.exception("Database connection failed: %s", exc)
+        sys.exit(1)
 
-    current = start_date
-    while current <= end_date:
+    fetchers = [
+        ("^TWII", fetch_twii_for_day),
+        ("^OTC", fetch_otc_for_day),
+    ]
+
+    for sym, fetcher in fetchers:
         try:
-            record = fetch_twii_for_day(current)
+            record = fetcher(target)
             if not record:
-                logger.info("No TWII data available for %s", current)
-            else:
-                upsert_twii_record(conn, record)
-                upsert_twii_return(conn, record)
-                logger.info("✅ TWII data & return synced for %s", current)
+                logger.info("No %s data available for %s.", sym, target)
+                continue
         except Exception as exc:
-            logger.exception("TWII fetch/sync failed for %s: %s", current, exc)
-        current += timedelta(days=1)
+            logger.exception("%s fetch failed for %s: %s", sym, target, exc)
+            continue
+
+        try:
+            upsert_index_record(conn, record)
+            upsert_index_return(conn, record)
+            logger.info("✅ %s data & return synced for %s", sym, target)
+        except Exception as exc:
+            logger.exception("Database sync failed for %s on %s: %s", sym, target, exc)
 
     try:
         conn.close()
     except Exception:
         pass
 
-    logger.info("🎉 TWII job finished successfully")
+    logger.info("🎉 Index job finished successfully")
 
 
 if __name__ == "__main__":
