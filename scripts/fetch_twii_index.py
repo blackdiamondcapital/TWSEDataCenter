@@ -404,6 +404,21 @@ def main():
                 continue
 
             try:
+                _symbol, _d, _open, _high, _low, _close, _vol = record
+                logger.info(
+                    "📊 %s %s O=%s H=%s L=%s C=%s V=%s",
+                    _symbol,
+                    _d,
+                    _open,
+                    _high,
+                    _low,
+                    _close,
+                    _vol,
+                )
+            except Exception:
+                pass
+
+            try:
                 upsert_index_record(conn, record)
                 upsert_index_return(conn, record)
                 logger.info("✅ %s data & return synced for %s", sym, target)
