@@ -2,7 +2,7 @@ name: TWII Index Fetch
 
 on:
   schedule:
-    - cron: '45 7 * * 1-5'   # 台北時間 14:15（UTC+8），僅週一到週五
+    - cron: '0 7 * * *'   # 台北時間 15:00
   workflow_dispatch:
     inputs:
       start_date:
@@ -46,7 +46,6 @@ jobs:
           start_input="${{ github.event.inputs.start_date }}"
           end_input="${{ github.event.inputs.end_date }}"
 
-          # 如果空值，用台北時間今天
           if [ -z "$start_input" ]; then
             start_input=$(TZ=$tz date +%Y-%m-%d)
           fi
@@ -54,12 +53,10 @@ jobs:
             end_input=$(TZ=$tz date +%Y-%m-%d)
           fi
 
-          # 驗證日期格式
           for d in "$start_input" "$end_input"; do
             date -d "$d" +%Y-%m-%d >/dev/null 2>&1 || { echo "Invalid date: $d"; exit 1; }
           done
 
-          # 驗證先後順序
           start_ts=$(date -d "$start_input" +%s)
           end_ts=$(date -d "$end_input" +%s)
           if [ "$start_ts" -gt "$end_ts" ]; then
@@ -70,14 +67,13 @@ jobs:
           echo "start_date=$start_input" >> $GITHUB_OUTPUT
           echo "end_date=$end_input" >> $GITHUB_OUTPUT
 
-      - name: Fetch TWII and sync to Neon (range)
+      - name: Fetch TWII and sync to Neon
         env:
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
           PYTHONUNBUFFERED: 1
           TWII_START_DATE: ${{ steps.daterange.outputs.start_date }}
           TWII_END_DATE: ${{ steps.daterange.outputs.end_date }}
         run: |
-          echo "Fetching TWII from $TWII_START_DATE to $TWII_END_DATE"
           python3 -u scripts/fetch_twii_index.py
 
       - name: Upload TWII logs
