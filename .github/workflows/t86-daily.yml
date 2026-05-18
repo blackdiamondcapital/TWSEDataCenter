@@ -1,0 +1,108 @@
+name: Daily T86 Institutional Trades Fetch
+
+on:
+  schedule:
+    - cron: '30 8 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'Start date (YYYY-MM-DD). Leave empty to use today.'
+        required: false
+        default: ''
+      end:
+        description: 'End date (YYYY-MM-DD). Leave empty to use start or today.'
+        required: false
+        default: ''
+      market:
+        description: 'Market scope'
+        required: false
+        default: 'both'
+      persist:
+        description: 'Persist fetched data into database'
+        required: false
+        default: 'true'
+      sleep_seconds:
+        description: 'Sleep seconds between date fetches'
+        required: false
+        default: '0.6'
+
+env:
+  TZ: Asia/Taipei
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  fetch-t86:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Resolve run parameters
+        id: params
+        shell: bash
+        run: |
+          TODAY_TPE=$(TZ=Asia/Taipei date +%F)
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            START_INPUT="${{ github.event.inputs.start }}"
+            END_INPUT="${{ github.event.inputs.end }}"
+            MARKET_INPUT="${{ github.event.inputs.market }}"
+            PERSIST_INPUT="${{ github.event.inputs.persist }}"
+            SLEEP_INPUT="${{ github.event.inputs.sleep_seconds }}"
+          else
+            START_INPUT=""
+            END_INPUT=""
+            MARKET_INPUT="both"
+            PERSIST_INPUT="true"
+            SLEEP_INPUT="0.6"
+          fi
+
+          START_VALUE="${START_INPUT:-$TODAY_TPE}"
+          END_VALUE="${END_INPUT:-$START_VALUE}"
+          MARKET_VALUE="${MARKET_INPUT:-both}"
+          PERSIST_VALUE="${PERSIST_INPUT:-true}"
+          SLEEP_VALUE="${SLEEP_INPUT:-0.6}"
+
+          echo "start=$START_VALUE" >> "$GITHUB_OUTPUT"
+          echo "end=$END_VALUE" >> "$GITHUB_OUTPUT"
+          echo "market=$MARKET_VALUE" >> "$GITHUB_OUTPUT"
+          echo "persist=$PERSIST_VALUE" >> "$GITHUB_OUTPUT"
+          echo "sleep=$SLEEP_VALUE" >> "$GITHUB_OUTPUT"
+
+      - name: Run T86 daily job
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_SSLMODE: ${{ secrets.DB_SSLMODE }}
+        run: |
+          CMD=(python server.py --job t86-daily \
+            --start "${{ steps.params.outputs.start }}" \
+            --end "${{ steps.params.outputs.end }}" \
+            --market "${{ steps.params.outputs.market }}" \
+            --sleep "${{ steps.params.outputs.sleep }}")
+
+          if [ "${{ steps.params.outputs.persist }}" != "true" ]; then
+            CMD+=(--no-persist)
+          fi
+
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}"

@@ -63,7 +63,7 @@ def stock_returns_table(*, use_neon: Optional[bool] = None, use_local: Optional[
 def institutional_trades_table(
     *, use_neon: Optional[bool] = None, use_local: Optional[bool] = None, db_url: Optional[str] = None
 ) -> str:
-    return "tw_institutional_tradea"
+    return "tw_institutional_trades"
 
 
 def margin_trades_table(

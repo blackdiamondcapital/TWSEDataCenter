@@ -40,6 +40,7 @@ import io
 import zipfile
 from functools import partial
 from typing import Optional
+import argparse
 
 from income_statement_service import fetch_all_incomes, fetch_income_row, TARGET_ORDER
 from balance_sheet_service import (
@@ -531,6 +532,54 @@ class DatabaseManager:
                 """
             )
 
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table_institutional} (
+                    date DATE NOT NULL,
+                    market VARCHAR(10) NOT NULL,
+                    stock_no VARCHAR(20) NOT NULL,
+                    stock_name VARCHAR(100),
+                    foreign_buy BIGINT,
+                    foreign_sell BIGINT,
+                    foreign_net BIGINT,
+                    foreign_dealer_buy BIGINT,
+                    foreign_dealer_sell BIGINT,
+                    foreign_dealer_net BIGINT,
+                    foreign_total_buy BIGINT,
+                    foreign_total_sell BIGINT,
+                    foreign_total_net BIGINT,
+                    investment_trust_buy BIGINT,
+                    investment_trust_sell BIGINT,
+                    investment_trust_net BIGINT,
+                    dealer_self_buy BIGINT,
+                    dealer_self_sell BIGINT,
+                    dealer_self_net BIGINT,
+                    dealer_hedge_buy BIGINT,
+                    dealer_hedge_sell BIGINT,
+                    dealer_hedge_net BIGINT,
+                    dealer_total_buy BIGINT,
+                    dealer_total_sell BIGINT,
+                    dealer_total_net BIGINT,
+                    overall_net BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (date, market, stock_no)
+                );
+                """
+            )
+            cursor.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS {self.table_institutional}_date_idx
+                ON {self.table_institutional}(date);
+                """
+            )
+            cursor.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS {self.table_institutional}_stock_idx
+                ON {self.table_institutional}(stock_no, date DESC);
+                """
+            )
+
             # 建立損益表資料表（寬表，每檔股票每期一列）
             income_columns_sql = ",\n".join([
                 f'    "{col}" NUMERIC(20,4)' for col in TARGET_ORDER
@@ -699,6 +748,318 @@ class StockAPI:
             return float(s)
         except Exception:
             return None
+
+    def fetch_twse_t86_by_date(self, target_date):
+        dt = self._ensure_date(target_date)
+        params = {
+            'response': 'json',
+            'date': dt.strftime('%Y%m%d'),
+            'selectType': 'ALLBUT0999'
+        }
+
+        resp = self.twse_session.get(self.TWSE_T86_URL, params=params, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        if payload.get('stat') != 'OK':
+            logger.info(f"TWSE T86 {dt} stat={payload.get('stat')}, 無資料")
+            return []
+
+        data_rows = payload.get('data') or []
+        results = []
+        for row in data_rows:
+            if len(row) < 19:
+                continue
+            fb = self._t86_parse_int(row[2])
+            fs = self._t86_parse_int(row[3])
+            fn = self._t86_parse_int(row[4])
+            fdb = self._t86_parse_int(row[5])
+            fds = self._t86_parse_int(row[6])
+            fdn = self._t86_parse_int(row[7])
+            itb = self._t86_parse_int(row[8])
+            its = self._t86_parse_int(row[9])
+            itn = self._t86_parse_int(row[10])
+            dealer_total_net = self._t86_parse_int(row[11])
+            dsb = self._t86_parse_int(row[12])
+            dss = self._t86_parse_int(row[13])
+            dsn = self._t86_parse_int(row[14])
+            dhb = self._t86_parse_int(row[15])
+            dhs = self._t86_parse_int(row[16])
+            dhn = self._t86_parse_int(row[17])
+            overall = self._t86_parse_int(row[18])
+
+            results.append({
+                'date': dt.isoformat(),
+                'market': 'TWSE',
+                'stock_no': (row[0] or '').strip(),
+                'stock_name': (row[1] or '').strip(),
+                'foreign_buy': fb,
+                'foreign_sell': fs,
+                'foreign_net': fn,
+                'foreign_dealer_buy': fdb,
+                'foreign_dealer_sell': fds,
+                'foreign_dealer_net': fdn,
+                'foreign_total_buy': fb + fdb,
+                'foreign_total_sell': fs + fds,
+                'foreign_total_net': fn + fdn,
+                'investment_trust_buy': itb,
+                'investment_trust_sell': its,
+                'investment_trust_net': itn,
+                'dealer_self_buy': dsb,
+                'dealer_self_sell': dss,
+                'dealer_self_net': dsn,
+                'dealer_hedge_buy': dhb,
+                'dealer_hedge_sell': dhs,
+                'dealer_hedge_net': dhn,
+                'dealer_total_buy': dsb + dhb,
+                'dealer_total_sell': dss + dhs,
+                'dealer_total_net': dealer_total_net if dealer_total_net else dsn + dhn,
+                'overall_net': overall,
+            })
+        logger.info(f"TWSE T86 {dt} 抓取 {len(results)} 筆")
+        return results
+
+    def fetch_tpex_t86_by_date(self, target_date):
+        dt = self._ensure_date(target_date)
+        roc_date = f"{dt.year - 1911:03d}/{dt.month:02d}/{dt.day:02d}"
+        params = {
+            'l': 'zh-tw',
+            'date': roc_date,
+            'json': '1'
+        }
+
+        resp = self.tpex_session.get(self.TPEX_T86_URL, params=params, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        if payload.get('stat', '').lower() != 'ok':
+            logger.info(f"TPEX T86 {dt} stat={payload.get('stat')}, 無資料")
+            return []
+
+        tables = payload.get('tables') or []
+        if not tables:
+            return []
+
+        data_rows = tables[0].get('data') or []
+        results = []
+        for row in data_rows:
+            if len(row) < 24:
+                continue
+            results.append({
+                'date': dt.isoformat(),
+                'market': 'TPEX',
+                'stock_no': (row[0] or '').strip(),
+                'stock_name': (row[1] or '').strip(),
+                'foreign_buy': self._t86_parse_int(row[2]),
+                'foreign_sell': self._t86_parse_int(row[3]),
+                'foreign_net': self._t86_parse_int(row[4]),
+                'foreign_dealer_buy': self._t86_parse_int(row[5]),
+                'foreign_dealer_sell': self._t86_parse_int(row[6]),
+                'foreign_dealer_net': self._t86_parse_int(row[7]),
+                'foreign_total_buy': self._t86_parse_int(row[8]),
+                'foreign_total_sell': self._t86_parse_int(row[9]),
+                'foreign_total_net': self._t86_parse_int(row[10]),
+                'investment_trust_buy': self._t86_parse_int(row[11]),
+                'investment_trust_sell': self._t86_parse_int(row[12]),
+                'investment_trust_net': self._t86_parse_int(row[13]),
+                'dealer_self_buy': self._t86_parse_int(row[14]),
+                'dealer_self_sell': self._t86_parse_int(row[15]),
+                'dealer_self_net': self._t86_parse_int(row[16]),
+                'dealer_hedge_buy': self._t86_parse_int(row[17]),
+                'dealer_hedge_sell': self._t86_parse_int(row[18]),
+                'dealer_hedge_net': self._t86_parse_int(row[19]),
+                'dealer_total_buy': self._t86_parse_int(row[20]),
+                'dealer_total_sell': self._t86_parse_int(row[21]),
+                'dealer_total_net': self._t86_parse_int(row[22]),
+                'overall_net': self._t86_parse_int(row[23]),
+            })
+        logger.info(f"TPEX T86 {dt} 抓取 {len(results)} 筆")
+        return results
+
+    def fetch_t86_range(self, start_date, end_date, market: str = 'both', sleep_seconds: float = 0.6):
+        start_dt = self._ensure_date(start_date)
+        end_dt = self._ensure_date(end_date)
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        market_key = (market or 'both').lower()
+        if market_key not in {'twse', 'tpex', 'both'}:
+            raise ValueError("market 必須為 'twse'、'tpex' 或 'both'")
+
+        markets = {'twse', 'tpex'} if market_key == 'both' else {market_key}
+        results = []
+        daily_stats = []
+        total_twse = 0
+        total_tpex = 0
+
+        current = start_dt
+        while current <= end_dt:
+            day_records = []
+            twse_count = 0
+            tpex_count = 0
+
+            if 'twse' in markets:
+                try:
+                    twse_records = self.fetch_twse_t86_by_date(current)
+                except Exception as exc:
+                    logger.warning(f"TWSE T86 {current} 抓取失敗: {exc}")
+                    twse_records = []
+                day_records.extend(twse_records)
+                twse_count = len(twse_records)
+
+            if 'tpex' in markets:
+                try:
+                    tpex_records = self.fetch_tpex_t86_by_date(current)
+                except Exception as exc:
+                    logger.warning(f"TPEX T86 {current} 抓取失敗: {exc}")
+                    tpex_records = []
+                day_records.extend(tpex_records)
+                tpex_count = len(tpex_records)
+
+            if day_records:
+                results.extend(day_records)
+
+            daily_stats.append({
+                'date': current.isoformat(),
+                'twse_count': twse_count,
+                'tpex_count': tpex_count,
+                'total_count': twse_count + tpex_count,
+            })
+
+            total_twse += twse_count
+            total_tpex += tpex_count
+
+            if sleep_seconds and sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+
+            current += timedelta(days=1)
+
+        summary = {
+            'start_date': start_dt.isoformat(),
+            'end_date': end_dt.isoformat(),
+            'markets': sorted(markets),
+            'days_processed': len(daily_stats),
+            'total_records': len(results),
+            'per_market': {
+                'TWSE': total_twse,
+                'TPEX': total_tpex,
+            },
+        }
+        return results, summary, daily_stats
+
+    def upsert_t86_records(self, records: list[dict], db_manager: DatabaseManager | None = None) -> int:
+        if not records:
+            return 0
+
+        own_manager = False
+        db = db_manager
+        if db is None:
+            db = DatabaseManager()
+            own_manager = True
+
+        if not db.connect():
+            raise RuntimeError("資料庫連線失敗")
+
+        try:
+            db.create_tables()
+            cursor = db.connection.cursor()
+            table_name = getattr(db, 'table_institutional', 'tw_institutional_trades')
+
+            def to_int(value):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+
+            values = []
+            for rec in records:
+                date_str = rec.get('date')
+                stock_no = (rec.get('stock_no') or '').strip()
+                if not date_str or not stock_no:
+                    continue
+                try:
+                    record_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                except Exception:
+                    continue
+
+                values.append((
+                    record_date,
+                    (rec.get('market') or '').strip().upper() or 'TWSE',
+                    stock_no,
+                    rec.get('stock_name'),
+                    to_int(rec.get('foreign_buy')),
+                    to_int(rec.get('foreign_sell')),
+                    to_int(rec.get('foreign_net')),
+                    to_int(rec.get('foreign_dealer_buy')),
+                    to_int(rec.get('foreign_dealer_sell')),
+                    to_int(rec.get('foreign_dealer_net')),
+                    to_int(rec.get('foreign_total_buy')),
+                    to_int(rec.get('foreign_total_sell')),
+                    to_int(rec.get('foreign_total_net')),
+                    to_int(rec.get('investment_trust_buy')),
+                    to_int(rec.get('investment_trust_sell')),
+                    to_int(rec.get('investment_trust_net')),
+                    to_int(rec.get('dealer_self_buy')),
+                    to_int(rec.get('dealer_self_sell')),
+                    to_int(rec.get('dealer_self_net')),
+                    to_int(rec.get('dealer_hedge_buy')),
+                    to_int(rec.get('dealer_hedge_sell')),
+                    to_int(rec.get('dealer_hedge_net')),
+                    to_int(rec.get('dealer_total_buy')),
+                    to_int(rec.get('dealer_total_sell')),
+                    to_int(rec.get('dealer_total_net')),
+                    to_int(rec.get('overall_net')),
+                ))
+
+            if not values:
+                return 0
+
+            insert_sql = f"""
+                INSERT INTO {table_name} (
+                    date, market, stock_no, stock_name,
+                    foreign_buy, foreign_sell, foreign_net,
+                    foreign_dealer_buy, foreign_dealer_sell, foreign_dealer_net,
+                    foreign_total_buy, foreign_total_sell, foreign_total_net,
+                    investment_trust_buy, investment_trust_sell, investment_trust_net,
+                    dealer_self_buy, dealer_self_sell, dealer_self_net,
+                    dealer_hedge_buy, dealer_hedge_sell, dealer_hedge_net,
+                    dealer_total_buy, dealer_total_sell, dealer_total_net,
+                    overall_net
+                )
+                VALUES %s
+                ON CONFLICT (date, market, stock_no) DO UPDATE SET
+                    stock_name = EXCLUDED.stock_name,
+                    foreign_buy = EXCLUDED.foreign_buy,
+                    foreign_sell = EXCLUDED.foreign_sell,
+                    foreign_net = EXCLUDED.foreign_net,
+                    foreign_dealer_buy = EXCLUDED.foreign_dealer_buy,
+                    foreign_dealer_sell = EXCLUDED.foreign_dealer_sell,
+                    foreign_dealer_net = EXCLUDED.foreign_dealer_net,
+                    foreign_total_buy = EXCLUDED.foreign_total_buy,
+                    foreign_total_sell = EXCLUDED.foreign_total_sell,
+                    foreign_total_net = EXCLUDED.foreign_total_net,
+                    investment_trust_buy = EXCLUDED.investment_trust_buy,
+                    investment_trust_sell = EXCLUDED.investment_trust_sell,
+                    investment_trust_net = EXCLUDED.investment_trust_net,
+                    dealer_self_buy = EXCLUDED.dealer_self_buy,
+                    dealer_self_sell = EXCLUDED.dealer_self_sell,
+                    dealer_self_net = EXCLUDED.dealer_self_net,
+                    dealer_hedge_buy = EXCLUDED.dealer_hedge_buy,
+                    dealer_hedge_sell = EXCLUDED.dealer_hedge_sell,
+                    dealer_hedge_net = EXCLUDED.dealer_hedge_net,
+                    dealer_total_buy = EXCLUDED.dealer_total_buy,
+                    dealer_total_sell = EXCLUDED.dealer_total_sell,
+                    dealer_total_net = EXCLUDED.dealer_total_net,
+                    overall_net = EXCLUDED.overall_net,
+                    updated_at = CURRENT_TIMESTAMP
+            """
+
+            execute_values(cursor, insert_sql, values, page_size=1000)
+            db.connection.commit()
+            return len(values)
+        finally:
+            if own_manager:
+                db.disconnect()
         
     def fetch_twse_symbols(self):
         """抓取台灣上市公司股票代碼"""
@@ -8203,8 +8564,119 @@ def database_sync_upload():
             'error': str(e)
         }), 500
 
+def run_t86_job(start_date=None, end_date=None, market='both', sleep_seconds=0.6, persist=True, use_local=False):
+    today = datetime.now().date().isoformat()
+    start_value = start_date or today
+    end_value = end_date or start_value
+
+    records, summary, daily_stats = stock_api.fetch_t86_range(
+        start_value,
+        end_value,
+        market=market,
+        sleep_seconds=sleep_seconds,
+    )
+
+    inserted = 0
+    if persist and records:
+        db_manager = DatabaseManager(use_local=use_local)
+        try:
+            inserted = stock_api.upsert_t86_records(records, db_manager=db_manager)
+        finally:
+            try:
+                db_manager.disconnect()
+            except Exception:
+                pass
+
+    result = {
+        'success': True,
+        'job': 't86-daily',
+        'summary': summary,
+        'daily_stats': daily_stats,
+        'count': len(records),
+        'persisted': inserted,
+        'persist_enabled': persist,
+        'start': start_value,
+        'end': end_value,
+        'market': market,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return result
+
+def parse_cli_args(argv=None):
+    parser = argparse.ArgumentParser(description='Taiwan stock data service jobs')
+    parser.add_argument('--job', choices=['t86-daily'], help='Run a background job instead of starting the web server')
+    parser.add_argument('--start', help='Start date for the job, format YYYY-MM-DD')
+    parser.add_argument('--end', help='End date for the job, format YYYY-MM-DD')
+    parser.add_argument('--market', default='both', choices=['twse', 'tpex', 'both'], help='Market scope for T86 job')
+    parser.add_argument('--sleep', type=float, default=0.6, help='Sleep seconds between date fetches')
+    parser.add_argument('--no-persist', action='store_true', help='Fetch records without writing into the database')
+    parser.add_argument('--use-local-db', action='store_true', help='Use local database settings instead of Neon/DATABASE_URL')
+    return parser.parse_args(argv)
+
+@app.route('/api/t86/fetch', methods=['GET'])
+def fetch_t86_range_api():
+    try:
+        start = request.args.get('start')
+        end = request.args.get('end')
+        market = request.args.get('market', 'both')
+        sleep_param = request.args.get('sleep')
+
+        if not start or not end:
+            return jsonify({'success': False, 'error': '需要 start 與 end 參數'}), 400
+
+        try:
+            sleep_seconds = float(sleep_param) if sleep_param is not None else 0.6
+        except ValueError:
+            sleep_seconds = 0.6
+
+        records, summary, daily_stats = stock_api.fetch_t86_range(start, end, market=market, sleep_seconds=sleep_seconds)
+
+        persist_flag = (request.args.get('persist', 'true').lower() != 'false')
+        inserted = 0
+        if persist_flag and records:
+            db_manager = DatabaseManager.from_request_args(request.args)
+            try:
+                inserted = stock_api.upsert_t86_records(records, db_manager=db_manager)
+            finally:
+                try:
+                    db_manager.disconnect()
+                except Exception:
+                    pass
+
+        return jsonify({
+            'success': True,
+            'summary': summary,
+            'daily_stats': daily_stats,
+            'count': len(records),
+            'persisted': inserted,
+            'persist_enabled': persist_flag,
+            'data': records,
+        })
+    except ValueError as ve:
+        return jsonify({'success': False, 'error': str(ve)}), 400
+    except Exception as e:
+        logger.exception('fetch_t86_range_api 失敗')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 if __name__ == '__main__':
-    import sys
+    args = parse_cli_args()
+
+    if args.job == 't86-daily':
+        try:
+            run_t86_job(
+                start_date=args.start,
+                end_date=args.end,
+                market=args.market,
+                sleep_seconds=args.sleep,
+                persist=not args.no_persist,
+                use_local=args.use_local_db,
+            )
+            sys.exit(0)
+        except Exception as exc:
+            logger.exception('T86 job failed')
+            print(json.dumps({'success': False, 'job': 't86-daily', 'error': str(exc)}, ensure_ascii=False))
+            sys.exit(1)
+
     # 支援以環境變數 PORT 指定埠號，預設 5003
     try:
         port = int(os.getenv('PORT', '5003'))
