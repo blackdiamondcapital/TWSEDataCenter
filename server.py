@@ -593,33 +593,41 @@ class DatabaseManager:
             )
 
             # 建立損益表資料表（寬表，每檔股票每期一列）
-            income_columns_sql = ",\n".join([
-                f'    "{col}" NUMERIC(20,4)' for col in TARGET_ORDER
+            income_columns = [
+                '                    "股票代號" VARCHAR(20) NOT NULL',
+                '                    period VARCHAR(16) NOT NULL',
+            ]
+            income_columns.extend([
+                f'                    "{col}" NUMERIC(20,4)' for col in TARGET_ORDER
+            ])
+            income_columns.extend([
+                '                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                '                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                '                    PRIMARY KEY ("股票代號", period)',
             ])
             create_income_sql = f"""
                 CREATE TABLE IF NOT EXISTS {self.table_income} (
-                    "股票代號" VARCHAR(20) NOT NULL,
-                    period VARCHAR(16) NOT NULL,
-{income_columns_sql},
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY ("股票代號", period)
+{",\n".join(income_columns)}
                 );
             """
             cursor.execute(create_income_sql)
 
             # 建立資產負債表資料表（寬表，每檔股票每期一列）
-            balance_columns_sql = ",\n".join([
-                f'    "{col}" NUMERIC(20,4)' for col in BALANCE_TARGET_ORDER
+            balance_columns = [
+                '                    "股票代號" VARCHAR(20) NOT NULL',
+                '                    period VARCHAR(16) NOT NULL',
+            ]
+            balance_columns.extend([
+                f'                    "{col}" NUMERIC(20,4)' for col in BALANCE_TARGET_ORDER
+            ])
+            balance_columns.extend([
+                '                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                '                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                '                    PRIMARY KEY ("股票代號", period)',
             ])
             create_balance_sql = f"""
                 CREATE TABLE IF NOT EXISTS {self.table_balance} (
-                    "股票代號" VARCHAR(20) NOT NULL,
-                    period VARCHAR(16) NOT NULL,
-{balance_columns_sql},
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY ("股票代號", period)
+{",\n".join(balance_columns)}
                 );
             """
             cursor.execute(create_balance_sql)
