@@ -43,12 +43,21 @@ from typing import Optional
 import argparse
 
 from income_statement_service import fetch_all_incomes, fetch_income_row, TARGET_ORDER
-from balance_sheet_service import (
-    fetch_all_balance_sheets,
-    fetch_balance_sheet_row,
-    MopsBlockedError as BalanceMopsBlockedError,
-    TARGET_ORDER as BALANCE_TARGET_ORDER,
-)
+try:
+    from balance_sheet_service import (
+        fetch_all_balance_sheets,
+        fetch_balance_sheet_row,
+        MopsBlockedError as BalanceMopsBlockedError,
+        TARGET_ORDER as BALANCE_TARGET_ORDER,
+    )
+except ImportError:
+    fetch_all_balance_sheets = None
+    fetch_balance_sheet_row = None
+
+    class BalanceMopsBlockedError(Exception):
+        pass
+
+    BALANCE_TARGET_ORDER = []
 
 from table_config import (
     resolve_use_neon,
@@ -61,7 +70,10 @@ from table_config import (
     balance_sheet_table,
 )
 
-from returns_calc import compute_returns as compute_returns_task
+try:
+    from returns_calc import compute_returns as compute_returns_task
+except ImportError:
+    compute_returns_task = None
 
 # 配置日誌
 logging.basicConfig(level=logging.INFO)
