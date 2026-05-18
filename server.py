@@ -605,9 +605,10 @@ class DatabaseManager:
                 '                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
                 '                    PRIMARY KEY ("股票代號", period)',
             ])
+            income_columns_sql = ",\n".join(income_columns)
             create_income_sql = f"""
                 CREATE TABLE IF NOT EXISTS {self.table_income} (
-{",\n".join(income_columns)}
+{income_columns_sql}
                 );
             """
             cursor.execute(create_income_sql)
@@ -625,9 +626,10 @@ class DatabaseManager:
                 '                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
                 '                    PRIMARY KEY ("股票代號", period)',
             ])
+            balance_columns_sql = ",\n".join(balance_columns)
             create_balance_sql = f"""
                 CREATE TABLE IF NOT EXISTS {self.table_balance} (
-{",\n".join(balance_columns)}
+{balance_columns_sql}
                 );
             """
             cursor.execute(create_balance_sql)
