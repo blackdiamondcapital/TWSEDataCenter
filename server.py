@@ -8625,51 +8625,6 @@ def parse_cli_args(argv=None):
     parser.add_argument('--use-local-db', action='store_true', help='Use local database settings instead of Neon/DATABASE_URL')
     return parser.parse_args(argv)
 
-@app.route('/api/t86/fetch', methods=['GET'])
-def fetch_t86_range_api():
-    try:
-        start = request.args.get('start')
-        end = request.args.get('end')
-        market = request.args.get('market', 'both')
-        sleep_param = request.args.get('sleep')
-
-        if not start or not end:
-            return jsonify({'success': False, 'error': '需要 start 與 end 參數'}), 400
-
-        try:
-            sleep_seconds = float(sleep_param) if sleep_param is not None else 0.6
-        except ValueError:
-            sleep_seconds = 0.6
-
-        records, summary, daily_stats = stock_api.fetch_t86_range(start, end, market=market, sleep_seconds=sleep_seconds)
-
-        persist_flag = (request.args.get('persist', 'true').lower() != 'false')
-        inserted = 0
-        if persist_flag and records:
-            db_manager = DatabaseManager.from_request_args(request.args)
-            try:
-                inserted = stock_api.upsert_t86_records(records, db_manager=db_manager)
-            finally:
-                try:
-                    db_manager.disconnect()
-                except Exception:
-                    pass
-
-        return jsonify({
-            'success': True,
-            'summary': summary,
-            'daily_stats': daily_stats,
-            'count': len(records),
-            'persisted': inserted,
-            'persist_enabled': persist_flag,
-            'data': records,
-        })
-    except ValueError as ve:
-        return jsonify({'success': False, 'error': str(ve)}), 400
-    except Exception as e:
-        logger.exception('fetch_t86_range_api 失敗')
-        return jsonify({'success': False, 'error': str(e)}), 500
-
 if __name__ == '__main__':
     args = parse_cli_args()
 
