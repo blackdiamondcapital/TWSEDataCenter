@@ -2,6 +2,7 @@ name: Daily Stock Data Fetch
 
 on:
   schedule:
+    # 週一到週五 11:57 台北時間（UTC 03:57）
     - cron: '57 3 * * 1-5'
   workflow_dispatch:
 
@@ -25,27 +26,529 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install psycopg2-binary requests beautifulsoup4 yfinance lxml
+          pip install requests psycopg2-binary yfinance
 
       - name: Fetch stock data and sync to Neon, then compute returns
         env:
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          PYTHONUNBUFFERED: '1'
+          PYTHONUNBUFFERED: 1
         run: |
-          python3 -u <<'PYTHON_SCRIPT'
+          python3 -u << 'PYTHON_SCRIPT'
           import os
+          import re
           import sys
           import time
-          import requests
-          import psycopg2
-          from psycopg2.extras import execute_values
-          from datetime import datetime, date, timedelta
-          from concurrent.futures import ThreadPoolExecutor, as_completed
           import threading
+          from datetime import date, datetime, timedelta
+
+          import psycopg2
+          import requests
           import yfinance as yf
+          from psycopg2.extras import execute_values
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
 
           sys.stdout.flush()
           sys.stderr.flush()
+
+          HEADERS = {
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+              ),
+              "Accept": "application/json,text/plain,*/*",
+              "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+          }
+
+          TWSE_REFERER = "https://www.twse.com.tw/zh/trading/historical/mi-index.html"
+          TPEX_REFERER = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430.php"
+
+
+          def make_session():
+              session = requests.Session()
+              session.headers.update(HEADERS)
+              retry = Retry(
+                  total=3,
+                  connect=3,
+                  read=3,
+                  backoff_factor=1.5,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET"],
+              )
+              session.mount("https://", HTTPAdapter(max_retries=retry))
+              return session
+
+
+          SESSION = make_session()
+
+
+          def get_json(url, params=None, referer=None, timeout=90, retries=5):
+              extra_headers = {"Referer": referer} if referer else {}
+              last_error = None
+              for attempt in range(1, retries + 1):
+                  try:
+                      response = SESSION.get(
+                          url,
+                          params=params,
+                          headers=extra_headers,
+                          timeout=timeout,
+                      )
+                      response.raise_for_status()
+                      return response.json()
+                  except Exception as err:
+                      last_error = err
+                      wait = min(30, 2 ** attempt)
+                      print(
+                          f"  ⚠️ 請求失敗 ({attempt}/{retries}): {err}，{wait}s 後重試...",
+                          flush=True,
+                      )
+                      time.sleep(wait)
+              raise last_error
+
+
+          def parse_number(value):
+              if value is None:
+                  return None
+              text = str(value).strip()
+              if text in {"", "--", "-", "----", "X0.00"}:
+                  return None
+              text = text.replace(",", "")
+              try:
+                  number = float(text)
+                  if number != number:
+                      return None
+                  return number
+              except ValueError:
+                  return None
+
+
+          def parse_volume(value):
+              number = parse_number(value)
+              if number is None:
+                  return 0
+              return int(number)
+
+
+          def is_common_stock_code(code):
+              return bool(re.fullmatch(r"\d{4}", str(code or "").strip()))
+
+          INSERT_SQL = """
+          INSERT INTO tw_stock_prices
+          (symbol, date, open_price, high_price, low_price, close_price, volume)
+          VALUES %s
+          ON CONFLICT (symbol, date)
+          DO UPDATE SET
+              open_price = EXCLUDED.open_price,
+              high_price = EXCLUDED.high_price,
+              low_price = EXCLUDED.low_price,
+              close_price = EXCLUDED.close_price,
+              volume = EXCLUDED.volume
+          """
+
+
+          def connect_db(db_url):
+              return psycopg2.connect(
+                  db_url,
+                  connect_timeout=30,
+                  keepalives=1,
+                  keepalives_idle=30,
+                  keepalives_interval=10,
+                  keepalives_count=5,
+              )
+
+
+          class IncrementalWriter:
+              """邊抓取邊寫入：緩衝滿 batch_size 就 flush 到 Neon。"""
+
+              def __init__(self, db_url, batch_size=200):
+                  self.db_url = db_url
+                  self.batch_size = batch_size
+                  self.buffer = []
+                  self.lock = threading.Lock()
+                  self.total_inserted = 0
+                  self.conn = connect_db(db_url)
+
+              def ensure_connection(self):
+                  try:
+                      if self.conn.closed:
+                          raise psycopg2.InterfaceError("connection closed")
+                      with self.conn.cursor() as cur:
+                          cur.execute("SELECT 1")
+                  except Exception:
+                      print("  🔄 資料庫連線中斷，正在重新連接...", flush=True)
+                      try:
+                          self.conn.close()
+                      except Exception:
+                          pass
+                      self.conn = connect_db(self.db_url)
+                      print("  ✅ 資料庫重新連接成功", flush=True)
+
+              def add(self, record):
+                  with self.lock:
+                      self.buffer.append(record)
+                      if len(self.buffer) >= self.batch_size:
+                          self._flush_unlocked()
+
+              def flush(self):
+                  with self.lock:
+                      self._flush_unlocked()
+
+              def _flush_unlocked(self):
+                  if not self.buffer:
+                      return
+                  batch = self.buffer
+                  self.buffer = []
+                  last_error = None
+                  for attempt in range(1, 4):
+                      try:
+                          self.ensure_connection()
+                          with self.conn.cursor() as cur:
+                              execute_values(cur, INSERT_SQL, batch)
+                          self.conn.commit()
+                          self.total_inserted += len(batch)
+                          print(f"  💾 已同步至資料庫: {self.total_inserted} 筆", flush=True)
+                          return
+                      except Exception as err:
+                          last_error = err
+                          print(f"  ⚠️ 寫入失敗 ({attempt}/3): {err}", flush=True)
+                          try:
+                              self.conn.rollback()
+                          except Exception:
+                              pass
+                          try:
+                              self.conn.close()
+                          except Exception:
+                              pass
+                          time.sleep(min(10, 2 ** attempt))
+                          try:
+                              self.conn = connect_db(self.db_url)
+                          except Exception as reconnect_err:
+                              last_error = reconnect_err
+                  self.buffer = batch + self.buffer
+                  raise last_error
+
+              def close(self):
+                  try:
+                      self.conn.close()
+                  except Exception:
+                      pass
+
+
+          def ensure_tables(conn):
+              with conn.cursor() as cur:
+                  cur.execute(
+                      """
+                      CREATE TABLE IF NOT EXISTS tw_stock_prices (
+                          id SERIAL PRIMARY KEY,
+                          symbol VARCHAR(20) NOT NULL,
+                          date DATE NOT NULL,
+                          open_price DECIMAL(10,2),
+                          high_price DECIMAL(10,2),
+                          low_price DECIMAL(10,2),
+                          close_price DECIMAL(10,2),
+                          volume BIGINT,
+                          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                          UNIQUE(symbol, date)
+                      );
+                      """
+                  )
+                  cur.execute(
+                      """
+                      CREATE UNIQUE INDEX IF NOT EXISTS tw_stock_prices_symbol_date_idx
+                      ON tw_stock_prices(symbol, date);
+                      """
+                  )
+                  cur.execute(
+                      """
+                      CREATE TABLE IF NOT EXISTS tw_stock_returns (
+                          id SERIAL PRIMARY KEY,
+                          symbol VARCHAR(20) NOT NULL,
+                          date DATE NOT NULL,
+                          daily_return DECIMAL(10,6),
+                          weekly_return DECIMAL(10,6),
+                          monthly_return DECIMAL(10,6),
+                          quarterly_return DECIMAL(10,6),
+                          yearly_return DECIMAL(10,6),
+                          cumulative_return DECIMAL(10,6),
+                          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                          UNIQUE(symbol, date)
+                      );
+                      """
+                  )
+                  cur.execute(
+                      """
+                      CREATE UNIQUE INDEX IF NOT EXISTS tw_stock_returns_symbol_date_idx
+                      ON tw_stock_returns(symbol, date);
+                      """
+                  )
+              conn.commit()
+
+
+          def pick_mi_index_table(tables):
+              best = None
+              best_count = 0
+              for table in tables or []:
+                  rows = table.get("data") or []
+                  title = table.get("title") or ""
+                  if len(rows) > best_count and "收盤" in title:
+                      best = table
+                      best_count = len(rows)
+              if best:
+                  return best
+              for table in tables or []:
+                  rows = table.get("data") or []
+                  if len(rows) > best_count:
+                      best = table
+                      best_count = len(rows)
+              return best
+
+
+          def fetch_twse_bulk(writer, target_date):
+              print("📥 批量抓取上市收盤行情（MI_INDEX）...", flush=True)
+              try:
+                  query_date = f"{target_date.year}{target_date.month:02d}{target_date.day:02d}"
+                  data = get_json(
+                      "https://www.twse.com.tw/exchangeReport/MI_INDEX",
+                      params={
+                          "response": "json",
+                          "date": query_date,
+                          "type": "ALLBUT0999",
+                      },
+                      referer=TWSE_REFERER,
+                  )
+              except Exception as err:
+                  print(f"⚠️ 上市批量抓取失敗: {err}", flush=True)
+                  return 0
+
+              if data.get("stat") != "OK":
+                  print(f"⚠️ 上市行情：{data.get('stat', '未知狀態')}", flush=True)
+                  return 0
+
+              table = pick_mi_index_table(data.get("tables"))
+              rows = (table or {}).get("data") or []
+              success_count = 0
+
+              for row in rows:
+                  try:
+                      code = str(row[0]).strip()
+                      if not is_common_stock_code(code):
+                          continue
+
+                      open_price = parse_number(row[5])
+                      high_price = parse_number(row[6])
+                      low_price = parse_number(row[7])
+                      close_price = parse_number(row[8])
+                      volume = parse_volume(row[2])
+
+                      if close_price and 0 < close_price < 30000:
+                          writer.add(
+                              (
+                                  f"{code}.TW",
+                                  target_date,
+                                  open_price,
+                                  high_price,
+                                  low_price,
+                                  close_price,
+                                  volume,
+                              )
+                          )
+                          success_count += 1
+                  except (IndexError, TypeError, ValueError):
+                      continue
+
+              writer.flush()
+              print(f"✅ 上市股票完成：{success_count} 檔", flush=True)
+              return success_count
+
+
+          def fetch_tpex_bulk(writer, target_date):
+              print("📥 批量抓取上櫃收盤行情...", flush=True)
+              try:
+                  roc_date = f"{target_date.year - 1911}/{target_date.month:02d}/{target_date.day:02d}"
+                  data = get_json(
+                      "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php",
+                      params={"l": "zh-tw", "d": roc_date, "se": "AL"},
+                      referer=TPEX_REFERER,
+                  )
+              except Exception as err:
+                  print(f"⚠️ 上櫃批量抓取失敗: {err}", flush=True)
+                  return 0
+
+              tables = data.get("tables") or []
+              rows = tables[0].get("data") if tables else []
+              if not rows:
+                  print("⚠️ 上櫃行情：無資料", flush=True)
+                  return 0
+
+              success_count = 0
+              for row in rows:
+                  try:
+                      code = str(row[0]).strip()
+                      if not is_common_stock_code(code):
+                          continue
+
+                      close_price = parse_number(row[2])
+                      open_price = parse_number(row[4])
+                      high_price = parse_number(row[5])
+                      low_price = parse_number(row[6])
+                      volume = parse_volume(row[7])
+
+                      if close_price and 0 < close_price < 30000:
+                          writer.add(
+                              (
+                                  f"{code}.TWO",
+                                  target_date,
+                                  open_price,
+                                  high_price,
+                                  low_price,
+                                  close_price,
+                                  volume,
+                              )
+                          )
+                          success_count += 1
+                  except (IndexError, TypeError, ValueError):
+                      continue
+
+              writer.flush()
+              print(f"✅ 上櫃股票完成：{success_count} 檔", flush=True)
+              return success_count
+
+
+          def fetch_twii_single_day(target_date):
+              print("📈 嘗試從 yfinance 抓取加權指數 (^TWII)...", flush=True)
+              try:
+                  start = target_date.strftime("%Y-%m-%d")
+                  end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                  df = yf.Ticker("^TWII").history(start=start, end=end, auto_adjust=False)
+                  if df is None or df.empty:
+                      print("⚠️ yfinance 未回傳當日 ^TWII 資料", flush=True)
+                      return None
+
+                  row = df.iloc[0]
+
+                  def to_float(value):
+                      try:
+                          if value is None:
+                              return None
+                          number = float(value)
+                          return None if number != number else number
+                      except Exception:
+                          return None
+
+                  def to_int(value):
+                      try:
+                          if value is None:
+                              return 0
+                          number = float(value)
+                          return 0 if number != number else int(number)
+                      except Exception:
+                          return 0
+
+                  close_price = to_float(row.get("Close"))
+                  if close_price is None:
+                      print("⚠️ yfinance 缺少收盤價，略過 ^TWII", flush=True)
+                      return None
+
+                  return (
+                      "^TWII",
+                      target_date,
+                      to_float(row.get("Open")),
+                      to_float(row.get("High")),
+                      to_float(row.get("Low")),
+                      close_price,
+                      to_int(row.get("Volume")),
+                  )
+              except Exception as err:
+                  print(f"⚠️ 加權指數 (^TWII) yfinance 抓取失敗: {err}", flush=True)
+                  return None
+
+
+          def compute_returns(writer, target_date):
+              print("\n🧮 計算並回寫今日報酬率到 tw_stock_returns...", flush=True)
+              writer.ensure_connection()
+              conn = writer.conn
+              last_error = None
+              for attempt in range(1, 4):
+                  try:
+                      writer.ensure_connection()
+                      conn = writer.conn
+                      with conn.cursor() as cur:
+                          cur.execute(
+                              """
+                              WITH s AS (
+                                  SELECT
+                                      symbol,
+                                      date,
+                                      close_price,
+                                      LAG(close_price, 1)   OVER (PARTITION BY symbol ORDER BY date) AS prev_1,
+                                      LAG(close_price, 5)   OVER (PARTITION BY symbol ORDER BY date) AS prev_5,
+                                      LAG(close_price, 21)  OVER (PARTITION BY symbol ORDER BY date) AS prev_21,
+                                      LAG(close_price, 63)  OVER (PARTITION BY symbol ORDER BY date) AS prev_63,
+                                      LAG(close_price, 252) OVER (PARTITION BY symbol ORDER BY date) AS prev_252
+                                  FROM tw_stock_prices
+                                  WHERE date >= %s - INTERVAL '1000 days' AND date <= %s
+                              ), firsts AS (
+                                  SELECT DISTINCT ON (symbol)
+                                      symbol,
+                                      close_price AS first_close
+                                  FROM tw_stock_prices
+                                  ORDER BY symbol, date ASC
+                              ), t AS (
+                                  SELECT
+                                      s.symbol,
+                                      s.date,
+                                      CASE WHEN s.close_price IS NULL OR s.prev_1 IS NULL OR s.prev_1 = 0
+                                           THEN NULL ELSE ROUND((s.close_price/s.prev_1 - 1)::numeric, 6) END AS daily_return,
+                                      CASE WHEN s.close_price IS NULL OR s.prev_5 IS NULL OR s.prev_5 = 0
+                                           THEN NULL ELSE ROUND((s.close_price/s.prev_5 - 1)::numeric, 6) END AS weekly_return,
+                                      CASE WHEN s.close_price IS NULL OR s.prev_21 IS NULL OR s.prev_21 = 0
+                                           THEN NULL ELSE ROUND((s.close_price/s.prev_21 - 1)::numeric, 6) END AS monthly_return,
+                                      CASE WHEN s.close_price IS NULL OR s.prev_63 IS NULL OR s.prev_63 = 0
+                                           THEN NULL ELSE ROUND((s.close_price/s.prev_63 - 1)::numeric, 6) END AS quarterly_return,
+                                      CASE WHEN s.close_price IS NULL OR s.prev_252 IS NULL OR s.prev_252 = 0
+                                           THEN NULL ELSE ROUND((s.close_price/s.prev_252 - 1)::numeric, 6) END AS yearly_return,
+                                      CASE WHEN s.close_price IS NULL OR f.first_close IS NULL OR f.first_close = 0
+                                           THEN NULL ELSE ROUND((s.close_price/f.first_close - 1)::numeric, 6) END AS cumulative_return
+                                  FROM s
+                                  JOIN firsts f ON f.symbol = s.symbol
+                                  WHERE s.date = %s
+                              )
+                              INSERT INTO tw_stock_returns (
+                                  symbol, date, daily_return, weekly_return, monthly_return,
+                                  quarterly_return, yearly_return, cumulative_return
+                              )
+                              SELECT
+                                  symbol, date, daily_return, weekly_return, monthly_return,
+                                  quarterly_return, yearly_return, cumulative_return
+                              FROM t
+                              ON CONFLICT (symbol, date) DO UPDATE SET
+                                  daily_return = EXCLUDED.daily_return,
+                                  weekly_return = EXCLUDED.weekly_return,
+                                  monthly_return = EXCLUDED.monthly_return,
+                                  quarterly_return = EXCLUDED.quarterly_return,
+                                  yearly_return = EXCLUDED.yearly_return,
+                                  cumulative_return = EXCLUDED.cumulative_return;
+                              """,
+                              (target_date, target_date, target_date),
+                          )
+                          conn.commit()
+                          cur.execute(
+                              "SELECT COUNT(*) FROM tw_stock_returns WHERE date = %s",
+                              (target_date,),
+                          )
+                          today_count = cur.fetchone()[0]
+                      print(f"✅ 今日報酬率已寫入/更新 {today_count} 筆", flush=True)
+                      return
+                  except Exception as err:
+                      last_error = err
+                      print(f"  ⚠️ 報酬率計算失敗 ({attempt}/3): {err}", flush=True)
+                      try:
+                          conn.rollback()
+                      except Exception:
+                          pass
+                      time.sleep(min(10, 2 ** attempt))
+              raise last_error
+
 
           print("=" * 80, flush=True)
           print("🚀 開始執行 GitHub Actions 股價資料抓取任務", flush=True)
@@ -59,529 +562,47 @@ jobs:
               print("❌ 錯誤：未設定 NEON_DATABASE_URL", flush=True)
               sys.exit(1)
 
+          writer = None
           try:
               print("🔌 正在連接 Neon 資料庫...", flush=True)
-              conn = psycopg2.connect(NEON_DB_URL, sslmode="require")
-              cur = conn.cursor()
+              writer = IncrementalWriter(NEON_DB_URL, batch_size=200)
               print("✅ 已連接到 Neon 資料庫", flush=True)
-              print(flush=True)
-          except Exception as e:
-              print(f"❌ 資料庫連線失敗：{e}", flush=True)
-              sys.exit(1)
+              ensure_tables(writer.conn)
 
-          def ensure_tables():
-              cur.execute(
-                  """
-                  CREATE TABLE IF NOT EXISTS tw_stock_prices (
-                      symbol TEXT NOT NULL,
-                      date DATE NOT NULL,
-                      open_price DOUBLE PRECISION,
-                      high_price DOUBLE PRECISION,
-                      low_price DOUBLE PRECISION,
-                      close_price DOUBLE PRECISION,
-                      volume BIGINT,
-                      created_at TIMESTAMPTZ DEFAULT NOW(),
-                      updated_at TIMESTAMPTZ DEFAULT NOW(),
-                      PRIMARY KEY (symbol, date)
-                  )
-                  """
-              )
-              cur.execute(
-                  """
-                  CREATE INDEX IF NOT EXISTS tw_stock_prices_symbol_date_idx
-                  ON tw_stock_prices(symbol, date DESC)
-                  """
-              )
-
-              cur.execute(
-                  """
-                  CREATE TABLE IF NOT EXISTS tw_stock_returns (
-                      symbol TEXT NOT NULL,
-                      date DATE NOT NULL,
-                      daily_return DOUBLE PRECISION,
-                      weekly_return DOUBLE PRECISION,
-                      monthly_return DOUBLE PRECISION,
-                      quarterly_return DOUBLE PRECISION,
-                      yearly_return DOUBLE PRECISION,
-                      created_at TIMESTAMPTZ DEFAULT NOW(),
-                      updated_at TIMESTAMPTZ DEFAULT NOW(),
-                      PRIMARY KEY (symbol, date)
-                  )
-                  """
-              )
-              cur.execute(
-                  """
-                  CREATE INDEX IF NOT EXISTS tw_stock_returns_symbol_date_idx
-                  ON tw_stock_returns(symbol, date DESC)
-                  """
-              )
-
-              cur.execute(
-                  """
-                  CREATE TABLE IF NOT EXISTS tw_stock_symbols (
-                      symbol TEXT PRIMARY KEY,
-                      name TEXT,
-                      short_name TEXT,
-                      market TEXT,
-                      industry TEXT
-                  )
-                  """
-              )
-
-              cur.execute(
-                  """
-                  ALTER TABLE tw_stock_returns
-                  ADD COLUMN IF NOT EXISTS daily_return DOUBLE PRECISION
-                  """
-              )
-              cur.execute(
-                  """
-                  ALTER TABLE tw_stock_returns
-                  ADD COLUMN IF NOT EXISTS weekly_return DOUBLE PRECISION
-                  """
-              )
-              cur.execute(
-                  """
-                  ALTER TABLE tw_stock_returns
-                  ADD COLUMN IF NOT EXISTS monthly_return DOUBLE PRECISION
-                  """
-              )
-              cur.execute(
-                  """
-                  ALTER TABLE tw_stock_returns
-                  ADD COLUMN IF NOT EXISTS quarterly_return DOUBLE PRECISION
-                  """
-              )
-              cur.execute(
-                  """
-                  ALTER TABLE tw_stock_returns
-                  ADD COLUMN IF NOT EXISTS yearly_return DOUBLE PRECISION
-                  """
-              )
-
-              conn.commit()
-
-          def normalize_symbol(raw):
-              value = str(raw or "").strip().upper()
-              if value.endswith(".TW"):
-                  return value[:-3], "TWSE"
-              if value.endswith(".TWO"):
-                  return value[:-4], "TPEX"
-              return value, None
-
-          def get_stock_symbols():
-              print("📋 從資料庫取得股票清單...", flush=True)
-
-              twse_symbols = []
-              tpex_symbols = []
-
-              try:
-                  cur.execute(
-                      """
-                      SELECT symbol, market
-                      FROM tw_stock_symbols
-                      WHERE symbol IS NOT NULL
-                        AND btrim(symbol) <> ''
-                      ORDER BY symbol
-                      """
-                  )
-                  rows = cur.fetchall()
-
-                  if rows:
-                      for symbol, market in rows:
-                          base_symbol, inferred_market = normalize_symbol(symbol)
-                          if not (base_symbol.isdigit() and len(base_symbol) == 4):
-                              continue
-
-                          market_value = str(market or inferred_market or "").strip().upper()
-                          if market_value in ("TWSE", "SII", "LISTED", "上市"):
-                              twse_symbols.append(base_symbol)
-                          elif market_value in ("TPEX", "OTC", "TWO", "上櫃"):
-                              tpex_symbols.append(base_symbol)
-                          else:
-                              if str(symbol).upper().endswith(".TW"):
-                                  twse_symbols.append(base_symbol)
-                              elif str(symbol).upper().endswith(".TWO"):
-                                  tpex_symbols.append(base_symbol)
-
-                  if twse_symbols or tpex_symbols:
-                      twse_symbols = sorted(set(twse_symbols))
-                      tpex_symbols = sorted(set(tpex_symbols))
-                      print(f"✅ 從 tw_stock_symbols 取得：上市 {len(twse_symbols)} 檔、上櫃 {len(tpex_symbols)} 檔", flush=True)
-                      return twse_symbols, tpex_symbols
-              except Exception as e:
-                  print(f"⚠️ 讀取 tw_stock_symbols 失敗：{e}", flush=True)
-
-              try:
-                  cur.execute(
-                      """
-                      SELECT DISTINCT symbol
-                      FROM tw_stock_prices
-                      WHERE symbol IS NOT NULL
-                        AND btrim(symbol) <> ''
-                      ORDER BY symbol
-                      """
-                  )
-                  rows = cur.fetchall()
-
-                  for (symbol,) in rows:
-                      raw = str(symbol or "").strip().upper()
-                      base_symbol, inferred_market = normalize_symbol(raw)
-
-                      if not (base_symbol.isdigit() and len(base_symbol) == 4):
-                          continue
-
-                      if inferred_market == "TWSE":
-                          twse_symbols.append(base_symbol)
-                      elif inferred_market == "TPEX":
-                          tpex_symbols.append(base_symbol)
-
-                  twse_symbols = sorted(set(twse_symbols))
-                  tpex_symbols = sorted(set(tpex_symbols))
-
-                  print(f"✅ 從 tw_stock_prices fallback 取得：上市 {len(twse_symbols)} 檔、上櫃 {len(tpex_symbols)} 檔", flush=True)
-                  return twse_symbols, tpex_symbols
-              except Exception as e:
-                  print(f"⚠️ 讀取 tw_stock_prices 失敗：{e}", flush=True)
-
-              return [], []
-
-          def fetch_stock_data_single_day(symbol, target_date, is_twse=True):
-              year = target_date.year
-              month = target_date.month
-              day = target_date.day
-              headers = {"User-Agent": "Mozilla/5.0"}
-
-              try:
-                  if is_twse:
-                      url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-                      params = {
-                          "response": "json",
-                          "date": f"{year}{month:02d}01",
-                          "stockNo": symbol,
-                      }
-
-                      response = requests.get(url, params=params, headers=headers, timeout=10)
-                      if response.status_code != 200:
-                          return None
-
-                      data = response.json()
-                      if data.get("stat") == "OK" and data.get("data"):
-                          for row in data["data"]:
-                              try:
-                                  date_parts = row[0].split("/")
-                                  if len(date_parts) != 3:
-                                      continue
-
-                                  trade_date = date(int(date_parts[0]) + 1911, int(date_parts[1]), int(date_parts[2]))
-                                  if trade_date != target_date:
-                                      continue
-
-                                  volume = int(row[1].replace(",", "")) if row[1] != "--" else 0
-                                  open_price = float(row[3].replace(",", "")) if row[3] != "--" else None
-                                  high_price = float(row[4].replace(",", "")) if row[4] != "--" else None
-                                  low_price = float(row[5].replace(",", "")) if row[5] != "--" else None
-                                  close_price = float(row[6].replace(",", "")) if row[6] != "--" else None
-
-                                  if close_price and 0 < close_price < 30000:
-                                      return (
-                                          f"{symbol}.TW",
-                                          target_date,
-                                          open_price,
-                                          high_price,
-                                          low_price,
-                                          close_price,
-                                          volume,
-                                      )
-                              except (ValueError, IndexError):
-                                  continue
-                  else:
-                      roc_date = f"{year-1911}/{month:02d}/{day:02d}"
-                      url = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php"
-                      params = {
-                          "l": "zh-tw",
-                          "d": roc_date,
-                          "se": "AL",
-                      }
-
-                      response = requests.get(url, params=params, headers=headers, timeout=10)
-                      if response.status_code != 200:
-                          return None
-
-                      data = response.json()
-                      if data.get("tables") and len(data["tables"]) > 0:
-                          table_data = data["tables"][0].get("data", [])
-
-                          for row in table_data:
-                              try:
-                                  stock_symbol = row[0].strip()
-                                  if stock_symbol != symbol:
-                                      continue
-
-                                  close_price = float(row[2].replace(",", "")) if row[2] not in ["-", "----", ""] else None
-                                  open_price = float(row[4].replace(",", "")) if row[4] not in ["-", "----", ""] else None
-                                  high_price = float(row[5].replace(",", "")) if row[5] not in ["-", "----", ""] else None
-                                  low_price = float(row[6].replace(",", "")) if row[6] not in ["-", "----", ""] else None
-                                  volume = int(row[7].replace(",", "")) if row[7] not in ["-", "0", ""] else 0
-
-                                  if close_price and 0 < close_price < 30000:
-                                      return (
-                                          f"{symbol}.TWO",
-                                          target_date,
-                                          open_price,
-                                          high_price,
-                                          low_price,
-                                          close_price,
-                                          volume,
-                                      )
-                              except (ValueError, IndexError):
-                                  continue
-              except Exception:
-                  return None
-
-              return None
-
-          def fetch_twii_single_day(target_date):
-              print("📈 嘗試從 yfinance 抓取加權指數 (^TWII)...", flush=True)
-              try:
-                  start = target_date.strftime("%Y-%m-%d")
-                  end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
-
-                  ticker = yf.Ticker("^TWII")
-                  df = ticker.history(start=start, end=end, auto_adjust=False)
-
-                  if df is None or df.empty:
-                      print("⚠️ yfinance 未回傳當日 ^TWII 資料", flush=True)
-                      return None
-
-                  row = df.iloc[0]
-
-                  def to_float(v):
-                      try:
-                          if v is None:
-                              return None
-                          f = float(v)
-                          if f != f:
-                              return None
-                          return f
-                      except Exception:
-                          return None
-
-                  def to_int(v):
-                      try:
-                          if v is None:
-                              return 0
-                          f = float(v)
-                          if f != f:
-                              return 0
-                          return int(f)
-                      except Exception:
-                          return 0
-
-                  open_price = to_float(row.get("Open"))
-                  high_price = to_float(row.get("High"))
-                  low_price = to_float(row.get("Low"))
-                  close_price = to_float(row.get("Close"))
-                  volume = to_int(row.get("Volume"))
-
-                  if close_price is None:
-                      print("⚠️ yfinance 缺少收盤價，略過 ^TWII", flush=True)
-                      return None
-
-                  return (
-                      "^TWII",
-                      target_date,
-                      open_price,
-                      high_price,
-                      low_price,
-                      close_price,
-                      volume,
-                  )
-              except Exception as err:
-                  print(f"⚠️ 加權指數 (^TWII) yfinance 抓取失敗: {err}", flush=True)
-                  return None
-
-          try:
-              ensure_tables()
               today = date.today()
 
-              twse_symbols, tpex_symbols = get_stock_symbols()
-              total_symbols = len(twse_symbols) + len(tpex_symbols)
-
-              if total_symbols == 0:
-                  print("❌ 無法從資料庫取得股票清單", flush=True)
-                  sys.exit(1)
-
-              print(f"\n📊 準備抓取 {total_symbols} 檔股票資料", flush=True)
-              print(f"   上市：{len(twse_symbols)} 檔", flush=True)
-              print(f"   上櫃：{len(tpex_symbols)} 檔", flush=True)
-              print(flush=True)
-
-              all_records = []
-              lock = threading.Lock()
-
-              def fetch_and_collect(symbol, is_twse):
-                  result = fetch_stock_data_single_day(symbol, today, is_twse)
-                  if result:
-                      with lock:
-                          all_records.append(result)
-                  time.sleep(0.3)
-                  return result is not None
-
-              print("📥 使用併發抓取上市股票（10 併發）...", flush=True)
-              twse_success_count = 0
-              with ThreadPoolExecutor(max_workers=10) as executor:
-                  futures = {executor.submit(fetch_and_collect, symbol, True): symbol for symbol in twse_symbols}
-                  for i, future in enumerate(as_completed(futures), 1):
-                      try:
-                          if future.result():
-                              twse_success_count += 1
-                      except Exception:
-                          pass
-
-                      if i % 50 == 0 or i == len(twse_symbols):
-                          print(f"  進度: {i}/{len(twse_symbols)}, 成功: {twse_success_count}", flush=True)
-
-              print(f"✅ 上市股票完成：{twse_success_count} / {len(twse_symbols)} 檔", flush=True)
-
-              print("\n📥 使用併發抓取上櫃股票（10 併發）...", flush=True)
-              tpex_success_count = 0
-              with ThreadPoolExecutor(max_workers=10) as executor:
-                  futures = {executor.submit(fetch_and_collect, symbol, False): symbol for symbol in tpex_symbols}
-                  for i, future in enumerate(as_completed(futures), 1):
-                      try:
-                          if future.result():
-                              tpex_success_count += 1
-                      except Exception:
-                          pass
-
-                      if i % 50 == 0 or i == len(tpex_symbols):
-                          print(f"  進度: {i}/{len(tpex_symbols)}, 成功: {tpex_success_count}", flush=True)
-
-              print(f"✅ 上櫃股票完成：{tpex_success_count} / {len(tpex_symbols)} 檔", flush=True)
-              print(f"\n📦 總計抓取：{len(all_records)} 筆資料", flush=True)
+              twse_count = fetch_twse_bulk(writer, today)
+              tpex_count = fetch_tpex_bulk(writer, today)
+              print(f"\n📦 上市/上櫃合計：{twse_count + tpex_count} 檔", flush=True)
 
               index_record = fetch_twii_single_day(today)
               if index_record:
-                  all_records.append(index_record)
-                  print(f"📈 已加入加權指數資料，總筆數：{len(all_records)}", flush=True)
+                  writer.add(index_record)
+                  writer.flush()
+                  print("📈 已加入加權指數資料", flush=True)
               else:
                   print("⚠️ 本次未取得加權指數 (^TWII) 資料", flush=True)
 
-              if not all_records:
-                  print("⚠️ 今日無資料可同步（可能是非交易日或資料尚未公布）", flush=True)
+              if writer.total_inserted == 0:
+                  print("⚠️  今日無資料可同步（可能是非交易日或資料尚未公布）", flush=True)
                   print("✅ 任務完成（無資料更新）", flush=True)
                   sys.exit(0)
 
-              print(flush=True)
-              print(f"📦 準備同步 {len(all_records)} 筆資料到 Neon 資料庫...", flush=True)
-
-              batch_size = 1000
-              total_inserted = 0
-
-              for i in range(0, len(all_records), batch_size):
-                  batch = all_records[i : i + batch_size]
-                  try:
-                      execute_values(
-                          cur,
-                          """
-                          INSERT INTO tw_stock_prices
-                          (symbol, date, open_price, high_price, low_price, close_price, volume)
-                          VALUES %s
-                          ON CONFLICT (symbol, date)
-                          DO UPDATE SET
-                              open_price = EXCLUDED.open_price,
-                              high_price = EXCLUDED.high_price,
-                              low_price = EXCLUDED.low_price,
-                              close_price = EXCLUDED.close_price,
-                              volume = EXCLUDED.volume,
-                              updated_at = NOW()
-                          """,
-                          batch,
-                      )
-                      conn.commit()
-                      total_inserted += len(batch)
-                      print(f"  已同步: {total_inserted}/{len(all_records)} 筆", flush=True)
-                  except Exception as e:
-                      print(f"  ⚠️ 批次 {i//batch_size + 1} 失敗: {e}", flush=True)
-                      conn.rollback()
-
-              print(f"✅ 成功同步 {total_inserted} 筆資料到 tw_stock_prices", flush=True)
-
-              try:
-                  print("\n🧮 計算並回寫今日報酬率到 tw_stock_returns...", flush=True)
-                  cur.execute(
-                      """
-                      WITH s AS (
-                          SELECT
-                              symbol,
-                              date,
-                              close_price,
-                              LAG(close_price, 1)   OVER (PARTITION BY symbol ORDER BY date) AS prev_1,
-                              LAG(close_price, 5)   OVER (PARTITION BY symbol ORDER BY date) AS prev_5,
-                              LAG(close_price, 21)  OVER (PARTITION BY symbol ORDER BY date) AS prev_21,
-                              LAG(close_price, 63)  OVER (PARTITION BY symbol ORDER BY date) AS prev_63,
-                              LAG(close_price, 252) OVER (PARTITION BY symbol ORDER BY date) AS prev_252
-                          FROM tw_stock_prices
-                          WHERE date >= %s - INTERVAL '1000 days' AND date <= %s
-                      ), t AS (
-                          SELECT
-                              s.symbol,
-                              s.date,
-                              CASE WHEN s.close_price IS NULL OR s.prev_1 IS NULL OR s.prev_1 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_1 - 1)::numeric, 6) END AS daily_return,
-                              CASE WHEN s.close_price IS NULL OR s.prev_5 IS NULL OR s.prev_5 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_5 - 1)::numeric, 6) END AS weekly_return,
-                              CASE WHEN s.close_price IS NULL OR s.prev_21 IS NULL OR s.prev_21 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_21 - 1)::numeric, 6) END AS monthly_return,
-                              CASE WHEN s.close_price IS NULL OR s.prev_63 IS NULL OR s.prev_63 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_63 - 1)::numeric, 6) END AS quarterly_return,
-                              CASE WHEN s.close_price IS NULL OR s.prev_252 IS NULL OR s.prev_252 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_252 - 1)::numeric, 6) END AS yearly_return
-                          FROM s
-                          WHERE s.date = %s
-                      )
-                      INSERT INTO tw_stock_returns (symbol, date, daily_return, weekly_return, monthly_return, quarterly_return, yearly_return, updated_at)
-                      SELECT symbol, date, daily_return, weekly_return, monthly_return, quarterly_return, yearly_return, NOW()
-                      FROM t
-                      ON CONFLICT (symbol, date) DO UPDATE SET
-                          daily_return = EXCLUDED.daily_return,
-                          weekly_return = EXCLUDED.weekly_return,
-                          monthly_return = EXCLUDED.monthly_return,
-                          quarterly_return = EXCLUDED.quarterly_return,
-                          yearly_return = EXCLUDED.yearly_return,
-                          updated_at = NOW()
-                      """,
-                      (today, today, today),
-                  )
-                  conn.commit()
-
-                  cur.execute("SELECT COUNT(*) FROM tw_stock_returns WHERE date = %s", (today,))
-                  today_count = cur.fetchone()[0]
-                  print(f"✅ 今日報酬率已寫入/更新 {today_count} 筆", flush=True)
-              except Exception as e:
-                  print(f"⚠️ 計算/寫入報酬率失敗: {e}", flush=True)
-                  conn.rollback()
+              print(f"\n✅ 股價資料同步完成，共 {writer.total_inserted} 筆", flush=True)
+              compute_returns(writer, today)
 
               print(flush=True)
               print("=" * 80, flush=True)
               print("🎉 GitHub Actions 任務執行完成！", flush=True)
               print("=" * 80, flush=True)
-
-          except Exception as e:
-              print(f"❌ 執行過程發生錯誤：{e}", flush=True)
+          except Exception as err:
+              print(f"❌ 執行過程發生錯誤：{err}", flush=True)
               import traceback
               traceback.print_exc()
               sys.exit(1)
           finally:
-              try:
-                  cur.close()
-              except Exception:
-                  pass
-              try:
-                  conn.close()
-              except Exception:
-                  pass
+              if writer is not None:
+                  writer.close()
           PYTHON_SCRIPT
 
       - name: Upload logs
