@@ -494,10 +494,11 @@ jobs:
                           auto_adjust=False,
                           actions=False,
                       )
+
                       if hist is None or hist.empty:
                           continue
 
-                          rows = []
+                      rows = []
                       for _, row in hist.iterrows():
                           normalized = normalize_price_row(symbol, row)
                           if normalized:
@@ -505,12 +506,15 @@ jobs:
 
                       if rows:
                           return rows
+
                   except Exception as err:
                       last_err = err
                       continue
 
               if last_err:
-                  raise last_err
+                  print(f"  {symbol} 所有候選代碼皆失敗：{last_err}", flush=True)
+                  return []
+
               return []
 
           def fetch_market(symbols, writer, start_date, end_date, max_workers=8):
