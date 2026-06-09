@@ -1,609 +1,642 @@
-name: Daily Stock Data Fetch
-
-on:
-  schedule:
-    - cron: '57 3 * * 1-5'
-  workflow_dispatch:
-
-env:
-  TZ: Asia/Taipei
-
-jobs:
-  fetch-stock-data:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests psycopg2-binary beautifulsoup4 yfinance
-
-      - name: Fetch stock data and sync to Neon, then compute returns
-        env:
-          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
-          PYTHONUNBUFFERED: 1
-        run: |
-          python3 -u << 'PYTHON_SCRIPT'
-          import os
-          import sys
-          import time
-          import threading
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          from datetime import date, datetime, timedelta
-
-          import psycopg2
-          import requests
-          import yfinance as yf
-          from bs4 import BeautifulSoup
-          from psycopg2.extras import execute_values
-          from requests.adapters import HTTPAdapter
-          from urllib3.util.retry import Retry
-
-          sys.stdout.flush()
-          sys.stderr.flush()
-
-          HEADERS = {
-              "User-Agent": (
-                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-              ),
-              "Accept": "text/html,application/json,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-              "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-              "Connection": "keep-alive",
-          }
-
-          INSERT_SQL = """
-          INSERT INTO tw_stock_prices
-          (symbol, date, open_price, high_price, low_price, close_price, volume)
-          VALUES %s
-          ON CONFLICT (symbol, date)
-          DO UPDATE SET
-              open_price = EXCLUDED.open_price,
-              high_price = EXCLUDED.high_price,
-              low_price = EXCLUDED.low_price,
-              close_price = EXCLUDED.close_price,
-              volume = EXCLUDED.volume
-          """
-
-
-          def build_session():
-              session = requests.Session()
-              retry = Retry(
-                  total=5,
-                  connect=5,
-                  read=5,
-                  backoff_factor=1.5,
-                  status_forcelist=[429, 500, 502, 503, 504],
-                  allowed_methods=["GET"],
-                  raise_on_status=False,
-              )
-              adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
-              session.mount("http://", adapter)
-              session.mount("https://", adapter)
-              session.headers.update(HEADERS)
-              return session
-
-
-          SESSION = build_session()
-
-
-          class IncrementalWriter:
-              def __init__(self, conn, batch_size=500):
-                  self.conn = conn
-                  self.batch_size = batch_size
-                  self.buffer = []
-                  self.lock = threading.Lock()
-                  self.total_inserted = 0
-
-              def add(self, record):
-                  with self.lock:
-                      self.buffer.append(record)
-                      if len(self.buffer) >= self.batch_size:
-                          self._flush_unlocked()
-
-              def flush(self):
-                  with self.lock:
-                      self._flush_unlocked()
-
-              def _flush_unlocked(self):
-                  if not self.buffer:
-                      return
-                  batch = self.buffer
-                  self.buffer = []
-                  try:
-                      with self.conn.cursor() as cur:
-                          execute_values(cur, INSERT_SQL, batch)
-                      self.conn.commit()
-                      self.total_inserted += len(batch)
-                      print(f"  💾 已同步至資料庫: {self.total_inserted} 筆", flush=True)
-                  except Exception as err:
-                      self.conn.rollback()
-                      print(f"  ⚠️ flush 失敗，本批 {len(batch)} 筆：{err}", flush=True)
-                      raise
-
-
-          def ensure_tables(conn):
-              with conn.cursor() as cur:
-                  cur.execute(
-                      """
-                      CREATE TABLE IF NOT EXISTS tw_stock_prices (
-                          id SERIAL PRIMARY KEY,
-                          symbol VARCHAR(20) NOT NULL,
-                          date DATE NOT NULL,
-                          open_price DECIMAL(10,2),
-                          high_price DECIMAL(10,2),
-                          low_price DECIMAL(10,2),
-                          close_price DECIMAL(10,2),
-                          volume BIGINT,
-                          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                          UNIQUE(symbol, date)
-                      );
-                      """
-                  )
-                  cur.execute(
-                      """
-                      CREATE UNIQUE INDEX IF NOT EXISTS tw_stock_prices_symbol_date_idx
-                      ON tw_stock_prices(symbol, date);
-                      """
-                  )
-                  cur.execute(
-                      """
-                      CREATE TABLE IF NOT EXISTS tw_stock_returns (
-                          id SERIAL PRIMARY KEY,
-                          symbol VARCHAR(20) NOT NULL,
-                          date DATE NOT NULL,
-                          daily_return DECIMAL(10,6),
-                          weekly_return DECIMAL(10,6),
-                          monthly_return DECIMAL(10,6),
-                          quarterly_return DECIMAL(10,6),
-                          yearly_return DECIMAL(10,6),
-                          cumulative_return DECIMAL(10,6),
-                          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                          UNIQUE(symbol, date)
-                      );
-                      """
-                  )
-                  cur.execute(
-                      """
-                      CREATE UNIQUE INDEX IF NOT EXISTS tw_stock_returns_symbol_date_idx
-                      ON tw_stock_returns(symbol, date);
-                      """
-                  )
-              conn.commit()
-
-
-          def safe_get(url, *, params=None, timeout=90, encoding=None):
-              last_err = None
-              for attempt in range(1, 4):
-                  try:
-                      response = SESSION.get(url, params=params, timeout=timeout)
-                      if encoding:
-                          response.encoding = encoding
-                      return response
-                  except Exception as err:
-                      last_err = err
-                      print(f"    第 {attempt} 次請求失敗: {url} -> {err}", flush=True)
-                      if attempt < 3:
-                          time.sleep(attempt * 2)
-              raise last_err
-
-
-          def parse_isin_symbols(html_text, exclude_non_stock=False):
-              soup = BeautifulSoup(html_text, "html.parser")
-              symbols = []
-              exclude_keywords = ["ETF", "DR", "TDR", "認購", "認售", "債券", "受益證券", "基金"]
-
-              for row in soup.find_all("tr"):
-                  cols = row.find_all("td")
-                  if len(cols) < 5:
-                      continue
-                  code_name = cols[0].text.strip()
-                  if "\u3000" not in code_name:
-                      continue
-                  if exclude_non_stock:
-                      security_type = cols[1].text.strip() if len(cols) > 1 else ""
-                      if any(keyword in security_type for keyword in exclude_keywords):
-                          continue
-                  parts = code_name.split("\u3000")
-                  if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
-                      symbols.append(parts[0])
-              return sorted(set(symbols))
-
-
-          def get_symbols_from_mops_csv(listed=True):
-              path = "t187ap03_L.csv" if listed else "t187ap03_O.csv"
-              url = f"https://mopsfin.twse.com.tw/opendata/{path}"
-              response = safe_get(url, timeout=120, encoding="utf-8-sig")
-              symbols = []
-              for line in response.text.splitlines()[1:]:
-                  if not line.strip():
-                      continue
-                  parts = line.split(",")
-                  if len(parts) < 2:
-                      continue
-                  code = parts[1].strip().strip('"')
-                  if code.isdigit() and len(code) == 4:
-                      symbols.append(code)
-              return sorted(set(symbols))
-
-
-          def fetch_isin_symbols(str_mode, exclude_non_stock=False, timeout=120):
-              url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={str_mode}"
-              response = safe_get(url, timeout=timeout, encoding="big5")
-              print(
-                  f"  ISIN strMode={str_mode}: HTTP {response.status_code}, "
-                  f"body {len(response.text)} chars",
-                  flush=True,
-              )
-              return parse_isin_symbols(response.text, exclude_non_stock=exclude_non_stock)
-
-
-          def get_stock_symbols():
-              print("📋 取得股票清單...", flush=True)
-
-              twse_symbols = []
-              tpex_symbols = []
-
-              try:
-                  print("  ⏳ 正在抓取上市股票清單...", flush=True)
-                  twse_symbols = fetch_isin_symbols(2)
-                  print(f"✅ 上市股票（ISIN）：{len(twse_symbols)} 檔", flush=True)
-              except Exception as err:
-                  print(f"⚠️  無法取得上市 ISIN 清單: {err}", flush=True)
-
-              if not twse_symbols:
-                  try:
-                      print("  ↪ 改用 MOPS 開放資料 CSV 取得上市清單...", flush=True)
-                      twse_symbols = get_symbols_from_mops_csv(listed=True)
-                      print(f"✅ 上市股票（MOPS）：{len(twse_symbols)} 檔", flush=True)
-                  except Exception as err:
-                      print(f"⚠️  無法取得上市 MOPS 清單: {err}", flush=True)
-
-              try:
-                  print("  ⏳ 正在抓取上櫃股票清單...", flush=True)
-                  tpex_symbols = fetch_isin_symbols(4, exclude_non_stock=True)
-                  print(f"✅ 上櫃股票（ISIN）：{len(tpex_symbols)} 檔", flush=True)
-              except Exception as err:
-                  print(f"⚠️  無法取得上櫃 ISIN 清單: {err}", flush=True)
-
-              if not tpex_symbols:
-                  try:
-                      print("  ↪ 改用 MOPS 開放資料 CSV 取得上櫃清單...", flush=True)
-                      tpex_symbols = get_symbols_from_mops_csv(listed=False)
-                      print(f"✅ 上櫃股票（MOPS）：{len(tpex_symbols)} 檔", flush=True)
-                  except Exception as err:
-                      print(f"⚠️  無法取得上櫃 MOPS 清單: {err}", flush=True)
-
-              return twse_symbols, tpex_symbols
-
-
-          def fetch_stock_data_single_day(symbol, target_date, is_twse=True):
-              year = target_date.year
-              month = target_date.month
-              day = target_date.day
-
-              try:
-                  if is_twse:
-                      url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-                      params = {
-                          "response": "json",
-                          "date": f"{year}{month:02d}01",
-                          "stockNo": symbol,
-                      }
-                      response = safe_get(url, params=params, timeout=20)
-                      if response.status_code != 200:
-                          return None
-
-                      data = response.json()
-                      if data.get("stat") == "OK" and data.get("data"):
-                          for row in data["data"]:
-                              try:
-                                  date_parts = row[0].split("/")
-                                  if len(date_parts) != 3:
-                                      continue
-                                  trade_date = date(
-                                      int(date_parts[0]) + 1911,
-                                      int(date_parts[1]),
-                                      int(date_parts[2]),
-                                  )
-                                  if trade_date != target_date:
-                                      continue
-
-                                  volume = int(row[1].replace(",", "")) if row[1] != "--" else 0
-                                  open_price = float(row[3].replace(",", "")) if row[3] != "--" else None
-                                  high_price = float(row[4].replace(",", "")) if row[4] != "--" else None
-                                  low_price = float(row[5].replace(",", "")) if row[5] != "--" else None
-                                  close_price = float(row[6].replace(",", "")) if row[6] != "--" else None
-
-                                  if close_price and 0 < close_price < 30000:
-                                      return (
-                                          f"{symbol}.TW",
-                                          target_date,
-                                          open_price,
-                                          high_price,
-                                          low_price,
-                                          close_price,
-                                          volume,
-                                      )
-                              except (ValueError, IndexError):
-                                  continue
-                  else:
-                      roc_date = f"{year - 1911}/{month:02d}/{day:02d}"
-                      url = (
-                          "https://www.tpex.org.tw/web/stock/aftertrading/"
-                          "otc_quotes_no1430/stk_wn1430_result.php"
-                      )
-                      params = {"l": "zh-tw", "d": roc_date, "se": "AL"}
-                      response = safe_get(url, params=params, timeout=20)
-                      if response.status_code != 200:
-                          return None
-
-                      data = response.json()
-                      if data.get("tables"):
-                          for row in data["tables"][0].get("data", []):
-                              try:
-                                  if row[0].strip() != symbol:
-                                      continue
-
-                                  close_price = float(row[2].replace(",", "")) if row[2] not in ["-", "----", ""] else None
-                                  open_price = float(row[4].replace(",", "")) if row[4] not in ["-", "----", ""] else None
-                                  high_price = float(row[5].replace(",", "")) if row[5] not in ["-", "----", ""] else None
-                                  low_price = float(row[6].replace(",", "")) if row[6] not in ["-", "----", ""] else None
-                                  volume = int(row[7].replace(",", "")) if row[7] not in ["-", "0", ""] else 0
-
-                                  if close_price and 0 < close_price < 30000:
-                                      return (
-                                          f"{symbol}.TWO",
-                                          target_date,
-                                          open_price,
-                                          high_price,
-                                          low_price,
-                                          close_price,
-                                          volume,
-                                      )
-                              except (ValueError, IndexError):
-                                  continue
-              except Exception:
-                  pass
-
-              return None
-
-
-          def fetch_twii_single_day(target_date):
-              print("📈 嘗試從 yfinance 抓取加權指數 (^TWII)...", flush=True)
-              try:
-                  start = target_date.strftime("%Y-%m-%d")
-                  end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
-                  df = yf.Ticker("^TWII").history(start=start, end=end, auto_adjust=False)
-                  if df is None or df.empty:
-                      print("⚠️ yfinance 未回傳當日 ^TWII 資料", flush=True)
-                      return None
-
-                  row = df.iloc[0]
-
-                  def to_float(value):
-                      try:
-                          if value is None:
-                              return None
-                          number = float(value)
-                          return None if number != number else number
-                      except Exception:
-                          return None
-
-                  def to_int(value):
-                      try:
-                          if value is None:
-                              return 0
-                          number = float(value)
-                          return 0 if number != number else int(number)
-                      except Exception:
-                          return 0
-
-                  close_price = to_float(row.get("Close"))
-                  if close_price is None:
-                      return None
-
-                  return (
-                      "^TWII",
-                      target_date,
-                      to_float(row.get("Open")),
-                      to_float(row.get("High")),
-                      to_float(row.get("Low")),
-                      close_price,
-                      to_int(row.get("Volume")),
-                  )
-              except Exception as err:
-                  print(f"⚠️ 加權指數 (^TWII) yfinance 抓取失敗: {err}", flush=True)
-                  return None
-
-
-          def fetch_market(writer, symbols, target_date, is_twse, label):
-              success_count = 0
-
-              def fetch_and_write(symbol):
-                  result = fetch_stock_data_single_day(symbol, target_date, is_twse)
-                  if result:
-                      writer.add(result)
-                  time.sleep(0.3)
-                  return result is not None
-
-              print(f"📥 邊抓邊寫 — {label}（10 併發）...", flush=True)
-              with ThreadPoolExecutor(max_workers=10) as executor:
-                  futures = {executor.submit(fetch_and_write, symbol): symbol for symbol in symbols}
-                  for index, future in enumerate(as_completed(futures), 1):
-                      try:
-                          if future.result():
-                              success_count += 1
-                      except Exception as err:
-                          symbol = futures[future]
-                          print(f"  ⚠️ {label} {symbol} 失敗: {err}", flush=True)
-
-                      if index % 50 == 0 or index == len(symbols):
-                          print(
-                              f"  進度: {index}/{len(symbols)}, 成功: {success_count}, 已寫入: {writer.total_inserted}",
-                              flush=True,
-                          )
-
-              writer.flush()
-              print(f"✅ {label}完成：{success_count} / {len(symbols)} 檔", flush=True)
-              return success_count
-
-
-          def compute_returns(conn, target_date):
-              print("\n🧮 計算並回寫今日報酬率到 tw_stock_returns...", flush=True)
-              with conn.cursor() as cur:
-                  cur.execute(
-                      """
-                      WITH s AS (
-                          SELECT
-                              symbol,
-                              date,
-                              close_price,
-                              LAG(close_price, 1)   OVER (PARTITION BY symbol ORDER BY date) AS prev_1,
-                              LAG(close_price, 5)   OVER (PARTITION BY symbol ORDER BY date) AS prev_5,
-                              LAG(close_price, 21)  OVER (PARTITION BY symbol ORDER BY date) AS prev_21,
-                              LAG(close_price, 63)  OVER (PARTITION BY symbol ORDER BY date) AS prev_63,
-                              LAG(close_price, 252) OVER (PARTITION BY symbol ORDER BY date) AS prev_252
-                          FROM tw_stock_prices
-                          WHERE date >= %s - INTERVAL '1000 days' AND date <= %s
-                      ), firsts AS (
-                          SELECT DISTINCT ON (symbol)
-                              symbol,
-                              close_price AS first_close
-                          FROM tw_stock_prices
-                          ORDER BY symbol, date ASC
-                      ), t AS (
-                          SELECT
-                              s.symbol,
-                              s.date,
-                              CASE WHEN s.close_price IS NULL OR s.prev_1 IS NULL OR s.prev_1 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_1 - 1)::numeric, 6) END AS daily_return,
-                              CASE WHEN s.close_price IS NULL OR s.prev_5 IS NULL OR s.prev_5 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_5 - 1)::numeric, 6) END AS weekly_return,
-                              CASE WHEN s.close_price IS NULL OR s.prev_21 IS NULL OR s.prev_21 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_21 - 1)::numeric, 6) END AS monthly_return,
-                              CASE WHEN s.close_price IS NULL OR s.prev_63 IS NULL OR s.prev_63 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_63 - 1)::numeric, 6) END AS quarterly_return,
-                              CASE WHEN s.close_price IS NULL OR s.prev_252 IS NULL OR s.prev_252 = 0
-                                   THEN NULL ELSE ROUND((s.close_price/s.prev_252 - 1)::numeric, 6) END AS yearly_return,
-                              CASE WHEN s.close_price IS NULL OR f.first_close IS NULL OR f.first_close = 0
-                                   THEN NULL ELSE ROUND((s.close_price/f.first_close - 1)::numeric, 6) END AS cumulative_return
-                          FROM s
-                          JOIN firsts f ON f.symbol = s.symbol
-                          WHERE s.date = %s
-                      )
-                      INSERT INTO tw_stock_returns (
-                          symbol, date, daily_return, weekly_return, monthly_return,
-                          quarterly_return, yearly_return, cumulative_return
-                      )
-                      SELECT
-                          symbol, date, daily_return, weekly_return, monthly_return,
-                          quarterly_return, yearly_return, cumulative_return
-                      FROM t
-                      ON CONFLICT (symbol, date) DO UPDATE SET
-                          daily_return = EXCLUDED.daily_return,
-                          weekly_return = EXCLUDED.weekly_return,
-                          monthly_return = EXCLUDED.monthly_return,
-                          quarterly_return = EXCLUDED.quarterly_return,
-                          yearly_return = EXCLUDED.yearly_return,
-                          cumulative_return = EXCLUDED.cumulative_return;
-                      """,
-                      (target_date, target_date, target_date),
-                  )
-                  conn.commit()
-                  cur.execute("SELECT COUNT(*) FROM tw_stock_returns WHERE date = %s", (target_date,))
-                  today_count = cur.fetchone()[0]
-              print(f"✅ 今日報酬率已寫入/更新 {today_count} 筆", flush=True)
-
-
-          print("=" * 80, flush=True)
-          print("🚀 開始執行 GitHub Actions 股價資料抓取任務", flush=True)
-          print("=" * 80, flush=True)
-          print(f"⏰ 執行時間：{datetime.now()}", flush=True)
-          print(f"📅 目標日期：{date.today()}", flush=True)
-          print(flush=True)
-
-          NEON_DB_URL = os.environ.get("NEON_DATABASE_URL")
-          if not NEON_DB_URL:
-              print("❌ 錯誤：未設定 NEON_DATABASE_URL", flush=True)
-              sys.exit(1)
-
-          conn = None
-          try:
-              print("🔌 正在連接 Neon 資料庫...", flush=True)
-              conn = psycopg2.connect(NEON_DB_URL)
-              print("✅ 已連接到 Neon 資料庫", flush=True)
-              ensure_tables(conn)
-
-              today = date.today()
-              twse_symbols, tpex_symbols = get_stock_symbols()
-              total_symbols = len(twse_symbols) + len(tpex_symbols)
-
-              if total_symbols == 0:
-                  print("❌ 無法取得股票清單", flush=True)
-                  sys.exit(1)
-
-              print(f"\n📊 準備抓取 {total_symbols} 檔股票資料", flush=True)
-              print(f"   上市：{len(twse_symbols)} 檔", flush=True)
-              print(f"   上櫃：{len(tpex_symbols)} 檔", flush=True)
-              print(flush=True)
-
-              writer = IncrementalWriter(conn, batch_size=500)
-
-              fetch_market(writer, twse_symbols, today, True, "上市股票")
-              fetch_market(writer, tpex_symbols, today, False, "上櫃股票")
-
-              index_record = fetch_twii_single_day(today)
-              if index_record:
-                  writer.add(index_record)
-                  writer.flush()
-                  print("📈 已加入加權指數資料", flush=True)
-              else:
-                  print("⚠️ 本次未取得加權指數 (^TWII) 資料", flush=True)
-
-              if writer.total_inserted == 0:
-                  print("⚠️ 今日無資料可同步（可能是非交易日或資料尚未公布）", flush=True)
-                  print("✅ 任務完成（無資料更新）", flush=True)
-                  sys.exit(0)
-
-              print(f"\n✅ 股價資料同步完成，共 {writer.total_inserted} 筆", flush=True)
-              compute_returns(conn, today)
-
-              print("=" * 80, flush=True)
-              print("🎉 GitHub Actions 任務執行完成！", flush=True)
-              print("=" * 80, flush=True)
-
-          except Exception as err:
-              print(f"❌ 執行過程發生錯誤：{err}", flush=True)
-              import traceback
-              traceback.print_exc()
-              sys.exit(1)
-          finally:
-              if conn is not None:
-                  conn.close()
-          PYTHON_SCRIPT
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fetch-logs-${{ github.run_number }}
-          path: |
-            *.log
-          retention-days: 30
-
-      - name: Send notification on failure
-        if: failure()
-        run: |
-          echo "❌ 資料抓取失敗，請檢查日誌"
-          echo "Run ID: ${{ github.run_id }}"
-          echo "Run Number: ${{ github.run_number }}"
+import os
+import sys
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
+
+import psycopg2
+import requests
+import yfinance as yf
+from bs4 import BeautifulSoup
+from psycopg2.extras import execute_values
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+sys.stdout.flush()
+sys.stderr.flush()
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/json,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Connection": "keep-alive",
+}
+
+INSERT_SQL = """
+INSERT INTO tw_stock_prices
+(symbol, date, open_price, high_price, low_price, close_price, volume)
+VALUES %s
+ON CONFLICT (symbol, date)
+DO UPDATE SET
+    open_price = EXCLUDED.open_price,
+    high_price = EXCLUDED.high_price,
+    low_price = EXCLUDED.low_price,
+    close_price = EXCLUDED.close_price,
+    volume = EXCLUDED.volume
+"""
+
+CREATE_PRICES_SQL = """
+CREATE TABLE IF NOT EXISTS tw_stock_prices (
+    symbol TEXT NOT NULL,
+    date DATE NOT NULL,
+    open_price DOUBLE PRECISION,
+    high_price DOUBLE PRECISION,
+    low_price DOUBLE PRECISION,
+    close_price DOUBLE PRECISION,
+    volume BIGINT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (symbol, date)
+)
+"""
+
+CREATE_PRICES_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_tw_stock_prices_date
+ON tw_stock_prices (date)
+"""
+
+CREATE_RETURNS_SQL = """
+CREATE TABLE IF NOT EXISTS tw_stock_returns (
+    symbol TEXT NOT NULL,
+    date DATE NOT NULL,
+    close_price DOUBLE PRECISION,
+    return_1d DOUBLE PRECISION,
+    return_1w DOUBLE PRECISION,
+    return_1m DOUBLE PRECISION,
+    return_3m DOUBLE PRECISION,
+    return_6m DOUBLE PRECISION,
+    return_1y DOUBLE PRECISION,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (symbol, date)
+)
+"""
+
+CREATE_RETURNS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_tw_stock_returns_date
+ON tw_stock_returns (date)
+"""
+
+CREATE_SYMBOLS_SQL = """
+CREATE TABLE IF NOT EXISTS tw_stock_symbols (
+    symbol TEXT PRIMARY KEY,
+    market TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+)
+"""
+
+
+def build_session():
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update(HEADERS)
+    return session
+
+
+def ensure_tables(conn):
+    with conn.cursor() as cur:
+        cur.execute(CREATE_PRICES_SQL)
+        cur.execute(CREATE_PRICES_INDEX_SQL)
+        cur.execute(CREATE_RETURNS_SQL)
+        cur.execute(CREATE_RETURNS_INDEX_SQL)
+        cur.execute(CREATE_SYMBOLS_SQL)
+    conn.commit()
+
+
+class IncrementalWriter:
+    def __init__(self, conn, batch_size=500):
+        self.conn = conn
+        self.batch_size = batch_size
+        self.buffer = []
+        self.lock = threading.Lock()
+        self.total_written = 0
+
+    def add_rows(self, rows):
+        if not rows:
+            return
+        should_flush = False
+        with self.lock:
+            self.buffer.extend(rows)
+            if len(self.buffer) >= self.batch_size:
+                should_flush = True
+        if should_flush:
+            self.flush()
+
+    def flush(self):
+        with self.lock:
+            if not self.buffer:
+                return
+            rows = self.buffer
+            self.buffer = []
+
+        with self.conn.cursor() as cur:
+            execute_values(cur, INSERT_SQL, rows, page_size=min(1000, len(rows)))
+        self.conn.commit()
+        self.total_written += len(rows)
+        print(f"  💾 已寫入 {len(rows)} 筆，累計 {self.total_written} 筆", flush=True)
+
+    def close(self):
+        self.flush()
+
+
+def should_refresh_symbols():
+    refresh_mode = os.getenv("SYMBOL_REFRESH_MODE", "weekly").strip().lower()
+    today = date.today()
+
+    if refresh_mode == "daily":
+        return True
+
+    if refresh_mode == "weekly":
+        refresh_weekday = int(os.getenv("SYMBOL_REFRESH_WEEKDAY", "6"))
+        return today.weekday() == refresh_weekday
+
+    if refresh_mode == "monthly":
+        refresh_day = int(os.getenv("SYMBOL_REFRESH_DAY", "1"))
+        return today.day == refresh_day
+
+    return False
+
+
+def get_symbols_from_cache(conn):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT symbol
+                FROM tw_stock_symbols
+                WHERE symbol IS NOT NULL
+                  AND btrim(symbol) <> ''
+                  AND symbol ~ '^[0-9]{4}$'
+                ORDER BY symbol
+            """)
+            rows = cur.fetchall()
+
+        symbols = [row[0].strip() for row in rows if row and row[0]]
+        if symbols:
+            print(f"  ✅ 使用快取股票清單：{len(symbols)} 檔", flush=True)
+        else:
+            print("  ℹ️ 快取股票清單為空", flush=True)
+        return symbols
+    except Exception as err:
+        print(f"  ⚠️ 讀取快取股票清單失敗：{err}", flush=True)
+        return []
+
+
+def save_symbols_to_cache(conn, symbols, market="ALL"):
+    if not symbols:
+        return
+
+    rows = [(symbol, market) for symbol in sorted(set(symbols))]
+
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            INSERT INTO tw_stock_symbols (symbol, market, updated_at)
+            VALUES %s
+            ON CONFLICT (symbol)
+            DO UPDATE SET
+                market = EXCLUDED.market,
+                updated_at = NOW()
+            """,
+            rows,
+        )
+    conn.commit()
+    print(f"  💾 已更新股票清單快取：{len(rows)} 檔", flush=True)
+
+
+def get_symbols_from_prices(conn):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT symbol
+                FROM tw_stock_prices
+                WHERE symbol IS NOT NULL
+                  AND btrim(symbol) <> ''
+                  AND symbol ~ '^[0-9]{4}$'
+                ORDER BY symbol
+            """)
+            rows = cur.fetchall()
+
+        symbols = [row[0].strip() for row in rows if row and row[0]]
+        if symbols:
+            print(f"  ✅ 使用價格表既有股票清單：{len(symbols)} 檔", flush=True)
+        else:
+            print("  ℹ️ 價格表內尚無既有股票清單", flush=True)
+        return symbols
+    except Exception as err:
+        print(f"  ⚠️ 從價格表讀取股票清單失敗：{err}", flush=True)
+        return []
+
+
+def fetch_twse_listed_symbols(session):
+    print("  ⏳ 嘗試抓取上市股票清單（TWSE ISIN）...", flush=True)
+    url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+    resp = session.get(url, timeout=(5, 12))
+    resp.raise_for_status()
+    resp.encoding = "big5"
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    symbols = []
+
+    for tr in soup.select("table tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        text = tds[0].get_text(" ", strip=True)
+        if not text or "有價證券代號" in text:
+            continue
+        parts = text.split()
+        if not parts:
+            continue
+        code = parts[0].strip()
+        if code.isdigit() and len(code) == 4:
+            symbols.append(code)
+
+    symbols = sorted(set(symbols))
+    print(f"  ✅ TWSE ISIN 取得上市股票 {len(symbols)} 檔", flush=True)
+    return symbols
+
+
+def fetch_mops_listed_symbols(session):
+    print("  ⏳ 嘗試抓取上市股票清單（MOPS）...", flush=True)
+    url = "https://mops.twse.com.tw/mops/web/ajax_t51sb01"
+    data = {
+        "encodeURIComponent": "1",
+        "step": "1",
+        "firstin": "1",
+        "TYPEK": "sii",
+        "code": "",
+    }
+    resp = session.post(
+        url,
+        data=data,
+        timeout=(5, 12),
+        headers={
+            **HEADERS,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": "https://mops.twse.com.tw/mops/web/t51sb01",
+        },
+    )
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    symbols = []
+
+    for tr in soup.select("table tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+        code = tds[0].get_text(strip=True)
+        if code.isdigit() and len(code) == 4:
+            symbols.append(code)
+
+    symbols = sorted(set(symbols))
+    print(f"  ✅ MOPS 取得上市股票 {len(symbols)} 檔", flush=True)
+    return symbols
+
+
+def fetch_tpex_listed_symbols(session):
+    print("  ⏳ 嘗試抓取上櫃股票清單（TPEX）...", flush=True)
+    candidates = [
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+        "https://www.tpex.org.tw/openapi/v1/tpex_daily_market_value",
+        "https://www.tpex.org.tw/openapi/v1/market_value",
+    ]
+
+    last_err = None
+    for url in candidates:
+        try:
+            resp = session.get(url, timeout=(5, 12))
+            resp.raise_for_status()
+            data = resp.json()
+            symbols = []
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("SecuritiesCompanyCode", "股票代號", "代號", "CompanyCode", "Code"):
+                        value = str(item.get(key, "")).strip()
+                        if value.isdigit() and len(value) == 4:
+                            symbols.append(value)
+                            break
+            symbols = sorted(set(symbols))
+            if symbols:
+                print(f"  ✅ TPEX 取得上櫃股票 {len(symbols)} 檔", flush=True)
+                return symbols
+        except Exception as err:
+            last_err = err
+            continue
+
+    if last_err:
+        raise last_err
+    return []
+
+
+def get_stock_symbols(conn, session):
+    print("📋 取得股票清單...", flush=True)
+
+    refresh_needed = should_refresh_symbols()
+    print(f"  ℹ️ 本次是否強制更新股票清單：{'是' if refresh_needed else '否'}", flush=True)
+
+    if not refresh_needed:
+        cached_symbols = get_symbols_from_cache(conn)
+        if cached_symbols:
+            return cached_symbols
+
+        db_symbols = get_symbols_from_prices(conn)
+        if db_symbols:
+            return db_symbols
+
+    sources = [
+        ("TWSE_ISIN", fetch_twse_listed_symbols),
+        ("MOPS", fetch_mops_listed_symbols),
+    ]
+
+    listed_symbols = []
+    for source_name, source_fn in sources:
+        try:
+            started = time.time()
+            listed_symbols = source_fn(session)
+            elapsed = time.time() - started
+            if listed_symbols:
+                print(f"  ✅ {source_name} 成功，耗時 {elapsed:.1f} 秒", flush=True)
+                break
+        except Exception as err:
+            print(f"  ⚠️ {source_name} 失敗：{err}", flush=True)
+
+    try:
+        tpex_symbols = fetch_tpex_listed_symbols(session)
+    except Exception as err:
+        print(f"  ⚠️ TPEX 股票清單抓取失敗：{err}", flush=True)
+        tpex_symbols = []
+
+    symbols = sorted(set(listed_symbols + tpex_symbols))
+    if not symbols:
+        fallback_symbols = get_symbols_from_cache(conn)
+        if fallback_symbols:
+            print("  ⚠️ 外部股票清單更新失敗，改用快取清單", flush=True)
+            return fallback_symbols
+
+        fallback_symbols = get_symbols_from_prices(conn)
+        if fallback_symbols:
+            print("  ⚠️ 外部股票清單更新失敗，改用價格表既有清單", flush=True)
+            return fallback_symbols
+
+        raise RuntimeError("無法取得任何股票清單")
+
+    save_symbols_to_cache(conn, symbols, market="ALL")
+    print(f"✅ 股票清單取得完成，共 {len(symbols)} 檔", flush=True)
+    return symbols
+
+
+def normalize_price_row(symbol, hist_row):
+    idx = hist_row.name
+    if hasattr(idx, "date"):
+        trade_date = idx.date()
+    else:
+        trade_date = idx
+
+    open_price = hist_row.get("Open")
+    high_price = hist_row.get("High")
+    low_price = hist_row.get("Low")
+    close_price = hist_row.get("Close")
+    volume = hist_row.get("Volume")
+
+    if close_price is None:
+        return None
+
+    return (
+        symbol,
+        trade_date,
+        float(open_price) if open_price is not None else None,
+        float(high_price) if high_price is not None else None,
+        float(low_price) if low_price is not None else None,
+        float(close_price) if close_price is not None else None,
+        int(volume) if volume is not None else 0,
+    )
+
+
+def fetch_single_stock_history(symbol, start_date, end_date):
+    candidates = [f"{symbol}.TW", f"{symbol}.TWO"]
+    last_err = None
+
+    for ticker_symbol in candidates:
+        try:
+            ticker = yf.Ticker(ticker_symbol)
+            hist = ticker.history(
+                start=start_date.strftime("%Y-%m-%d"),
+                end=(end_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+                auto_adjust=False,
+                actions=False,
+            )
+            if hist is None or hist.empty:
+                continue
+
+            rows = []
+            for _, row in hist.iterrows():
+                normalized = normalize_price_row(symbol, row)
+                if normalized:
+                    rows.append(normalized)
+
+            if rows:
+                return rows
+        except Exception as err:
+            last_err = err
+            continue
+
+    if last_err:
+        raise last_err
+    return []
+
+
+def fetch_market(symbols, writer, start_date, end_date, max_workers=8):
+    print(f"🚚 開始抓取股價資料，共 {len(symbols)} 檔", flush=True)
+
+    completed = 0
+    success_count = 0
+    fail_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_symbol = {
+            executor.submit(fetch_single_stock_history, symbol, start_date, end_date): symbol
+            for symbol in symbols
+        }
+
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            completed += 1
+            try:
+                rows = future.result()
+                if rows:
+                    writer.add_rows(rows)
+                    success_count += 1
+                    print(f"  ✅ [{completed}/{len(symbols)}] {symbol} 成功，{len(rows)} 筆", flush=True)
+                else:
+                    print(f"  ⚪ [{completed}/{len(symbols)}] {symbol} 無資料", flush=True)
+            except Exception as err:
+                fail_count += 1
+                print(f"  ❌ [{completed}/{len(symbols)}] {symbol} 抓取失敗：{err}", flush=True)
+
+    writer.flush()
+    print(f"✅ 股價抓取完成：成功 {success_count} 檔，失敗 {fail_count} 檔", flush=True)
+
+
+def compute_returns(conn):
+    print("📈 開始計算報酬率...", flush=True)
+
+    sql = """
+    INSERT INTO tw_stock_returns
+    (symbol, date, close_price, return_1d, return_1w, return_1m, return_3m, return_6m, return_1y, updated_at)
+    WITH base AS (
+        SELECT
+            symbol,
+            date,
+            close_price,
+            LAG(close_price, 1) OVER (PARTITION BY symbol ORDER BY date) AS close_1d,
+            LAG(close_price, 5) OVER (PARTITION BY symbol ORDER BY date) AS close_1w,
+            LAG(close_price, 21) OVER (PARTITION BY symbol ORDER BY date) AS close_1m,
+            LAG(close_price, 63) OVER (PARTITION BY symbol ORDER BY date) AS close_3m,
+            LAG(close_price, 126) OVER (PARTITION BY symbol ORDER BY date) AS close_6m,
+            LAG(close_price, 252) OVER (PARTITION BY symbol ORDER BY date) AS close_1y
+        FROM tw_stock_prices
+    )
+    SELECT
+        symbol,
+        date,
+        close_price,
+        CASE WHEN close_1d IS NULL OR close_1d = 0 THEN NULL ELSE ((close_price / close_1d) - 1) * 100 END AS return_1d,
+        CASE WHEN close_1w IS NULL OR close_1w = 0 THEN NULL ELSE ((close_price / close_1w) - 1) * 100 END AS return_1w,
+        CASE WHEN close_1m IS NULL OR close_1m = 0 THEN NULL ELSE ((close_price / close_1m) - 1) * 100 END AS return_1m,
+        CASE WHEN close_3m IS NULL OR close_3m = 0 THEN NULL ELSE ((close_price / close_3m) - 1) * 100 END AS return_3m,
+        CASE WHEN close_6m IS NULL OR close_6m = 0 THEN NULL ELSE ((close_price / close_6m) - 1) * 100 END AS return_6m,
+        CASE WHEN close_1y IS NULL OR close_1y = 0 THEN NULL ELSE ((close_price / close_1y) - 1) * 100 END AS return_1y,
+        NOW()
+    FROM base
+    ON CONFLICT (symbol, date)
+    DO UPDATE SET
+        close_price = EXCLUDED.close_price,
+        return_1d = EXCLUDED.return_1d,
+        return_1w = EXCLUDED.return_1w,
+        return_1m = EXCLUDED.return_1m,
+        return_3m = EXCLUDED.return_3m,
+        return_6m = EXCLUDED.return_6m,
+        return_1y = EXCLUDED.return_1y,
+        updated_at = NOW()
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+    print("✅ 報酬率計算完成", flush=True)
+
+
+def fetch_index_data(conn, target_date):
+    print("📊 抓取指數資料...", flush=True)
+    index_map = {
+        "^TWII": "TWII",
+        "^TWOII": "TWOII",
+    }
+
+    rows = []
+    for yf_symbol, db_symbol in index_map.items():
+        try:
+            hist = yf.Ticker(yf_symbol).history(
+                start=(target_date - timedelta(days=10)).strftime("%Y-%m-%d"),
+                end=(target_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+                auto_adjust=False,
+                actions=False,
+            )
+            if hist is None or hist.empty:
+                continue
+            hist = hist.tail(1)
+            for _, row in hist.iterrows():
+                normalized = normalize_price_row(db_symbol, row)
+                if normalized:
+                    rows.append(normalized)
+        except Exception as err:
+            print(f"  ⚠️ 指數 {db_symbol} 抓取失敗：{err}", flush=True)
+
+    if rows:
+        with conn.cursor() as cur:
+            execute_values(cur, INSERT_SQL, rows)
+        conn.commit()
+        print(f"✅ 指數資料寫入完成，共 {len(rows)} 筆", flush=True)
+    else:
+        print("⚠️ 無指數資料可寫入", flush=True)
+
+
+def main():
+    conn = None
+    session = None
+
+    try:
+        print("🚀 開始執行 GitHub Actions 股價資料抓取任務", flush=True)
+        print("=" * 80, flush=True)
+        print(f"⏰ 執行時間：{datetime.now()}", flush=True)
+
+        target_date = date.today()
+        start_date = target_date - timedelta(days=370)
+        end_date = target_date
+
+        print(f"📅 目標日期：{target_date}", flush=True)
+
+        database_url = os.getenv("NEON_DATABASE_URL")
+        if not database_url:
+            raise RuntimeError("缺少環境變數 NEON_DATABASE_URL")
+
+        print("🔌 正在連接 Neon 資料庫...", flush=True)
+        conn = psycopg2.connect(database_url, sslmode="require")
+        conn.autocommit = False
+        print("✅ 已連接到 Neon 資料庫", flush=True)
+
+        ensure_tables(conn)
+        session = build_session()
+
+        symbols = get_stock_symbols(conn, session)
+
+        writer = IncrementalWriter(conn, batch_size=500)
+        fetch_market(symbols, writer, start_date, end_date, max_workers=8)
+        writer.close()
+
+        fetch_index_data(conn, target_date)
+        compute_returns(conn)
+
+        print("=" * 80, flush=True)
+        print("🎉 任務完成", flush=True)
+
+    except Exception as err:
+        print(f"❌ 執行過程發生錯誤：{err}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()
