@@ -12,7 +12,7 @@ env:
 jobs:
   fetch-stock-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code
@@ -82,7 +82,7 @@ jobs:
           SESSION = make_session()
 
 
-          def get_json(url, params=None, referer=None, timeout=90, retries=5):
+          def get_json(url, params=None, referer=None, timeout=90, retries=3):
               extra_headers = {"Referer": referer} if referer else {}
               last_error = None
               for attempt in range(1, retries + 1):
@@ -93,17 +93,224 @@ jobs:
                           headers=extra_headers,
                           timeout=timeout,
                       )
+                      if response.status_code == 451:
+                          raise requests.HTTPError(
+                              f"451 blocked by upstream for {url}", response=response
+                          )
                       response.raise_for_status()
                       return response.json()
                   except Exception as err:
                       last_error = err
-                      wait = min(30, 2 ** attempt)
+                      if getattr(getattr(err, "response", None), "status_code", None) == 451:
+                          raise last_error
+                      wait = min(15, 2 ** attempt)
                       print(
                           f"  ⚠️ 請求失敗 ({attempt}/{retries}): {err}，{wait}s 後重試...",
                           flush=True,
                       )
                       time.sleep(wait)
               raise last_error
+
+
+          def warm_twse_session():
+              try:
+                  SESSION.get("https://www.twse.com.tw/zh/", timeout=20)
+                  SESSION.get(
+                      TWSE_REFERER,
+                      timeout=20,
+                      headers={"Referer": "https://www.twse.com.tw/zh/"},
+                  )
+              except Exception:
+                  pass
+
+
+          def fetch_twse_mi_index_json(query_date):
+              warm_twse_session()
+              params = {"response": "json", "date": query_date, "type": "ALLBUT0999"}
+              sources = [
+                  ("exchangeReport", "https://www.twse.com.tw/exchangeReport/MI_INDEX"),
+                  ("rwd", "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"),
+              ]
+              last_error = None
+              for name, url in sources:
+                  try:
+                      response = SESSION.get(
+                          url,
+                          params=params,
+                          headers={"Referer": TWSE_REFERER},
+                          timeout=90,
+                      )
+                      if response.status_code == 451:
+                          print(f"  ⚠️ {name} 被 TWSE 封鎖 (451)，改試下一來源", flush=True)
+                          last_error = requests.HTTPError(f"451 blocked ({name})")
+                          continue
+                      response.raise_for_status()
+                      data = response.json()
+                      if data.get("stat") == "OK":
+                          print(f"  ✅ TWSE 來源：{name}", flush=True)
+                          return data
+                      last_error = ValueError(data.get("stat", "unknown stat"))
+                  except Exception as err:
+                      last_error = err
+                      print(f"  ⚠️ {name} 失敗: {err}", flush=True)
+              raise last_error or RuntimeError("所有 TWSE MI_INDEX 來源均失敗")
+
+
+          def normalize_base_symbol(raw):
+              value = str(raw or "").strip().upper()
+              if value.endswith(".TW"):
+                  return value[:-3], "TWSE"
+              if value.endswith(".TWO"):
+                  return value[:-4], "TPEX"
+              return value, None
+
+
+          def load_symbols_from_db(conn, market):
+              twse_symbols = []
+              tpex_symbols = []
+
+              try:
+                  with conn.cursor() as cur:
+                      cur.execute(
+                          """
+                          SELECT symbol, market
+                          FROM tw_stock_symbols
+                          WHERE symbol IS NOT NULL
+                            AND btrim(symbol) <> ''
+                          ORDER BY symbol
+                          """
+                      )
+                      rows = cur.fetchall()
+                  for symbol, market_value in rows:
+                      base_symbol, inferred_market = normalize_base_symbol(symbol)
+                      if not is_common_stock_code(base_symbol):
+                          continue
+                      market_text = str(market_value or inferred_market or "").strip().upper()
+                      if market_text in ("TWSE", "SII", "LISTED", "上市"):
+                          twse_symbols.append(base_symbol)
+                      elif market_text in ("TPEX", "OTC", "TWO", "上櫃"):
+                          tpex_symbols.append(base_symbol)
+                      elif str(symbol).upper().endswith(".TW"):
+                          twse_symbols.append(base_symbol)
+                      elif str(symbol).upper().endswith(".TWO"):
+                          tpex_symbols.append(base_symbol)
+              except Exception as err:
+                  print(f"⚠️ 讀取 tw_stock_symbols 失敗：{err}", flush=True)
+
+              if not twse_symbols and not tpex_symbols:
+                  try:
+                      with conn.cursor() as cur:
+                          cur.execute(
+                              """
+                              SELECT DISTINCT symbol
+                              FROM tw_stock_prices
+                              WHERE symbol IS NOT NULL
+                                AND btrim(symbol) <> ''
+                              ORDER BY symbol
+                              """
+                          )
+                          rows = cur.fetchall()
+                      for (symbol,) in rows:
+                          base_symbol, inferred_market = normalize_base_symbol(symbol)
+                          if not is_common_stock_code(base_symbol):
+                              continue
+                          if inferred_market == "TWSE":
+                              twse_symbols.append(base_symbol)
+                          elif inferred_market == "TPEX":
+                              tpex_symbols.append(base_symbol)
+                  except Exception as err:
+                      print(f"⚠️ 讀取 tw_stock_prices 失敗：{err}", flush=True)
+
+              twse_symbols = sorted(set(twse_symbols))
+              tpex_symbols = sorted(set(tpex_symbols))
+
+              if market == "TWSE":
+                  print(f"  📋 DB 上市清單：{len(twse_symbols)} 檔", flush=True)
+                  return twse_symbols
+              print(f"  📋 DB 上櫃清單：{len(tpex_symbols)} 檔", flush=True)
+              return tpex_symbols
+
+
+          def yfinance_row_for_ticker(data, ticker, multi_ticker):
+              if data is None or getattr(data, "empty", True):
+                  return None
+              if not multi_ticker:
+                  return data.iloc[0]
+              if ticker not in data.columns.get_level_values(0):
+                  return None
+              subset = data[ticker].dropna(how="all")
+              if subset.empty:
+                  return None
+              return subset.iloc[0]
+
+
+          def fetch_market_yfinance_fallback(writer, target_date, symbols, suffix, label):
+              if not symbols:
+                  print(f"⚠️ {label}：資料庫無可用代號，無法使用 yfinance fallback", flush=True)
+                  return 0
+
+              print(
+                  f"↪ {label}：證交所 API 無法從 GHA 存取，改用 yfinance + DB 清單（{len(symbols)} 檔）...",
+                  flush=True,
+              )
+              start = target_date.isoformat()
+              end = (target_date + timedelta(days=1)).isoformat()
+              success_count = 0
+              batch_size = 50
+
+              for offset in range(0, len(symbols), batch_size):
+                  batch = symbols[offset : offset + batch_size]
+                  tickers = [f"{code}.{suffix}" for code in batch]
+                  try:
+                      data = yf.download(
+                          tickers,
+                          start=start,
+                          end=end,
+                          group_by="ticker",
+                          auto_adjust=False,
+                          threads=True,
+                          progress=False,
+                      )
+                  except Exception as err:
+                      print(f"  ⚠️ yfinance batch 失敗: {err}", flush=True)
+                      continue
+
+                  multi_ticker = len(batch) > 1
+                  for code in batch:
+                      ticker = f"{code}.{suffix}"
+                      try:
+                          row = yfinance_row_for_ticker(data, ticker, multi_ticker)
+                          if row is None:
+                              continue
+                          close_price = parse_number(row.get("Close"))
+                          if not close_price or not (0 < close_price < 30000):
+                              continue
+                          writer.add(
+                              (
+                                  ticker,
+                                  target_date,
+                                  parse_number(row.get("Open")),
+                                  parse_number(row.get("High")),
+                                  parse_number(row.get("Low")),
+                                  close_price,
+                                  parse_volume(row.get("Volume")),
+                              )
+                          )
+                          success_count += 1
+                      except Exception:
+                          continue
+
+                  done = min(offset + batch_size, len(symbols))
+                  print(
+                      f"  進度: {done}/{len(symbols)}, 成功: {success_count}, "
+                      f"已寫入: {writer.total_inserted}",
+                      flush=True,
+                  )
+                  time.sleep(0.5)
+
+              writer.flush()
+              print(f"✅ {label}（yfinance）完成：{success_count} 檔", flush=True)
+              return success_count
 
 
           def parse_number(value):
@@ -305,113 +512,109 @@ jobs:
 
           def fetch_twse_bulk(writer, target_date):
               print("📥 批量抓取上市收盤行情（MI_INDEX）...", flush=True)
+              query_date = f"{target_date.year}{target_date.month:02d}{target_date.day:02d}"
+              data = None
               try:
-                  query_date = f"{target_date.year}{target_date.month:02d}{target_date.day:02d}"
-                  data = get_json(
-                      "https://www.twse.com.tw/exchangeReport/MI_INDEX",
-                      params={
-                          "response": "json",
-                          "date": query_date,
-                          "type": "ALLBUT0999",
-                      },
-                      referer=TWSE_REFERER,
-                  )
+                  data = fetch_twse_mi_index_json(query_date)
               except Exception as err:
-                  print(f"⚠️ 上市批量抓取失敗: {err}", flush=True)
-                  return 0
+                  print(f"⚠️ 上市 MI_INDEX 不可用: {err}", flush=True)
 
-              if data.get("stat") != "OK":
-                  print(f"⚠️ 上市行情：{data.get('stat', '未知狀態')}", flush=True)
-                  return 0
-
-              table = pick_mi_index_table(data.get("tables"))
-              rows = (table or {}).get("data") or []
               success_count = 0
+              if data and data.get("stat") == "OK":
+                  table = pick_mi_index_table(data.get("tables"))
+                  rows = (table or {}).get("data") or []
 
-              for row in rows:
-                  try:
-                      code = str(row[0]).strip()
-                      if not is_common_stock_code(code):
+                  for row in rows:
+                      try:
+                          code = str(row[0]).strip()
+                          if not is_common_stock_code(code):
+                              continue
+
+                          open_price = parse_number(row[5])
+                          high_price = parse_number(row[6])
+                          low_price = parse_number(row[7])
+                          close_price = parse_number(row[8])
+                          volume = parse_volume(row[2])
+
+                          if close_price and 0 < close_price < 30000:
+                              writer.add(
+                                  (
+                                      f"{code}.TW",
+                                      target_date,
+                                      open_price,
+                                      high_price,
+                                      low_price,
+                                      close_price,
+                                      volume,
+                                  )
+                              )
+                              success_count += 1
+                      except (IndexError, TypeError, ValueError):
                           continue
 
-                      open_price = parse_number(row[5])
-                      high_price = parse_number(row[6])
-                      low_price = parse_number(row[7])
-                      close_price = parse_number(row[8])
-                      volume = parse_volume(row[2])
+                  if success_count > 0:
+                      writer.flush()
+                      print(f"✅ 上市股票完成：{success_count} 檔", flush=True)
+                      return success_count
 
-                      if close_price and 0 < close_price < 30000:
-                          writer.add(
-                              (
-                                  f"{code}.TW",
-                                  target_date,
-                                  open_price,
-                                  high_price,
-                                  low_price,
-                                  close_price,
-                                  volume,
-                              )
-                          )
-                          success_count += 1
-                  except (IndexError, TypeError, ValueError):
-                      continue
-
-              writer.flush()
-              print(f"✅ 上市股票完成：{success_count} 檔", flush=True)
-              return success_count
+              symbols = load_symbols_from_db(writer.conn, "TWSE")
+              return fetch_market_yfinance_fallback(writer, target_date, symbols, "TW", "上市股票")
 
 
           def fetch_tpex_bulk(writer, target_date):
               print("📥 批量抓取上櫃收盤行情...", flush=True)
+              roc_date = f"{target_date.year - 1911}/{target_date.month:02d}/{target_date.day:02d}"
+              data = None
               try:
-                  roc_date = f"{target_date.year - 1911}/{target_date.month:02d}/{target_date.day:02d}"
                   data = get_json(
                       "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php",
                       params={"l": "zh-tw", "d": roc_date, "se": "AL"},
                       referer=TPEX_REFERER,
+                      retries=2,
                   )
               except Exception as err:
-                  print(f"⚠️ 上櫃批量抓取失敗: {err}", flush=True)
-                  return 0
-
-              tables = data.get("tables") or []
-              rows = tables[0].get("data") if tables else []
-              if not rows:
-                  print("⚠️ 上櫃行情：無資料", flush=True)
-                  return 0
+                  print(f"⚠️ 上櫃 bulk API 不可用: {err}", flush=True)
 
               success_count = 0
-              for row in rows:
-                  try:
-                      code = str(row[0]).strip()
-                      if not is_common_stock_code(code):
+              if data:
+                  tables = data.get("tables") or []
+                  rows = tables[0].get("data") if tables else []
+
+                  for row in rows:
+                      try:
+                          code = str(row[0]).strip()
+                          if not is_common_stock_code(code):
+                              continue
+
+                          close_price = parse_number(row[2])
+                          open_price = parse_number(row[4])
+                          high_price = parse_number(row[5])
+                          low_price = parse_number(row[6])
+                          volume = parse_volume(row[7])
+
+                          if close_price and 0 < close_price < 30000:
+                              writer.add(
+                                  (
+                                      f"{code}.TWO",
+                                      target_date,
+                                      open_price,
+                                      high_price,
+                                      low_price,
+                                      close_price,
+                                      volume,
+                                  )
+                              )
+                              success_count += 1
+                      except (IndexError, TypeError, ValueError):
                           continue
 
-                      close_price = parse_number(row[2])
-                      open_price = parse_number(row[4])
-                      high_price = parse_number(row[5])
-                      low_price = parse_number(row[6])
-                      volume = parse_volume(row[7])
+                  if success_count > 0:
+                      writer.flush()
+                      print(f"✅ 上櫃股票完成：{success_count} 檔", flush=True)
+                      return success_count
 
-                      if close_price and 0 < close_price < 30000:
-                          writer.add(
-                              (
-                                  f"{code}.TWO",
-                                  target_date,
-                                  open_price,
-                                  high_price,
-                                  low_price,
-                                  close_price,
-                                  volume,
-                              )
-                          )
-                          success_count += 1
-                  except (IndexError, TypeError, ValueError):
-                      continue
-
-              writer.flush()
-              print(f"✅ 上櫃股票完成：{success_count} 檔", flush=True)
-              return success_count
+              symbols = load_symbols_from_db(writer.conn, "TPEX")
+              return fetch_market_yfinance_fallback(writer, target_date, symbols, "TWO", "上櫃股票")
 
 
           def fetch_twii_single_day(target_date):
