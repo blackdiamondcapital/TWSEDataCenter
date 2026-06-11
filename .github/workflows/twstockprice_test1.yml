@@ -39,6 +39,7 @@ jobs:
           import sys
           import time
           import threading
+          from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
           from datetime import date, datetime, timedelta
 
           import psycopg2
@@ -67,19 +68,79 @@ jobs:
           def make_session():
               session = requests.Session()
               session.headers.update(HEADERS)
-              retry = Retry(
-                  total=3,
-                  connect=3,
-                  read=3,
-                  backoff_factor=1.5,
-                  status_forcelist=[429, 500, 502, 503, 504],
-                  allowed_methods=["GET"],
-              )
+              # 關閉 urllib3 自動重試，避免「設定 20s 卻等數分鐘」
+              retry = Retry(total=0, connect=0, read=0, redirect=0, status=0)
               session.mount("https://", HTTPAdapter(max_retries=retry))
               return session
 
 
           SESSION = make_session()
+          TWSE_WARM_CONNECT_TIMEOUT = 3
+          TWSE_WARM_READ_TIMEOUT = 8
+          TWSE_API_CONNECT_TIMEOUT = 5
+          TWSE_API_READ_TIMEOUT = 45
+
+
+          def format_timeout_label(timeout):
+              if isinstance(timeout, (tuple, list)) and len(timeout) == 2:
+                  return f"connect={timeout[0]}s/read={timeout[1]}s"
+              return f"{timeout}s"
+
+
+          def hard_timeout_get(url, params=None, headers=None, timeout=(5, 30), deadline=30, label="HTTP"):
+              """硬性總時限 + connect/read 分離 timeout，避免慢速回應拖過上限。"""
+              connect_timeout, read_timeout = timeout
+              merged_headers = dict(headers or {})
+              query = ""
+              if params:
+                  query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+              timeout_label = format_timeout_label(timeout)
+              log_diag(f"{label} 開始請求（{timeout_label}，硬性上限 {deadline}s）")
+              log_diag(f"{label} URL: {url}{query}", indent=1)
+
+              done = threading.Event()
+              start = time.perf_counter()
+
+              def heartbeat():
+                  tick = 0
+                  while not done.wait(5):
+                      tick += 1
+                      elapsed = diag_elapsed(start)
+                      log_diag(
+                          f"{label} 仍在等待回應… 已 {elapsed:.1f}s "
+                          f"(heartbeat #{tick}，硬性上限 {deadline}s)",
+                          indent=1,
+                      )
+                      if elapsed >= deadline:
+                          break
+
+              watcher = threading.Thread(target=heartbeat, daemon=True)
+              watcher.start()
+              try:
+                  with ThreadPoolExecutor(max_workers=1) as executor:
+                      future = executor.submit(
+                          SESSION.get,
+                          url,
+                          params=params,
+                          headers=merged_headers,
+                          timeout=(connect_timeout, read_timeout),
+                      )
+                      response = future.result(timeout=deadline)
+              except FuturesTimeoutError as err:
+                  raise requests.Timeout(
+                      f"{label} 超過硬性上限 {deadline}s（connect={connect_timeout}s/read={read_timeout}s）"
+                  ) from err
+              finally:
+                  done.set()
+
+              elapsed = diag_elapsed(start)
+              size = len(response.content or b"")
+              log_diag(
+                  f"{label} 收到回應：HTTP {response.status_code}，"
+                  f"{size:,} bytes，耗時 {elapsed:.2f}s",
+                  indent=1,
+              )
+              return response, elapsed
 
 
           def diag_ts():
@@ -95,50 +156,25 @@ jobs:
               print(f"{prefix}🔍 [{diag_ts()}] {message}", flush=True)
 
 
-          def http_get_with_diag(url, params=None, headers=None, timeout=90, label="HTTP"):
-              merged_headers = dict(headers or {})
-              query = ""
-              if params:
-                  query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
-              log_diag(f"{label} 開始請求（timeout={timeout}s）")
-              log_diag(f"{label} URL: {url}{query}", indent=1)
-
-              done = threading.Event()
-              start = time.perf_counter()
-
-              def heartbeat():
-                  tick = 0
-                  while not done.wait(15):
-                      tick += 1
-                      log_diag(
-                          f"{label} 仍在等待回應… 已 {diag_elapsed(start):.1f}s "
-                          f"(heartbeat #{tick}，上限 {timeout}s)",
-                          indent=1,
-                      )
-
-              watcher = threading.Thread(target=heartbeat, daemon=True)
-              watcher.start()
-              try:
-                  response = SESSION.get(
-                      url,
-                      params=params,
-                      headers=merged_headers,
-                      timeout=timeout,
-                  )
-              finally:
-                  done.set()
-
-              elapsed = diag_elapsed(start)
-              size = len(response.content or b"")
-              log_diag(
-                  f"{label} 收到回應：HTTP {response.status_code}，"
-                  f"{size:,} bytes，耗時 {elapsed:.2f}s",
-                  indent=1,
+          def http_get_with_diag(url, params=None, headers=None, timeout=90, deadline=None, label="HTTP"):
+              if isinstance(timeout, (int, float)):
+                  connect_timeout = TWSE_API_CONNECT_TIMEOUT
+                  read_timeout = int(timeout)
+              else:
+                  connect_timeout, read_timeout = timeout
+              if deadline is None:
+                  deadline = read_timeout + connect_timeout + 5
+              return hard_timeout_get(
+                  url,
+                  params=params,
+                  headers=headers,
+                  timeout=(connect_timeout, read_timeout),
+                  deadline=deadline,
+                  label=label,
               )
-              return response, elapsed
 
 
-          def get_json(url, params=None, referer=None, timeout=90, retries=3, label="JSON"):
+          def get_json(url, params=None, referer=None, timeout=90, retries=2, label="JSON"):
               extra_headers = {"Referer": referer} if referer else {}
               last_error = None
               for attempt in range(1, retries + 1):
@@ -173,32 +209,27 @@ jobs:
 
 
           def warm_twse_session():
-              log_diag("TWSE 暖機：建立 session / cookie")
+              log_diag("TWSE 暖機：略過首頁，只嘗試 MI_INDEX 參考頁（最多 10s）")
               warm_start = time.perf_counter()
-              steps = [
-                  ("首頁", "https://www.twse.com.tw/zh/", {"Referer": "https://www.twse.com.tw/zh/"}),
-                  ("MI_INDEX 參考頁", TWSE_REFERER, {"Referer": "https://www.twse.com.tw/zh/"}),
-              ]
-              for step_name, url, headers in steps:
-                  step_start = time.perf_counter()
-                  try:
-                      response, _ = http_get_with_diag(
-                          url,
-                          headers=headers,
-                          timeout=20,
-                          label=f"TWSE 暖機/{step_name}",
-                      )
-                      log_diag(
-                          f"TWSE 暖機/{step_name} 完成：HTTP {response.status_code}，"
-                          f"耗時 {diag_elapsed(step_start):.2f}s",
-                          indent=1,
-                      )
-                  except Exception as err:
-                      log_diag(
-                          f"TWSE 暖機/{step_name} 失敗（可忽略）: {err}，"
-                          f"耗時 {diag_elapsed(step_start):.2f}s",
-                          indent=1,
-                      )
+              try:
+                  response, _ = hard_timeout_get(
+                      TWSE_REFERER,
+                      headers={"Referer": "https://www.twse.com.tw/zh/"},
+                      timeout=(TWSE_WARM_CONNECT_TIMEOUT, TWSE_WARM_READ_TIMEOUT),
+                      deadline=10,
+                      label="TWSE 暖機/MI_INDEX 參考頁",
+                  )
+                  log_diag(
+                      f"TWSE 暖機/MI_INDEX 參考頁 完成：HTTP {response.status_code}，"
+                      f"耗時 {diag_elapsed(warm_start):.2f}s",
+                      indent=1,
+                  )
+              except Exception as err:
+                  log_diag(
+                      f"TWSE 暖機失敗（可忽略，直接打 MI_INDEX API）：{err}，"
+                      f"耗時 {diag_elapsed(warm_start):.2f}s",
+                      indent=1,
+                  )
               log_diag(f"TWSE 暖機總耗時 {diag_elapsed(warm_start):.2f}s")
 
 
@@ -220,7 +251,8 @@ jobs:
                           url,
                           params=params,
                           headers={"Referer": TWSE_REFERER},
-                          timeout=90,
+                          timeout=(TWSE_API_CONNECT_TIMEOUT, TWSE_API_READ_TIMEOUT),
+                          deadline=50,
                           label=f"TWSE MI_INDEX/{name}",
                       )
                       if response.status_code == 451:
