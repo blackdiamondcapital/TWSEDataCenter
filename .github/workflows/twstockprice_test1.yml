@@ -82,49 +82,129 @@ jobs:
           SESSION = make_session()
 
 
-          def get_json(url, params=None, referer=None, timeout=90, retries=3):
+          def diag_ts():
+              return datetime.now().strftime("%H:%M:%S")
+
+
+          def diag_elapsed(start):
+              return time.perf_counter() - start
+
+
+          def log_diag(message, indent=0):
+              prefix = "  " * indent
+              print(f"{prefix}🔍 [{diag_ts()}] {message}", flush=True)
+
+
+          def http_get_with_diag(url, params=None, headers=None, timeout=90, label="HTTP"):
+              merged_headers = dict(headers or {})
+              query = ""
+              if params:
+                  query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+              log_diag(f"{label} 開始請求（timeout={timeout}s）")
+              log_diag(f"{label} URL: {url}{query}", indent=1)
+
+              done = threading.Event()
+              start = time.perf_counter()
+
+              def heartbeat():
+                  tick = 0
+                  while not done.wait(15):
+                      tick += 1
+                      log_diag(
+                          f"{label} 仍在等待回應… 已 {diag_elapsed(start):.1f}s "
+                          f"(heartbeat #{tick}，上限 {timeout}s)",
+                          indent=1,
+                      )
+
+              watcher = threading.Thread(target=heartbeat, daemon=True)
+              watcher.start()
+              try:
+                  response = SESSION.get(
+                      url,
+                      params=params,
+                      headers=merged_headers,
+                      timeout=timeout,
+                  )
+              finally:
+                  done.set()
+
+              elapsed = diag_elapsed(start)
+              size = len(response.content or b"")
+              log_diag(
+                  f"{label} 收到回應：HTTP {response.status_code}，"
+                  f"{size:,} bytes，耗時 {elapsed:.2f}s",
+                  indent=1,
+              )
+              return response, elapsed
+
+
+          def get_json(url, params=None, referer=None, timeout=90, retries=3, label="JSON"):
               extra_headers = {"Referer": referer} if referer else {}
               last_error = None
               for attempt in range(1, retries + 1):
                   try:
-                      response = SESSION.get(
+                      response, elapsed = http_get_with_diag(
                           url,
                           params=params,
                           headers=extra_headers,
                           timeout=timeout,
+                          label=f"{label} (第 {attempt}/{retries} 次)",
                       )
                       if response.status_code == 451:
                           raise requests.HTTPError(
                               f"451 blocked by upstream for {url}", response=response
                           )
                       response.raise_for_status()
+                      log_diag(f"{label} JSON 解析完成，總耗時 {elapsed:.2f}s", indent=1)
                       return response.json()
                   except Exception as err:
                       last_error = err
-                      if getattr(getattr(err, "response", None), "status_code", None) == 451:
+                      status = getattr(getattr(err, "response", None), "status_code", None)
+                      if status == 451:
+                          log_diag(f"{label} 被上游封鎖 (451)，停止重試", indent=1)
                           raise last_error
                       wait = min(15, 2 ** attempt)
-                      print(
-                          f"  ⚠️ 請求失敗 ({attempt}/{retries}): {err}，{wait}s 後重試...",
-                          flush=True,
+                      log_diag(
+                          f"{label} 請求失敗 ({attempt}/{retries}): {err}，{wait}s 後重試…",
+                          indent=1,
                       )
                       time.sleep(wait)
               raise last_error
 
 
           def warm_twse_session():
-              try:
-                  SESSION.get("https://www.twse.com.tw/zh/", timeout=20)
-                  SESSION.get(
-                      TWSE_REFERER,
-                      timeout=20,
-                      headers={"Referer": "https://www.twse.com.tw/zh/"},
-                  )
-              except Exception:
-                  pass
+              log_diag("TWSE 暖機：建立 session / cookie")
+              warm_start = time.perf_counter()
+              steps = [
+                  ("首頁", "https://www.twse.com.tw/zh/", {"Referer": "https://www.twse.com.tw/zh/"}),
+                  ("MI_INDEX 參考頁", TWSE_REFERER, {"Referer": "https://www.twse.com.tw/zh/"}),
+              ]
+              for step_name, url, headers in steps:
+                  step_start = time.perf_counter()
+                  try:
+                      response, _ = http_get_with_diag(
+                          url,
+                          headers=headers,
+                          timeout=20,
+                          label=f"TWSE 暖機/{step_name}",
+                      )
+                      log_diag(
+                          f"TWSE 暖機/{step_name} 完成：HTTP {response.status_code}，"
+                          f"耗時 {diag_elapsed(step_start):.2f}s",
+                          indent=1,
+                      )
+                  except Exception as err:
+                      log_diag(
+                          f"TWSE 暖機/{step_name} 失敗（可忽略）: {err}，"
+                          f"耗時 {diag_elapsed(step_start):.2f}s",
+                          indent=1,
+                      )
+              log_diag(f"TWSE 暖機總耗時 {diag_elapsed(warm_start):.2f}s")
 
 
           def fetch_twse_mi_index_json(query_date):
+              fetch_start = time.perf_counter()
+              log_diag(f"MI_INDEX 查詢日期：{query_date}")
               warm_twse_session()
               params = {"response": "json", "date": query_date, "type": "ALLBUT0999"}
               sources = [
@@ -132,27 +212,50 @@ jobs:
                   ("rwd", "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"),
               ]
               last_error = None
-              for name, url in sources:
+              for index, (name, url) in enumerate(sources, start=1):
+                  source_start = time.perf_counter()
+                  log_diag(f"MI_INDEX 來源 {index}/{len(sources)}：{name}")
                   try:
-                      response = SESSION.get(
+                      response, elapsed = http_get_with_diag(
                           url,
                           params=params,
                           headers={"Referer": TWSE_REFERER},
                           timeout=90,
+                          label=f"TWSE MI_INDEX/{name}",
                       )
                       if response.status_code == 451:
-                          print(f"  ⚠️ {name} 被 TWSE 封鎖 (451)，改試下一來源", flush=True)
+                          log_diag(f"{name} 被 TWSE 封鎖 (451)，改試下一來源", indent=1)
                           last_error = requests.HTTPError(f"451 blocked ({name})")
                           continue
                       response.raise_for_status()
+                      parse_start = time.perf_counter()
                       data = response.json()
-                      if data.get("stat") == "OK":
+                      parse_elapsed = diag_elapsed(parse_start)
+                      stat = data.get("stat")
+                      tables = data.get("tables") or []
+                      row_count = sum(len((table or {}).get("data") or []) for table in tables)
+                      log_diag(
+                          f"{name} JSON stat={stat!r}，tables={len(tables)}，rows≈{row_count}，"
+                          f"解析 {parse_elapsed:.2f}s",
+                          indent=1,
+                      )
+                      if stat == "OK":
+                          log_diag(
+                              f"MI_INDEX 成功來源：{name}，本來源 {diag_elapsed(source_start):.2f}s，"
+                              f"總耗時 {diag_elapsed(fetch_start):.2f}s",
+                          )
                           print(f"  ✅ TWSE 來源：{name}", flush=True)
                           return data
-                      last_error = ValueError(data.get("stat", "unknown stat"))
+                      last_error = ValueError(stat or "unknown stat")
+                      log_diag(f"{name} 回傳 stat 非 OK：{stat!r}", indent=1)
                   except Exception as err:
                       last_error = err
+                      log_diag(
+                          f"{name} 失敗: {err}，本來源耗時 {diag_elapsed(source_start):.2f}s",
+                          indent=1,
+                      )
                       print(f"  ⚠️ {name} 失敗: {err}", flush=True)
+              log_diag(f"MI_INDEX 全部來源失敗，總耗時 {diag_elapsed(fetch_start):.2f}s")
               raise last_error or RuntimeError("所有 TWSE MI_INDEX 來源均失敗")
 
 
@@ -261,6 +364,10 @@ jobs:
               for offset in range(0, len(symbols), batch_size):
                   batch = symbols[offset : offset + batch_size]
                   tickers = [f"{code}.{suffix}" for code in batch]
+                  batch_no = offset // batch_size + 1
+                  batch_total = (len(symbols) + batch_size - 1) // batch_size
+                  batch_start = time.perf_counter()
+                  log_diag(f"{label} yfinance 批次 {batch_no}/{batch_total}（{len(batch)} 檔）")
                   try:
                       data = yf.download(
                           tickers,
@@ -272,8 +379,17 @@ jobs:
                           progress=False,
                       )
                   except Exception as err:
+                      log_diag(
+                          f"{label} yfinance 批次 {batch_no} 失敗: {err}，"
+                          f"耗時 {diag_elapsed(batch_start):.2f}s",
+                          indent=1,
+                      )
                       print(f"  ⚠️ yfinance batch 失敗: {err}", flush=True)
                       continue
+                  log_diag(
+                      f"{label} yfinance 批次 {batch_no} 下載完成，耗時 {diag_elapsed(batch_start):.2f}s",
+                      indent=1,
+                  )
 
                   multi_ticker = len(batch) > 1
                   for code in batch:
@@ -511,18 +627,22 @@ jobs:
 
 
           def fetch_twse_bulk(writer, target_date):
+              phase_start = time.perf_counter()
               print("📥 批量抓取上市收盤行情（MI_INDEX）...", flush=True)
               query_date = f"{target_date.year}{target_date.month:02d}{target_date.day:02d}"
               data = None
               try:
                   data = fetch_twse_mi_index_json(query_date)
               except Exception as err:
+                  log_diag(f"上市 MI_INDEX 全部失敗，耗時 {diag_elapsed(phase_start):.2f}s：{err}")
                   print(f"⚠️ 上市 MI_INDEX 不可用: {err}", flush=True)
 
               success_count = 0
               if data and data.get("stat") == "OK":
+                  parse_start = time.perf_counter()
                   table = pick_mi_index_table(data.get("tables"))
                   rows = (table or {}).get("data") or []
+                  log_diag(f"MI_INDEX 解析表格：{len(rows)} 列，耗時 {diag_elapsed(parse_start):.2f}s")
 
                   for row in rows:
                       try:
@@ -554,14 +674,19 @@ jobs:
 
                   if success_count > 0:
                       writer.flush()
+                      log_diag(f"上市 MI_INDEX 寫入完成，總耗時 {diag_elapsed(phase_start):.2f}s")
                       print(f"✅ 上市股票完成：{success_count} 檔", flush=True)
                       return success_count
 
+              log_diag("MI_INDEX 無可用資料，準備改用 yfinance fallback")
               symbols = load_symbols_from_db(writer.conn, "TWSE")
-              return fetch_market_yfinance_fallback(writer, target_date, symbols, "TW", "上市股票")
+              result = fetch_market_yfinance_fallback(writer, target_date, symbols, "TW", "上市股票")
+              log_diag(f"上市抓取階段結束，總耗時 {diag_elapsed(phase_start):.2f}s")
+              return result
 
 
           def fetch_tpex_bulk(writer, target_date):
+              phase_start = time.perf_counter()
               print("📥 批量抓取上櫃收盤行情...", flush=True)
               roc_date = f"{target_date.year - 1911}/{target_date.month:02d}/{target_date.day:02d}"
               data = None
@@ -571,8 +696,10 @@ jobs:
                       params={"l": "zh-tw", "d": roc_date, "se": "AL"},
                       referer=TPEX_REFERER,
                       retries=2,
+                      label="TPEX 上櫃 bulk",
                   )
               except Exception as err:
+                  log_diag(f"上櫃 bulk API 失敗，耗時 {diag_elapsed(phase_start):.2f}s：{err}")
                   print(f"⚠️ 上櫃 bulk API 不可用: {err}", flush=True)
 
               success_count = 0
@@ -758,6 +885,12 @@ jobs:
           print("=" * 80, flush=True)
           print(f"⏰ 執行時間：{datetime.now()}", flush=True)
           print(f"📅 目標日期：{date.today()}", flush=True)
+          print(
+              f"🖥️ Runner：{os.environ.get('RUNNER_OS', '?')} / "
+              f"{os.environ.get('RUNNER_ARCH', '?')} / "
+              f"{os.environ.get('RUNNER_NAME', 'github-hosted')}",
+              flush=True,
+          )
           print(flush=True)
 
           NEON_DB_URL = os.environ.get("NEON_DATABASE_URL")
