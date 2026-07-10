@@ -3,6 +3,7 @@
 """清空資料庫並重新從 2010 年開始完整抓取所有股價數據"""
 
 import argparse
+import os
 import sys
 import psycopg2
 from backfill_full_history import main as backfill_main
@@ -11,7 +12,7 @@ DB_CONFIG = {
     'host': 'localhost',
     'port': '5432',
     'user': 'postgres',
-    'password': 's8304021',
+    'password': os.environ.get('DB_PASSWORD', ''),
     'database': 'postgres'
 }
 

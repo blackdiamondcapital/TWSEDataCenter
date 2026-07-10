@@ -27,7 +27,7 @@ DB_CONFIG = {
     'host': 'localhost',
     'port': '5432',
     'user': 'postgres',
-    'password': 's8304021',
+    'password': os.environ.get('DB_PASSWORD', ''),
     'database': 'postgres'
 }
 

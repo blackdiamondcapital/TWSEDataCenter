@@ -17,7 +17,7 @@ def get_local_conn():
     host = os.getenv("DB_HOST", "localhost")
     port = int(os.getenv("DB_PORT", "5432"))
     user = os.getenv("DB_USER", "postgres")
-    password = os.getenv("DB_PASSWORD", "s8304021")
+    password = os.getenv("DB_PASSWORD", "")
     database = os.getenv("DB_NAME", "postgres")
     sslmode = os.getenv("DB_SSLMODE", "prefer")
     return psycopg2.connect(
@@ -34,8 +34,9 @@ def get_neon_conn():
     url = (
         os.getenv("DATABASE_URL")
         or os.getenv("NEON_DATABASE_URL")
-        or "postgresql://neondb_owner:npg_6vuayEsIl4Qb@ep-wispy-sky-adgltyd1-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require"
     )
+    if not url:
+        raise RuntimeError("Missing DATABASE_URL/NEON_DATABASE_URL for Neon connection")
     return psycopg2.connect(url)
 
 

@@ -53,7 +53,7 @@ def main() -> None:
             host = os.getenv("DB_HOST", "localhost")
             port = int(os.getenv("DB_PORT", "5432"))
             user = os.getenv("DB_USER", "postgres")
-            password = os.getenv("DB_PASSWORD", "s8304021")
+            password = os.getenv("DB_PASSWORD", "")
             database = os.getenv("DB_NAME", "postgres")
             sslmode = os.getenv("DB_SSLMODE", "prefer")
             conn = psycopg2.connect(

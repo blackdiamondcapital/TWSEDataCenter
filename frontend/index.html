@@ -46,12 +46,16 @@
                             <label for="modeSelect" class="status-text">模式</label>
                             <select id="modeSelect" class="modern-select" style="min-width:160px;" onchange="window.__applyMode && window.__applyMode(this.value)">
                                 <option value="price" selected>股價更新</option>
+                                <option value="symbols">股票名稱更新</option>
+                                <option value="etf">ETF 名稱更新</option>
                                 <option value="bwibbu">BWIBBU 回朔</option>
                                 <option value="t86">三大法人 (T86)</option>
                                 <option value="margin">融資融券</option>
                                 <option value="revenue">月營收</option>
                                 <option value="income">損益表</option>
                                 <option value="balance">資產負債表</option>
+                                <option value="cashflow">現金流量表</option>
+                                <option value="ratios">財務比率</option>
                                 <option value="warrants">權證資料</option>
                             </select>
                         </div>
@@ -92,6 +96,15 @@
                                 <span class="tab-desc">全市場資產負債表</span>
                             </div>
                         </button>
+                        <button class="modern-tab-btn" data-tab="ratios" style="display: none;">
+                            <div class="tab-icon">
+                                <i class="fas fa-chart-pie"></i>
+                            </div>
+                            <div class="tab-content-info">
+                                <span class="tab-title">財務比率</span>
+                                <span class="tab-desc">常用財務比率</span>
+                            </div>
+                        </button>
                         <button class="modern-tab-btn" data-tab="query">
                             <div class="tab-icon">
                                 <i class="fas fa-search"></i>
@@ -107,7 +120,7 @@
                             </div>
                             <div class="tab-content-info">
                                 <span class="tab-title">資料庫同步</span>
-                                <span class="tab-desc">上傳本地資料庫到 Neon</span>
+                                <span class="tab-desc">本機 PostgreSQL ↔ Neon 雲端</span>
                             </div>
                         </button>
                         <button class="modern-tab-btn" data-tab="bwibbu" style="display: none;">
@@ -140,6 +153,223 @@
                     </div>
                 </div>
 
+                <div id="ratiosTab" class="tab-pane" style="display: none;">@@
+                    <div class="config-section">
+                        <div class="section-header">
+                            <div class="section-icon"><i class="fas fa-chart-pie"></i></div>
+                            <div class="section-info">
+                                <h3 class="section-title">財務比率</h3>
+                                <p class="section-subtitle">從資料庫內的損益表 + 資產負債表計算常用財務比率，並可寫入 tw_financial_ratios</p>
+                            </div>
+                            <div class="section-badge" id="ratiosModeBadge">資料庫計算</div>
+                        </div>
+                        <div class="section-content">
+                            <div class="date-inputs-row">
+                                <div class="date-input-wrapper">
+                                    <label>西元年度</label>
+                                    <input type="number" id="ratiosYear" class="date-input" min="2000" max="2100" placeholder="例如 2025">
+                                </div>
+                                <div class="date-separator">/</div>
+                                <div class="date-input-wrapper">
+                                    <label>季別</label>
+                                    <select id="ratiosSeason" class="modern-select">
+                                        <option value="1">第 1 季</option>
+                                        <option value="2">第 2 季</option>
+                                        <option value="3">第 3 季</option>
+                                        <option value="4">第 4 季</option>
+                                    </select>
+                                </div>
+                                <div class="date-input-wrapper" style="display:flex; align-items:center; gap:.5rem; flex-wrap:wrap;">
+                                    <button id="ratiosFetchBtn" class="btn btn-primary"><i class="fas fa-calculator"></i> 計算財務比率</button>
+                                    <button id="ratiosWriteDbBtn" class="btn btn-outline"><i class="fas fa-database"></i> 計算並寫入資料庫</button>
+                                </div>
+                            </div>
+                            <div class="date-inputs-row" style="margin-top:0.75rem; flex-wrap:wrap; gap:0.75rem;">
+                                <div class="date-input-wrapper" style="max-width:220px;">
+                                    <label>股票代號起始（選填）</label>
+                                    <input type="text" id="ratiosCodeFrom" class="date-input" placeholder="例如 1101">
+                                </div>
+                                <div class="date-separator">~</div>
+                                <div class="date-input-wrapper" style="max-width:220px;">
+                                    <label>股票代號結束（選填）</label>
+                                    <input type="text" id="ratiosCodeTo" class="date-input" placeholder="例如 2899">
+                                </div>
+                                <div class="date-input-wrapper" style="flex:1; color:#64748b; font-size:0.8rem; min-width:220px;">
+                                    <p style="margin:0;">會依資料庫中已存在的損益表/資產負債表資料進行 JOIN 計算；若某公司缺任一張表，該公司不會出現在結果內。</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="config-section">
+                        <div class="section-header">
+                            <div class="section-icon"><i class="fas fa-square-root-alt"></i></div>
+                            <div class="section-info">
+                                <h3 class="section-title">公式說明</h3>
+                                <p class="section-subtitle">以下公式與後端計算邏輯一致；當分母為 0 或缺值時，該比率回傳空值</p>
+                            </div>
+                            <div class="section-badge">公式</div>
+                        </div>
+                        <div class="section-content">
+                            <div class="table-wrapper">
+                                <table class="modern-data-table">
+                                    <thead>
+                                        <tr>
+                                            <th style="min-width:140px;">比率</th>
+                                            <th>公式</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr>
+                                            <td>毛利率</td>
+                                            <td>毛利 ÷ 營收（GrossProfitFromOperations ÷ Revenue）</td>
+                                        </tr>
+                                        <tr>
+                                            <td>營業利益率</td>
+                                            <td>營業利益 ÷ 營收（ProfitLossFromOperatingActivities ÷ Revenue）</td>
+                                        </tr>
+                                        <tr>
+                                            <td>淨利率</td>
+                                            <td>淨利 ÷ 營收（ProfitLoss ÷ Revenue）</td>
+                                        </tr>
+                                        <tr>
+                                            <td>ROA</td>
+                                            <td>淨利 ÷ 資產（ProfitLoss ÷ Assets）</td>
+                                        </tr>
+                                        <tr>
+                                            <td>ROE</td>
+                                            <td>淨利 ÷ 母公司權益（ProfitLoss ÷ EquityAttributableToOwnersOfParent）</td>
+                                        </tr>
+                                        <tr>
+                                            <td>負債比</td>
+                                            <td>負債 ÷ 資產（Liabilities ÷ Assets）</td>
+                                        </tr>
+                                        <tr>
+                                            <td>流動比</td>
+                                            <td>流動資產 ÷ 流動負債（CurrentAssets ÷ CurrentLiabilities）</td>
+                                        </tr>
+                                        <tr>
+                                            <td>速動比</td>
+                                            <td>速動資產 ÷ 流動負債（QuickAssets ÷ CurrentLiabilities）</td>
+                                        </tr>
+                                        <tr>
+                                            <td>速動資產（QuickAssets）</td>
+                                            <td>現金及約當現金 + 應收帳款 + 其他應收款 + 各類流動金融資產加總（CashAndCashEquivalents + AccountsReceivableNet + OtherCurrentReceivables + CurrentFinancialAssetsAtAmortisedCost + CurrentFinancialAssetsAtFairValueThroughProfitOrLoss + CurrentFinancialAssetsAtFairValueThroughOtherComprehensiveIncome + OtherCurrentFinancialAssets）</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="config-section">
+                        <div class="section-header">
+                            <div class="section-icon"><i class="fas fa-info-circle"></i></div>
+                            <div class="section-info">
+                                <h3 class="section-title">執行結果</h3>
+                                <p class="section-subtitle">顯示計算筆數與期別資訊</p>
+                            </div>
+                            <div class="section-badge" id="ratiosSummaryBadge">尚未執行</div>
+                        </div>
+                        <div class="section-content">
+                            <div class="stats-grid" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem;">
+                                <div class="stat-card">
+                                    <div class="stat-label">資料筆數</div>
+                                    <div class="stat-value" id="ratiosStatTotal">--</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">期別</div>
+                                    <div class="stat-value" id="ratiosStatPeriod">--</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">寫入筆數</div>
+                                    <div class="stat-value" id="ratiosStatInserted">--</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="config-section">
+                        <div class="section-header">
+                            <div class="section-icon"><i class="fas fa-terminal"></i></div>
+                            <div class="section-info">
+                                <h3 class="section-title">執行日誌</h3>
+                                <p class="section-subtitle">即時顯示財務比率計算/寫入過程與系統訊息</p>
+                            </div>
+                            <div class="section-badge" style="background:linear-gradient(135deg,#4facfe,#00f2fe); color:white;">即時</div>
+                        </div>
+                        <div class="section-content">
+                            <div class="ratios-progress-container" style="margin-bottom:0.75rem;">
+                                <div class="ratios-progress-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.35rem;">
+                                    <span class="ratios-progress-label" style="color:#cbd5f5; font-size:0.85rem;">進度</span>
+                                    <span id="ratiosProgressText" class="ratios-progress-percent" style="color:#e2e8f0; font-weight:600;">0%</span>
+                                </div>
+                                <div class="ratios-progress-bar" style="height:10px; background:rgba(148,163,184,0.18); border-radius:999px; overflow:hidden;">
+                                    <div id="ratiosProgressFill" class="ratios-progress-bar-fill" style="height:100%; width:0%; background:linear-gradient(90deg,#4facfe,#00f2fe);"></div>
+                                </div>
+                                <div id="ratiosProgressStatus" class="ratios-progress-status" style="margin-top:0.35rem; color:#94a3b8; font-size:0.85rem;">尚未開始</div>
+                            </div>
+
+                            <div style="display:flex; justify-content:flex-end; margin-top:0.25rem; margin-bottom:0.75rem;">
+                                <button id="ratiosLogClearBtn" class="btn btn-outline" style="padding:0.5rem 1rem; font-size:0.85rem;"><i class="fas fa-eraser"></i> 清空日誌</button>
+                            </div>
+                            <div id="ratiosLogPanel" style="max-height:260px; overflow-y:auto; background:rgba(17,24,39,0.85); border:1px solid rgba(148,163,184,0.2); border-radius:10px; padding:1rem; font-family:'Consolas','Monaco',monospace; font-size:0.85rem; line-height:1.6; color:#e2e8f0;">
+                                <div class="ratios-log-empty" style="color:#94a3b8;">尚未開始計算</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="config-section">
+                        <div class="section-header">
+                            <div class="section-icon"><i class="fas fa-table"></i></div>
+                            <div class="section-info">
+                                <h3 class="section-title">樣本明細</h3>
+                                <p class="section-subtitle">顯示部分公司財務比率（僅示意）</p>
+                            </div>
+                            <div class="section-badge">資料列表</div>
+                        </div>
+                        <div class="section-content">
+                            <div class="table-wrapper">
+                                <table class="modern-data-table" id="ratiosResultsTable">
+                                    <thead>
+                                        <tr>
+                                            <th>股票代號</th>
+                                            <th>期別</th>
+                                            <th>營收</th>
+                                            <th>毛利</th>
+                                            <th>營業利益</th>
+                                            <th>淨利</th>
+                                            <th>資產</th>
+                                            <th>母公司權益</th>
+                                            <th>毛利率</th>
+                                            <th>營業利益率</th>
+                                            <th>淨利率</th>
+                                            <th>ROA</th>
+                                            <th>ROE</th>
+                                            <th>負債比</th>
+                                            <th>流動比</th>
+                                            <th>速動比</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr class="no-data-row">
+                                            <td colspan="16" class="no-data-cell">
+                                                <div class="no-data-content">
+                                                    <div class="no-data-icon"><i class="fas fa-search"></i></div>
+                                                    <div class="no-data-text">
+                                                        <h4>尚無資料</h4>
+                                                        <p>請先輸入年度與季別後執行計算</p>
+                                                    </div>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Revenue Tab -->
                 <div id="revenueTab" class="tab-pane" style="display: none;">
                     <div class="config-section">
@@ -154,13 +384,13 @@
                         <div class="section-content">
                             <div class="date-inputs-row">
                                 <div class="date-input-wrapper">
-                                    <label>西元年份</label>
-                                    <input type="number" id="revenueYear" class="date-input" min="2000" max="2100" placeholder="例如 2025">
+                                    <label>開始年月</label>
+                                    <input type="month" id="revenueStartYm" class="date-input" min="2000-01" max="2100-12" placeholder="例如 2025-01">
                                 </div>
                                 <div class="date-separator">/</div>
                                 <div class="date-input-wrapper">
-                                    <label>月份</label>
-                                    <input type="number" id="revenueMonth" class="date-input" min="1" max="12" placeholder="1~12">
+                                    <label>結束年月</label>
+                                    <input type="month" id="revenueEndYm" class="date-input" min="2000-01" max="2100-12" placeholder="例如 2025-12">
                                 </div>
                                 <div class="date-input-wrapper">
                                     <label>市場</label>
@@ -178,7 +408,7 @@
                                     <button id="revenueDownloadMopsBtn" class="btn btn-outline"><i class="fas fa-cloud-download-alt"></i> MOPS CSV 下載+匯入</button>
                                 </div>
                                 <div class="date-input-wrapper" style="flex:1; color:#64748b; font-size:0.85rem;">
-                                    <p style="margin:0;">若未輸入年份與月份，將抓取最新一個月的資料。</p>
+                                    <p style="margin:0;">若未輸入開始與結束年月，將抓取最新一個月的資料。</p>
                                 </div>
                             </div>
                         </div>
@@ -342,6 +572,14 @@
                                 <div class="date-input-wrapper" style="max-width:260px;">
                                     <label>每批休息時間（分鐘，選填）</label>
                                     <input type="number" id="incomeBatchRestMinutes" class="date-input" min="0" max="120" step="1" placeholder="例如 5">
+                                </div>
+                                <div class="date-input-wrapper" style="max-width:260px;">
+                                    <label>遇到封鎖最多暫停次數</label>
+                                    <input type="number" id="incomeRetryMax" class="date-input" min="0" max="10" step="1" value="1" placeholder="例如 1">
+                                </div>
+                                <div class="date-input-wrapper" style="max-width:260px;">
+                                    <label>遇到封鎖每次等待（分鐘）</label>
+                                    <input type="number" id="incomeRetryWaitMinutes" class="date-input" min="1" max="120" step="1" value="5" placeholder="例如 5">
                                 </div>
                                 <div class="date-input-wrapper" style="flex:1; color:#64748b; font-size:0.8rem; min-width:260px;">
                                     <p style="margin:0;">若兩者皆有填寫，系統每抓完指定檔數會暫停指定分鐘後再繼續抓取，以降低被 MOPS 封鎖的機率。</p>
@@ -575,6 +813,10 @@
                                     <label>遇到封鎖最多暫停次數</label>
                                     <input type="number" id="balanceRetryMax" class="date-input" min="0" max="10" step="1" value="1" placeholder="例如 1">
                                 </div>
+                                <div class="date-input-wrapper" style="max-width:260px;">
+                                    <label>遇到封鎖每次等待（分鐘）</label>
+                                    <input type="number" id="balanceRetryWaitMinutes" class="date-input" min="1" max="120" step="1" value="5" placeholder="例如 5">
+                                </div>
                                 <div class="date-input-wrapper" style="flex:1; color:#64748b; font-size:0.8rem; min-width:260px;">
                                     <p style="margin:0;">若兩者皆有填寫，系統每抓完指定檔數會暫停指定分鐘後再繼續抓取，以降低被 MOPS 封鎖的機率。</p>
                                 </div>
@@ -715,25 +957,143 @@
                     </div>
                 </div>
 
+                <div id="cashflowTab" class="tab-pane" style="display:none;">
+                    <div class="config-section">
+                        <div class="section-header">
+                            <div class="section-icon"><i class="fas fa-water"></i></div>
+                            <div class="section-info">
+                                <h3 class="section-title">現金流量表</h3>
+                                <p class="section-subtitle">抓取 MOPS 上市櫃公司現金流量表，支援單股、代號範圍、全市場及多期查詢</p>
+                            </div>
+                            <div class="section-badge">MOPS XBRL</div>
+                        </div>
+                        <div class="section-content">
+                            <div class="date-inputs-row" style="flex-wrap:wrap; gap:.75rem;">
+                                <div class="date-input-wrapper">
+                                    <label>西元年度</label>
+                                    <input type="number" id="cashflowYear" class="date-input" min="2000" max="2100" placeholder="例如 2025">
+                                </div>
+                                <div class="date-input-wrapper">
+                                    <label>季別</label>
+                                    <select id="cashflowSeason" class="modern-select">
+                                        <option value="1">第 1 季</option><option value="2">第 2 季</option>
+                                        <option value="3">第 3 季</option><option value="4">第 4 季</option>
+                                    </select>
+                                </div>
+                                <div class="date-input-wrapper">
+                                    <label>單一股票（選填）</label>
+                                    <input type="text" id="cashflowSingleCode" class="date-input" placeholder="例如 2330">
+                                </div>
+                                <div class="date-input-wrapper" style="display:flex; align-items:flex-end; gap:.5rem; flex-wrap:wrap;">
+                                    <button id="cashflowFetchBtn" class="btn btn-primary"><i class="fas fa-download"></i> 抓取現金流量表</button>
+                                    <button id="cashflowExportBtn" class="btn btn-outline"><i class="fas fa-file-csv"></i> 匯出 CSV</button>
+                                    <button id="cashflowImportDbBtn" class="btn btn-outline"><i class="fas fa-database"></i> 寫入資料庫</button>
+                                </div>
+                            </div>
+                            <div class="date-inputs-row" style="margin-top:.75rem; flex-wrap:wrap; gap:.75rem;">
+                                <div class="date-input-wrapper"><label>股票代號起始（選填）</label><input type="text" id="cashflowCodeFrom" class="date-input" placeholder="例如 1101"></div>
+                                <div class="date-input-wrapper"><label>股票代號結束（選填）</label><input type="text" id="cashflowCodeTo" class="date-input" placeholder="例如 2899"></div>
+                                <div class="date-input-wrapper"><label>每批抓取檔數</label><input type="number" id="cashflowBatchSize" class="date-input" min="1" placeholder="例如 100"></div>
+                                <div class="date-input-wrapper"><label>每批休息（分鐘）</label><input type="number" id="cashflowBatchRestMinutes" class="date-input" min="0" step="1" placeholder="例如 5"></div>
+                                <div class="date-input-wrapper"><label>封鎖重試次數</label><input type="number" id="cashflowRetryMax" class="date-input" min="0" value="1"></div>
+                                <div class="date-input-wrapper"><label>每次等待（分鐘）</label><input type="number" id="cashflowRetryWaitMinutes" class="date-input" min="1" value="5"></div>
+                            </div>
+                            <div class="date-inputs-row" style="margin-top:.75rem;">
+                                <label style="display:flex; align-items:center; gap:.35rem; cursor:pointer;">
+                                    <input type="checkbox" id="cashflowAutoImportCheckbox"> 抓取時直接寫入資料庫
+                                </label>
+                            </div>
+                            <div class="date-inputs-row" style="margin-top:.9rem; flex-wrap:wrap; gap:.75rem;">
+                                <div class="date-input-wrapper"><label>多期起始年度</label><input type="number" id="cashflowYearFrom" class="date-input" min="2000" max="2100"></div>
+                                <div class="date-input-wrapper"><label>多期終止年度</label><input type="number" id="cashflowYearTo" class="date-input" min="2000" max="2100"></div>
+                                <div class="date-input-wrapper" style="min-width:260px;">
+                                    <label>季別（多選）</label>
+                                    <div style="display:flex; gap:.6rem; flex-wrap:wrap;">
+                                        <label><input type="checkbox" id="cashflowMultiSeason1" checked>第 1 季</label>
+                                        <label><input type="checkbox" id="cashflowMultiSeason2" checked>第 2 季</label>
+                                        <label><input type="checkbox" id="cashflowMultiSeason3" checked>第 3 季</label>
+                                        <label><input type="checkbox" id="cashflowMultiSeason4" checked>第 4 季</label>
+                                    </div>
+                                </div>
+                                <div class="date-input-wrapper" style="display:flex; align-items:flex-end;">
+                                    <button id="cashflowMultiFetchBtn" class="btn btn-outline"><i class="fas fa-layer-group"></i> 多期抓取</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="config-section">
+                        <div class="section-header">
+                            <div class="section-icon"><i class="fas fa-info-circle"></i></div>
+                            <div class="section-info"><h3 class="section-title">執行結果</h3><p class="section-subtitle">顯示抓取筆數與期別資訊</p></div>
+                            <div class="section-badge" id="cashflowSummaryBadge">尚未執行</div>
+                        </div>
+                        <div class="section-content">
+                            <div class="stats-grid" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem;">
+                                <div class="stat-card"><div class="stat-label">公司家數</div><div class="stat-value" id="cashflowStatUnique">--</div></div>
+                                <div class="stat-card"><div class="stat-label">資料筆數</div><div class="stat-value" id="cashflowStatTotal">--</div></div>
+                                <div class="stat-card"><div class="stat-label">期別</div><div class="stat-value" id="cashflowStatPeriod">--</div></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="config-section">
+                        <div class="section-header">
+                            <div class="section-icon"><i class="fas fa-terminal"></i></div>
+                            <div class="section-info"><h3 class="section-title">抓取日誌</h3><p class="section-subtitle">即時顯示進度、封鎖重試與資料庫寫入狀態</p></div>
+                            <button id="cashflowLogClearBtn" class="btn btn-outline">清空日誌</button>
+                        </div>
+                        <div class="section-content">
+                            <div class="income-progress-container">
+                                <div class="income-progress-header"><span>進度</span><span id="cashflowProgressText">0%</span></div>
+                                <div class="income-progress-bar"><div id="cashflowProgressFill" class="income-progress-bar-fill"></div></div>
+                                <div id="cashflowProgressStatus" class="income-progress-status">尚未開始</div>
+                            </div>
+                            <div id="cashflowLogPanel" style="margin-top:.75rem; max-height:260px; overflow-y:auto; background:rgba(17,24,39,.85); border:1px solid rgba(148,163,184,.2); border-radius:10px; padding:1rem; font-family:monospace; color:#e2e8f0;">尚未開始抓取</div>
+                        </div>
+                    </div>
+
+                    <div class="config-section">
+                        <div class="section-header">
+                            <div class="section-icon"><i class="fas fa-table"></i></div>
+                            <div class="section-info"><h3 class="section-title">樣本明細</h3><p class="section-subtitle">完整科目請使用 CSV 匯出</p></div>
+                        </div>
+                        <div class="section-content"><div class="table-wrapper">
+                            <table class="modern-data-table" id="cashflowResultsTable">
+                                <thead><tr><th>股票代號</th><th>期別</th><th>營業活動</th><th>投資活動</th><th>籌資活動</th><th>現金淨增減</th></tr></thead>
+                                <tbody><tr class="no-data-row"><td colspan="6" class="no-data-cell">尚無資料</td></tr></tbody>
+                            </table>
+                        </div></div>
+                    </div>
+                </div>
+
                 <div id="warrantsTab" class="tab-pane" style="display: none;">
                     <div class="config-section">
                         <div class="section-header">
                             <div class="section-icon"><i class="fas fa-file-contract"></i></div>
                             <div class="section-info">
                                 <h3 class="section-title">權證資料</h3>
-                                <p class="section-subtitle">查詢 TWSE 權證成交資料</p>
+                                <p class="section-subtitle">查詢 TWSE / TPEX 權證資料，並可匯入 TPEX 主檔與日行情</p>
                             </div>
                             <div class="section-badge">查詢</div>
                         </div>
                         <div class="section-content">
                             <div class="date-inputs-row">
                                 <div class="date-input-wrapper">
+                                    <label>市場</label>
+                                    <select id="warrantsMarketSelect" class="modern-select">
+                                        <option value="twse">TWSE</option>
+                                        <option value="tpex">TPEX</option>
+                                        <option value="both">全市場</option>
+                                    </select>
+                                </div>
+                                <div class="date-input-wrapper">
                                     <label>交易日期</label>
                                     <select id="warrantsDateSelect" class="modern-select"></select>
                                 </div>
                                 <div class="date-input-wrapper">
-                                    <label>關鍵字（代號或名稱）</label>
-                                    <input type="text" id="warrantsKeyword" class="date-input" placeholder="例如：台積電、035528">
+                                    <label>關鍵字（代號、名稱、標的）</label>
+                                    <input type="text" id="warrantsKeyword" class="date-input" placeholder="例如：台積電、035528、群益">
                                 </div>
                                 <div class="date-input-wrapper">
                                     <label>&nbsp;</label>
@@ -741,9 +1101,15 @@
                                 </div>
                             </div>
                             <div class="date-inputs-row" style="margin-top:0.75rem;">
-                                <div class="date-input-wrapper" style="flex:1; display:flex; gap:12px; align-items:center;">
+                                <div class="date-input-wrapper" style="flex:1; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
                                     <button id="warrantsImportBtn" class="btn btn-outline">
-                                        <i class="fas fa-download"></i> 抓取最新權證資料
+                                        <i class="fas fa-download"></i> 匯入 TWSE 最新成交
+                                    </button>
+                                    <button id="warrantsTpexMasterImportBtn" class="btn btn-outline">
+                                        <i class="fas fa-database"></i> 匯入 TPEX 主檔
+                                    </button>
+                                    <button id="warrantsTpexDailyImportBtn" class="btn btn-outline">
+                                        <i class="fas fa-chart-bar"></i> 匯入 TPEX 日行情
                                     </button>
                                     <span id="warrantsStatus" class="status-text"></span>
                                 </div>
@@ -755,7 +1121,7 @@
                             <div class="section-icon"><i class="fas fa-table"></i></div>
                             <div class="section-info">
                                 <h3 class="section-title">查詢結果</h3>
-                                <p class="section-subtitle">依選定日期顯示權證成交資料</p>
+                                <p class="section-subtitle">依選定市場與日期顯示權證資料</p>
                             </div>
                             <div class="section-badge">資料列表</div>
                         </div>
@@ -764,16 +1130,19 @@
                                 <table class="modern-data-table">
                                     <thead>
                                         <tr>
+                                            <th>市場</th>
                                             <th>交易日期</th>
                                             <th>權證代號</th>
                                             <th>權證名稱</th>
+                                            <th>標的代號</th>
+                                            <th>標的名稱</th>
                                             <th>成交金額</th>
-                                            <th>成交張數</th>
+                                            <th>成交量/張數</th>
                                         </tr>
                                     </thead>
                                     <tbody id="warrantsTableBody">
                                         <tr class="no-data-row">
-                                            <td colspan="5" class="no-data-cell">
+                                            <td colspan="8" class="no-data-cell">
                                                 <div class="no-data-content">
                                                     <div class="no-data-icon"><i class="fas fa-search"></i></div>
                                                     <div class="no-data-text">
@@ -996,6 +1365,16 @@
                                             <p class="option-desc">使用 yfinance 匯入 ^TWII 日K 資料到選定資料庫（依上方時間範圍與資料庫目標）。</p>
                                         </div>
                                         
+                                        <!-- 專用指數操作：櫃買指數 (^OTC) 匯入 -->
+                                        <div class="advanced-option twii-import-option" id="importOtcBtn">
+                                            <div class="option-header">
+                                                <i class="fas fa-chart-area"></i>
+                                                <span>匯入櫃買指數 (^OTC)</span>
+                                                <span class="info-badge">指數 · 1檔</span>
+                                            </div>
+                                            <p class="option-desc">透過櫃買中心 OpenAPI 匯入 ^OTC 日K 資料到選定資料庫（依上方時間範圍與資料庫目標）。</p>
+                                        </div>
+                                        
                                         <div class="advanced-option" data-type="otc">
                                             <div class="option-header">
                                                 <i class="fas fa-store"></i>
@@ -1152,12 +1531,12 @@
                                         <div class="btn-content">
                                             <i class="fas fa-wrench"></i>
                                             <span class="btn-text">修復異常</span>
-                                            <span class="btn-subtitle">僅重抓→匯入（預設）</span>
+                                            <span class="btn-subtitle">備份→刪除→重抓（預設）</span>
                                         </div>
                                     </button>
                                     <label style="display:flex; align-items:center; gap:6px; margin-left:8px;">
                                         <input type="checkbox" id="refetchOnlyToggle" checked>
-                                        <span>僅重抓（不刪除）</span>
+                                        <span>刪除後重抓（會備份）</span>
                                     </label>
                                 </div>
                             </div>
@@ -1188,10 +1567,38 @@
                                         </div>
                                     </div>
                                     <div class="date-input-group">
+                                        <label class="date-label">開始日期（可空）</label>
+                                        <div class="date-input-container">
+                                            <i class="fas fa-calendar-alt"></i>
+                                            <input type="date" id="returnsStartDate" class="modern-date-input" placeholder="YYYY-MM-DD">
+                                        </div>
+                                    </div>
+                                    <div class="date-input-group">
+                                        <label class="date-label">結束日期（可空）</label>
+                                        <div class="date-input-container">
+                                            <i class="fas fa-calendar-check"></i>
+                                            <input type="date" id="returnsEndDate" class="modern-date-input" placeholder="YYYY-MM-DD">
+                                        </div>
+                                    </div>
+                                    <div class="date-input-group">
                                         <label class="date-label">僅填補缺失</label>
                                         <div class="date-input-container">
                                             <input type="checkbox" id="returnsFillMissing" checked>
                                             <span style="margin-left:8px;">只寫入 stock_returns 尚未存在的日期</span>
+                                        </div>
+                                    </div>
+                                    <div class="date-input-group">
+                                        <label class="date-label">並行數量（1~32）</label>
+                                        <div class="date-input-container">
+                                            <i class="fas fa-bolt"></i>
+                                            <input type="number" id="returnsMaxWorkers" class="modern-date-input" min="1" max="32" step="1" placeholder="預設 8" value="8">
+                                        </div>
+                                    </div>
+                                    <div class="date-input-group">
+                                        <label class="date-label">批次大小（1~200）</label>
+                                        <div class="date-input-container">
+                                            <i class="fas fa-layer-group"></i>
+                                            <input type="number" id="returnsBatchSize" class="modern-date-input" min="1" max="200" step="1" placeholder="預設 50" value="50">
                                         </div>
                                     </div>
                                     <div class="date-input-group">
@@ -1379,6 +1786,106 @@
                             </div>
                         </div>
 
+                        <div class="config-section">
+                            <div class="section-header">
+                                <div class="section-icon">
+                                    <i class="fas fa-list"></i>
+                                </div>
+                                <div class="section-info">
+                                    <h3 class="section-title">股票名稱更新</h3>
+                                    <p class="section-subtitle">從交易所更新股票代碼與名稱（寫入 tw_stock_symbols）</p>
+                                </div>
+                                <div class="section-badge" id="symbolsCountBadge">-- 筆</div>
+                            </div>
+
+                            <div class="section-content">
+                                <div class="action-buttons" style="margin-top: 0;">
+                                    <button id="symbolsReloadBtn" class="btn btn-outline action-btn" type="button">
+                                        <div class="btn-content">
+                                            <i class="fas fa-rotate"></i>
+                                            <span class="btn-text">重新載入</span>
+                                            <span class="btn-subtitle">重新抓取清單</span>
+                                        </div>
+                                    </button>
+                                    <button id="symbolsRefreshFromExchangesBtn" class="btn btn-primary action-btn" type="button">
+                                        <div class="btn-content">
+                                            <i class="fas fa-sync-alt"></i>
+                                            <span class="btn-text">從交易所更新</span>
+                                            <span class="btn-subtitle">更新本機與雲端</span>
+                                        </div>
+                                    </button>
+                                </div>
+
+                                <div id="symbolsRefreshStatus" class="input-hint" style="margin-top: 10px; display:none;"></div>
+
+                                <div class="stock-input-container" style="margin-top: 12px;">
+                                    <div class="input-group">
+                                        <div class="input-icon">
+                                            <i class="fas fa-search"></i>
+                                        </div>
+                                        <input type="text" id="symbolsSearchInput" class="modern-input" placeholder="搜尋代號 / 名稱 / 市場 / 產業...">
+                                    </div>
+                                </div>
+
+                                <div class="results-content" style="margin-top: 12px;">
+                                    <div class="modern-table-wrapper">
+                                        <div class="table-scroll-container">
+                                            <table id="symbolsTable" class="modern-data-table">
+                                                <thead>
+                                                    <tr>
+                                                        <th>代號</th>
+                                                        <th>名稱</th>
+                                                        <th>市場</th>
+                                                        <th>簡稱</th>
+                                                        <th>產業</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    <tr id="symbolsTableEmptyRow" class="no-data-row">
+                                                        <td colspan="5" class="no-data-cell">
+                                                            <div class="no-data-content">
+                                                                <div class="no-data-icon"><i class="fas fa-search"></i></div>
+                                                                <div class="no-data-text">
+                                                                    <h4>尚未載入</h4>
+                                                                    <p>請點擊重新載入或從交易所更新</p>
+                                                                </div>
+                                                            </div>
+                                                        </td>
+                                                    </tr>
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="config-section">
+                            <div class="section-header">
+                                <div class="section-icon">
+                                    <i class="fas fa-layer-group"></i>
+                                </div>
+                                <div class="section-info">
+                                    <h3 class="section-title">ETF 名稱更新</h3>
+                                    <p class="section-subtitle">從 ISIN (strMode=2) 取得 ETF 清單，寫入 tw_stock_symbols</p>
+                                </div>
+                                <div class="section-badge">ETF</div>
+                            </div>
+
+                            <div class="section-content">
+                                <div class="action-buttons" style="margin-top: 0;">
+                                    <button id="etfRefreshBtn" class="btn btn-primary action-btn" type="button">
+                                        <div class="btn-content">
+                                            <i class="fas fa-sync"></i>
+                                            <span class="btn-text">更新 ETF 名稱</span>
+                                            <span class="btn-subtitle">更新本機與雲端</span>
+                                        </div>
+                                    </button>
+                                </div>
+                                <div id="etfRefreshStatus" class="input-hint" style="margin-top: 10px; display:none;"></div>
+                            </div>
+                        </div>
+
                         <!-- Stock Selection Card -->
                         <div class="config-section">
                             <div class="section-header">
@@ -1449,6 +1956,26 @@
                                         </div>
                                     </div>
                                 </div>
+                            </div>
+                        </div>
+
+                        <div class="config-section">
+                            <div class="section-header">
+                                <div class="section-icon">
+                                    <i class="fas fa-table"></i>
+                                </div>
+                                <div class="section-info">
+                                    <h3 class="section-title">資料表選擇</h3>
+                                    <p class="section-subtitle">選擇要查詢的資料表（依資料庫目標切換）</p>
+                                </div>
+                                <div class="section-badge">可選</div>
+                            </div>
+                            <div class="section-content">
+                                <select id="queryTableSelect" class="modern-select" style="width: 100%">
+                                    <option value="">自動（依查詢類型）</option>
+                                    <option value="tw_stock_prices">tw_stock_prices</option>
+                                    <option value="tw_stock_returns">tw_stock_returns</option>
+                                </select>
                             </div>
                         </div>
 
@@ -1664,8 +2191,8 @@
                                     <i class="fas fa-cloud-upload-alt"></i>
                                 </div>
                                 <div class="header-text">
-                                    <h2>上傳本地資料庫到 Neon</h2>
-                                    <p>將本地 PostgreSQL 資料庫完整上傳至 Neon 雲端</p>
+                                    <h2>資料庫同步（本機 ↔ Neon）</h2>
+                                    <p>在本機 PostgreSQL 與 Neon 雲端之間同步資料表（上傳 / 下載）</p>
                                 </div>
                             </div>
                         </div>
@@ -1677,9 +2204,13 @@
                                     <i class="fas fa-list-check"></i>
                                 </div>
                                 <div class="section-info">
-                                    <h3 class="section-title">選擇要上傳的表格</h3>
-                                    <p class="section-subtitle">勾選要同步到 Neon 的資料表</p>
+                                    <h3 class="section-title">選擇要同步的表格</h3>
+                                    <p class="section-subtitle">勾選要上傳/下載的資料表</p>
                                 </div>
+                                <select id="syncTablesSource" class="modern-select" style="margin-right: 10px; min-width: 140px;">
+                                    <option value="local">本機資料庫</option>
+                                    <option value="neon">Neon 雲端</option>
+                                </select>
                                 <button class="btn-check-connection" id="btnLoadTables">
                                     <i class="fas fa-sync-alt"></i> 載入表格列表
                                 </button>
@@ -1707,10 +2238,20 @@
                                 </div>
                                 
                                 <div style="text-align: center; margin-top: 30px;">
-                                    <button class="btn-primary-large" id="btnStartSync" disabled style="margin: 0 auto; font-size: 18px; padding: 16px 40px;">
-                                        <i class="fas fa-cloud-upload-alt"></i>
-                                        <span>開始上傳到 Neon</span>
-                                    </button>
+                                    <div style="display:flex; justify-content:center; gap:12px; flex-wrap:wrap;">
+                                        <button class="btn-primary-large" id="btnStartSync" disabled style="margin: 0; font-size: 18px; padding: 16px 40px;">
+                                            <i class="fas fa-cloud-upload-alt"></i>
+                                            <span>開始上傳到 Neon</span>
+                                        </button>
+                                        <button class="btn-primary-large" id="btnDownloadFromNeon" disabled style="margin: 0; font-size: 18px; padding: 16px 40px;">
+                                            <i class="fas fa-cloud-download-alt"></i>
+                                            <span>從 Neon 下載到本機</span>
+                                        </button>
+                                        <button class="btn-primary-large" id="btnExportTablesExcel" type="button" disabled style="margin: 0; font-size: 18px; padding: 16px 40px;">
+                                            <i class="fas fa-file-excel"></i>
+                                            <span>匯出CSV</span>
+                                        </button>
+                                    </div>
                                 </div>
 
                                 <div class="alert-box info" style="margin-top: 20px;">
@@ -1718,9 +2259,10 @@
                                     <div>
                                         <strong>說明：</strong>
                                         <ul style="margin: 10px 0 0 0; padding-left: 20px;">
-                                            <li>可以選擇特定表格上傳，或全選上傳所有表格</li>
+                                            <li>可選擇特定表格同步，或全選同步所有表格</li>
+                                            <li>上傳：本機 → Neon；下載：Neon → 本機</li>
                                             <li>大表格（>10,000 行）會使用批次處理</li>
-                                            <li>已存在的數據會自動跳過</li>
+                                            <li>若資料表有主鍵，已存在的資料會自動跳過</li>
                                         </ul>
                                     </div>
                                 </div>
@@ -1734,8 +2276,8 @@
                                     <i class="fas fa-tasks"></i>
                                 </div>
                                 <div class="section-info">
-                                    <h3 class="section-title">上傳進度</h3>
-                                    <p class="section-subtitle">資料同步進行中</p>
+                                    <h3 class="section-title">同步進度</h3>
+                                    <p class="section-subtitle">同步進行中（上傳 / 下載）</p>
                                 </div>
                             </div>
                             <div class="section-content">
@@ -1755,7 +2297,7 @@
                                     <i class="fas fa-check-circle"></i>
                                 </div>
                                 <div class="section-info">
-                                    <h3 class="section-title">上傳結果</h3>
+                                    <h3 class="section-title">同步結果</h3>
                                     <p class="section-subtitle">同步完成摘要</p>
                                 </div>
                             </div>
@@ -1765,6 +2307,26 @@
                                 </div>
                                 <div class="results-details" id="syncResultsDetails">
                                     <!-- Detailed results will be inserted here -->
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="config-section" id="syncLogSection" style="display: none;">
+                            <div class="section-header">
+                                <div class="section-icon">
+                                    <i class="fas fa-terminal"></i>
+                                </div>
+                                <div class="section-info">
+                                    <h3 class="section-title">同步日誌</h3>
+                                    <p class="section-subtitle">即時顯示同步過程（表格 / 批次進度 / 錯誤）</p>
+                                </div>
+                                <button class="btn-check-connection" id="btnClearSyncLog" style="margin-left:auto;">
+                                    <i class="fas fa-eraser"></i> 清空日誌
+                                </button>
+                            </div>
+                            <div class="section-content">
+                                <div id="syncLogPanel" style="max-height:260px; overflow-y:auto; background:rgba(17,24,39,0.85); border:1px solid rgba(148,163,184,0.2); border-radius:10px; padding:1rem; font-family:'Consolas','Monaco',monospace; font-size:0.85rem; line-height:1.6; color:#e2e8f0;">
+                                    <div class="sync-log-empty" style="color:#94a3b8;">尚未開始同步</div>
                                 </div>
                             </div>
                         </div>
@@ -2213,8 +2775,10 @@
     </div>
 
     <!-- BWIBBU module -->
+    <script src="config.js"></script>
+    <script src="cloud-jobs.js"></script>
     <script src="bwibbu.js"></script>
     <!-- Cache-busting: bump version to force reload of updated script.js -->
-    <script src="script.js?v=20251117-1931"></script>
+    <script src="script.js?v=20260126-0136"></script>
 </body>
 </html>

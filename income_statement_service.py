@@ -16,7 +16,7 @@ script `comprehensive_income_statement.py`.
 """
 
 import time
-from io import BytesIO
+from io import BytesIO, StringIO
 from typing import List, Callable, Optional
 
 import logging
@@ -46,7 +46,13 @@ TARGET_KEYWORDS = {
         "Other gains and losses",
         "其他利益及損失淨額",
     ],
-    "Revenue": ["Revenue", "ifrs-full:Revenue", "營業收入"],
+    "Revenue": [
+        "ifrs-full:Revenue",
+        "ifrs-full:RevenueFromSaleOfGoods",
+        "ifrs-full:RevenueFromContractsWithCustomers",
+        "營業收入",
+        "Net sales revenue",
+    ],
     "OperatingCosts": [
         "OperatingCosts",
         "tifrs-bsci-ci:OperatingCosts",
@@ -332,12 +338,38 @@ class MopsBlockedError(Exception):
     pass
 
 
-def _build_mops_url(co_id: str, year: str, season: str) -> str:
+def _normalize_mops_year(year: str) -> str:
+    year_str = str(year).strip()
+    try:
+        year_int = int(year_str)
+    except Exception:
+        return year_str
+
+    if year_int >= 1911:
+        return str(year_int - 1911)
+    return str(year_int)
+
+
+def _build_mops_url(co_id: str, year: str, season: str, *, host: str) -> str:
     """Construct the MOPS URL for a given company/year/season (C-report)."""
 
     return (
-        "https://mopsov.twse.com.tw/server-java/t164sb01?step=1"
+        f"https://{host}/server-java/t164sb01?step=1"
         f"&CO_ID={co_id}&SYEAR={year}&SSEASON={season}&REPORT_ID=C"
+    )
+
+
+def _is_connection_issue(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "failed to resolve" in msg
+        or "nodatename nor servname" in msg
+        or "name resolution" in msg
+        or "gaierror" in msg
+        or "connection reset" in msg
+        or "connection aborted" in msg
+        or "max retries exceeded" in msg
+        or "timed out" in msg
     )
 
 
@@ -386,8 +418,6 @@ def fetch_income_row(co_id: str, year: str, season: str) -> pd.DataFrame:
     股票代號, period, Revenue, RevenueFromInterest, ..., DilutedEarningsLossPerShareTotal
     """
 
-    url = _build_mops_url(co_id, year, season)
-
     session = requests.Session()
     session.headers.update(
         {
@@ -399,7 +429,32 @@ def fetch_income_row(co_id: str, year: str, season: str) -> pd.DataFrame:
         }
     )
 
-    resp = session.get(url, timeout=20)
+    resp = None
+    last_exc: Exception | None = None
+    for host in ("mopsov.twse.com.tw", "mops.twse.com.tw"):
+        url = _build_mops_url(co_id, year, season, host=host)
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+            last_exc = None
+            break
+        except Exception as e:
+            last_exc = e
+            if not _is_connection_issue(e):
+                raise
+            logger.warning(
+                "[income][mops] connection issue host=%s stock=%s year=%s season=%s err=%s",
+                host,
+                co_id,
+                year,
+                season,
+                e,
+            )
+            continue
+
+    if resp is None:
+        raise last_exc if last_exc is not None else RuntimeError("MOPS request failed")
+
     resp.raise_for_status()
 
     text = ""
@@ -426,13 +481,53 @@ def fetch_income_row(co_id: str, year: str, season: str) -> pd.DataFrame:
 
     parser = etree.HTMLParser()
     tree = etree.parse(BytesIO(resp.content), parser)
+    page_title = ""
+    try:
+        title_bits = [str(x).strip() for x in tree.xpath("//title/text()")]
+        page_title = " ".join([x for x in title_bits if x])
+    except Exception:
+        page_title = ""
 
-    nonfraction_nodes = tree.xpath("//*[local-name() = 'nonfraction']")
+    # MOPS iXBRL tags are often `nonFraction` (camelCase). XPath local-name() is
+    # case-sensitive, so we normalize to lowercase to support both variants.
+    nonfraction_nodes = tree.xpath(
+        "//*[translate(local-name(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') = 'nonfraction']"
+    )
+    if not nonfraction_nodes:
+        try:
+            logger.warning(
+                "[income][debug-no-nodes] stock=%s year=%s season=%s title=%s has_ix_nonfraction=%s has_nonfraction=%s url=%s",
+                co_id,
+                year,
+                season,
+                page_title,
+                ("ix:nonFraction" in text or "ix:nonfraction" in text),
+                ("nonFraction" in text or "nonfraction" in text),
+                resp.url,
+            )
+        except Exception:
+            pass
 
     results = []
+    debug_samples = []
     for node in nonfraction_nodes:
         name_attr = node.get("name") or ""
         text_content = (node.text or "").strip()
+        row_text = ""
+        try:
+            row_bits = [str(x).strip() for x in node.xpath("ancestor::tr[1]//text()")]
+            row_text = " ".join([x for x in row_bits if x])
+        except Exception:
+            row_text = ""
+
+        if len(debug_samples) < 8:
+            debug_samples.append(
+                {
+                    "name_attr": name_attr,
+                    "text": text_content[:80],
+                    "row": row_text[:160],
+                }
+            )
 
         matched_key = None
         for key, kws in TARGET_KEYWORDS.items():
@@ -442,7 +537,10 @@ def fetch_income_row(co_id: str, year: str, season: str) -> pd.DataFrame:
                         matched_key = key
                         break
                 else:
-                    if kw.lower() in name_attr.lower() or kw in text_content:
+                    # MOPS often puts the account label in sibling <td> cells within
+                    # the same <tr>, while node.text itself is only the numeric value.
+                    # Therefore free-text keywords must inspect the whole row text.
+                    if kw in row_text or kw in text_content:
                         matched_key = key
                         break
             if matched_key:
@@ -497,6 +595,16 @@ def fetch_income_row(co_id: str, year: str, season: str) -> pd.DataFrame:
                 co_id,
                 year,
                 season,
+            )
+            logger.warning(
+                "[income][debug-no-match] stock=%s year=%s season=%s title=%s node_count=%s samples=%s url=%s",
+                co_id,
+                year,
+                season,
+                page_title,
+                len(nonfraction_nodes),
+                debug_samples,
+                resp.url,
             )
         except Exception:
             pass
@@ -561,7 +669,38 @@ def fetch_all_stock_codes() -> List[str]:
     codes: set[str] = set()
     for url in urls:
         # 這兩個 ISIN 頁面使用 Big5 編碼，若直接給 pandas URL 會以 UTF-8 解碼而失敗
-        resp = requests.get(url, timeout=20)
+        resp = None
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    url,
+                    timeout=20,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        )
+                    },
+                )
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                wait_s = 2.0 if attempt == 0 else (5.0 if attempt == 1 else 10.0)
+                logger.warning(
+                    "[income][isin] fetch failed (attempt=%s/3, wait=%ss) url=%s err=%s",
+                    attempt + 1,
+                    wait_s,
+                    url,
+                    e,
+                )
+                _time.sleep(wait_s)
+
+        if resp is None:
+            logger.error("[income][isin] giving up url=%s err=%s", url, last_exc)
+            continue
         # 明確指定 Big5（cp950）；若解析失敗則退回 apparent_encoding 或忽略錯誤
         try:
             resp.encoding = "cp950"  # Big5 / 繁體中文編碼
@@ -574,7 +713,7 @@ def fetch_all_stock_codes() -> List[str]:
             except Exception:
                 html = resp.content.decode("cp950", errors="ignore")
 
-        tables = pd.read_html(html)
+        tables = pd.read_html(StringIO(html))
         if not tables:
             continue
         df = tables[0]
@@ -585,6 +724,9 @@ def fetch_all_stock_codes() -> List[str]:
             parts = val.split()
             if len(parts) >= 1 and parts[0].isdigit() and len(parts[0]) == 4:
                 codes.add(parts[0])
+
+    if not codes:
+        raise RuntimeError("無法從 ISIN 頁面取得股票代號清單（連線可能不穩或被重設），請稍後再試")
 
     return sorted(codes)
 
@@ -599,6 +741,7 @@ def fetch_all_incomes(
     code_to: Optional[str] = None,
     pause_every: Optional[int] = None,
     pause_seconds: float = 0.0,
+    raise_on_block: bool = False,
 ) -> pd.DataFrame:
     """Fetch income statement wide-rows for all stocks for a given year/season.
 
@@ -675,6 +818,8 @@ def fetch_all_incomes(
             )
             if progress_cb is not None:
                 progress_cb(idx, total, co_id, "error", str(e))
+            if raise_on_block:
+                raise
             break
         except Exception as e:
             logger.exception("[income] error fetching stock %s: %s", co_id, e)
