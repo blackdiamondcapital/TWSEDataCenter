@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+1#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import sys
@@ -21,9 +21,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 # 禁用 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-from flask import Flask, jsonify, request, send_from_directory, send_file, Response
+from flask import Flask, jsonify, request, send_from_directory, send_file, Response, stream_with_context
 from flask_cors import CORS
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import RealDictCursor, execute_values, Json
 from psycopg2.extensions import register_adapter
 import json as json_lib
@@ -32,32 +33,34 @@ import json as json_lib
 register_adapter(dict, Json)
 from urllib.parse import urlparse
 import os
+import socket
 import math
 import threading  # 添加线程模块
+import subprocess
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 import zipfile
+import tempfile
 from functools import partial
 from typing import Optional
 import argparse
 
+import re
+
 from income_statement_service import fetch_all_incomes, fetch_income_row, TARGET_ORDER
-try:
-    from balance_sheet_service import (
-        fetch_all_balance_sheets,
-        fetch_balance_sheet_row,
-        MopsBlockedError as BalanceMopsBlockedError,
-        TARGET_ORDER as BALANCE_TARGET_ORDER,
-    )
-except ImportError:
-    fetch_all_balance_sheets = None
-    fetch_balance_sheet_row = None
-
-    class BalanceMopsBlockedError(Exception):
-        pass
-
-    BALANCE_TARGET_ORDER = []
+from balance_sheet_service import (
+    fetch_all_balance_sheets,
+    fetch_balance_sheet_row,
+    MopsBlockedError as BalanceMopsBlockedError,
+    TARGET_ORDER as BALANCE_TARGET_ORDER,
+)
+from cash_flow_service import (
+    fetch_all_cash_flows,
+    fetch_cash_flow_row,
+    MopsBlockedError as CashFlowMopsBlockedError,
+    TARGET_ORDER as CASH_FLOW_TARGET_ORDER,
+)
 
 from table_config import (
     resolve_use_neon,
@@ -68,27 +71,180 @@ from table_config import (
     monthly_revenue_table,
     income_statement_table,
     balance_sheet_table,
+    cash_flow_table,
+    financial_ratios_table,
 )
 
-try:
-    from returns_calc import compute_returns as compute_returns_task
-except ImportError:
-    compute_returns_task = None
+from returns_calc import compute_returns as compute_returns_task
+from cloud_jobs_api import cloud_jobs_blueprint
 
 # 配置日誌
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Load environment variables from .env if present (optional dependency)
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 DEFAULT_START_DATE = '2010-01-01'
+
+FMTQIK_URL = 'https://www.twse.com.tw/exchangeReport/FMTQIK'
 
 # 全局数据库表锁（防止并发修改表结构导致死锁）
 db_table_lock = threading.Lock()
+# 全局更新鎖，避免並行 /api/update 造成重複抓取
+update_lock = threading.Lock()
+db_sync_lock = threading.Lock()
+
+FINANCIAL_RATIO_COLS = [
+    # 方案 B：以 Neon 既有格式為準（snake_case）
+    "assets",
+    "equity",
+    "revenue",
+    "gross_profit",
+    "op_profit",
+    "net_profit",
+    "gross_margin",
+    "op_margin",
+    "net_margin",
+    "roa",
+    "roe",
+    "debt_ratio",
+    "current_ratio",
+    "quick_ratio",
+]
+
+
+def _safe_div(n, d):
+    try:
+        if n is None or d is None:
+            return None
+        dn = float(d)
+        if dn == 0:
+            return None
+        return float(n) / dn
+    except Exception:
+        return None
+
+
+def _compute_ratios_record(row: dict) -> dict:
+    revenue = row.get('Revenue')
+    gross_profit = row.get('GrossProfitFromOperations')
+    op_profit = row.get('ProfitLossFromOperatingActivities')
+    net_profit = row.get('ProfitLoss')
+
+    assets = row.get('Assets')
+    liabilities = row.get('Liabilities')
+    equity_parent = row.get('EquityAttributableToOwnersOfParent')
+    current_assets = row.get('CurrentAssets')
+    current_liabilities = row.get('CurrentLiabilities')
+
+    quick_assets = 0.0
+    quick_used = False
+    for k in (
+        'CashAndCashEquivalents',
+        'AccountsReceivableNet',
+        'OtherCurrentReceivables',
+        'CurrentFinancialAssetsAtAmortisedCost',
+        'CurrentFinancialAssetsAtFairValueThroughProfitOrLoss',
+        'CurrentFinancialAssetsAtFairValueThroughOtherComprehensiveIncome',
+        'OtherCurrentFinancialAssets',
+    ):
+        v = row.get(k)
+        if v is None:
+            continue
+        try:
+            quick_assets += float(v)
+            quick_used = True
+        except Exception:
+            continue
+
+    return {
+        'assets': assets,
+        'equity': equity_parent,
+        'revenue': revenue,
+        'gross_profit': gross_profit,
+        'op_profit': op_profit,
+        'net_profit': net_profit,
+        'gross_margin': _safe_div(gross_profit, revenue),
+        'op_margin': _safe_div(op_profit, revenue),
+        'net_margin': _safe_div(net_profit, revenue),
+        'roa': _safe_div(net_profit, assets),
+        'roe': _safe_div(net_profit, equity_parent),
+        'debt_ratio': _safe_div(liabilities, assets),
+        'current_ratio': _safe_div(current_assets, current_liabilities),
+        'quick_ratio': _safe_div(quick_assets, current_liabilities) if quick_used else None,
+    }
 
 # 获取当前目录作为静态文件目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
+frontend_dir = os.path.join(current_dir, 'frontend')
 
-app = Flask(__name__, static_folder=current_dir, static_url_path='')
-CORS(app)  # 允許跨域請求
+app = Flask(__name__, static_folder=frontend_dir, static_url_path='')
+allowed_origins = [
+    origin.strip()
+    for origin in os.environ.get(
+        'ALLOWED_ORIGINS',
+        'http://localhost:5003,http://127.0.0.1:5003,http://localhost:5500,http://127.0.0.1:5500',
+    ).split(',')
+    if origin.strip()
+]
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
+app.register_blueprint(cloud_jobs_blueprint)
+
+# SSE 事件佇列（推進度/警告到前端）
+sse_queue = Queue()
+
+def push_sse(channel: str, event: str, message: str | None = None, **extra):
+    try:
+        payload = {
+            'channel': channel,
+            'event': event,
+            'message': message,
+        }
+        if extra:
+            # 避免覆寫保留欄位，讓前端事件分類穩定
+            for k, v in extra.items():
+                if k in ('channel', 'event', 'message'):
+                    continue
+                payload[k] = v
+        sse_queue.put(payload, timeout=0.1)
+    except Exception:
+        pass
+
+
+@app.route('/api/stream/logs', methods=['GET'])
+def stream_logs():
+    """Server-Sent Events: 推送後端進度/警告到前端。"""
+    def event_stream():
+        heartbeat_interval = 10
+        last_heartbeat = time.time()
+        while True:
+            try:
+                item = sse_queue.get(timeout=1)
+                try:
+                    payload = json.dumps(item, ensure_ascii=False)
+                except TypeError:
+                    payload = json.dumps({'channel': 'system', 'event': 'error', 'message': 'encode_failed'})
+                yield f"data: {payload}\n\n"
+            except Exception:
+                pass
+            now = time.time()
+            if now - last_heartbeat >= heartbeat_interval:
+                last_heartbeat = now
+                yield "data: {\"channel\":\"system\",\"event\":\"heartbeat\"}\n\n"
+
+    headers = {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    }
+    return Response(event_stream(), headers=headers)
 
 class TableNameAwareCursor(RealDictCursor):
     """Cursor that automatically maps logical table names to environment-specific ones."""
@@ -137,7 +293,6 @@ class DatabaseManager:
             None if use_local else (
                 os.environ.get('DATABASE_URL')
                 or os.environ.get('NEON_DATABASE_URL')
-                or 'postgresql://neondb_owner:npg_6vuayEsIl4Qb@ep-wispy-sky-adgltyd1-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require'
             )
         )
         ssl_default = 'require' if self.db_url else 'prefer'
@@ -145,7 +300,7 @@ class DatabaseManager:
             'host': os.environ.get('DB_HOST', 'localhost'),
             'port': os.environ.get('DB_PORT', '5432'),
             'user': os.environ.get('DB_USER', 'postgres'),
-            'password': os.environ.get('DB_PASSWORD', 's8304021'),
+            'password': os.environ.get('DB_PASSWORD', ''),
             'database': os.environ.get('DB_NAME', 'postgres'),
             'sslmode': os.environ.get('DB_SSLMODE', ssl_default)
         }
@@ -158,12 +313,120 @@ class DatabaseManager:
         self.table_revenue = monthly_revenue_table(use_neon=self.is_neon)
         self.table_income = income_statement_table(use_neon=self.is_neon)
         self.table_balance = balance_sheet_table(use_neon=self.is_neon)
+        self.table_cash_flow = cash_flow_table(use_neon=self.is_neon)
+        self.table_financial_ratios = financial_ratios_table(use_neon=self.is_neon)
         self._cursor_factory = partial(
             TableNameAwareCursor,
             table_prices=self.table_prices,
             table_returns=self.table_returns,
             table_institutional=self.table_institutional,
         )
+
+    def ensure_prices_unique(self):
+        """確保價格表 (symbol, date) 有 UNIQUE/INDEX。
+
+        ON CONFLICT (symbol, date) 需要對應的 unique/exclusion constraint。
+        若既有資料含重複，會先自動去重後再建索引。
+        """
+        if self.connection is None:
+            if not self.connect():
+                return False
+
+        cursor = self.connection.cursor()
+        try:
+            # 如果表不存在（例如 create_tables 因鎖超時略過），先補一個最小可用表結構
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table_prices} (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    date DATE NOT NULL,
+                    open_price DECIMAL(10,2),
+                    high_price DECIMAL(10,2),
+                    low_price DECIMAL(10,2),
+                    close_price DECIMAL(10,2),
+                    volume BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, date)
+                );
+                """
+            )
+
+            # 先嘗試建立唯一索引（若已存在則不動作）
+            cursor.execute(
+                f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS {self.table_prices}_symbol_date_idx
+                ON {self.table_prices}(symbol, date);
+                """
+            )
+            self.connection.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            logger.error(f"ensure_prices_unique error: {e}")
+            try:
+                self.connection.rollback()
+            except Exception:
+                pass
+
+            msg = str(e)
+            if 'duplicated' not in msg and 'duplicate' not in msg:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+                return False
+
+            # 有重複鍵：先去重，再重試建立索引
+            try:
+                cursor = self.connection.cursor()
+                cursor.execute(
+                    f"""
+                    DELETE FROM {self.table_prices} t
+                    USING (
+                      SELECT ctid,
+                             ROW_NUMBER() OVER (PARTITION BY symbol, date ORDER BY ctid) AS rn
+                      FROM {self.table_prices}
+                    ) d
+                    WHERE t.ctid = d.ctid AND d.rn > 1;
+                    """
+                )
+                self.connection.commit()
+                cursor.close()
+            except Exception as cleanup_exc:
+                logger.error(f"ensure_prices_unique cleanup error: {cleanup_exc}")
+                try:
+                    self.connection.rollback()
+                except Exception:
+                    pass
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+                return False
+
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    CREATE UNIQUE INDEX IF NOT EXISTS {self.table_prices}_symbol_date_idx
+                    ON {self.table_prices}(symbol, date);
+                    """
+                )
+                self.connection.commit()
+                cursor.close()
+                return True
+            except Exception as e2:
+                logger.error(f"ensure_prices_unique retry error: {e2}")
+                try:
+                    self.connection.rollback()
+                except Exception:
+                    pass
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+                return False
 
     def connection_info(self):
         if self.db_url:
@@ -274,7 +537,15 @@ class DatabaseManager:
         acquired = db_table_lock.acquire(timeout=30)
         if not acquired:
             logger.warning("获取表锁超时，跳过表检查")
-            return False
+            # 即使略過建表，也要確保 prices 的 unique index 存在，否則 ON CONFLICT 會直接報錯
+            try:
+                if self.connection is None:
+                    if not self.connect():
+                        return False
+                self.ensure_prices_unique()
+            except Exception:
+                pass
+            return True
         
         try:
             if self.connection is None:
@@ -311,12 +582,9 @@ class DatabaseManager:
                 );
                 """
             )
-            cursor.execute(
-                f"""
-                CREATE UNIQUE INDEX IF NOT EXISTS {self.table_prices}_symbol_date_idx
-                ON {self.table_prices}(symbol, date);
-                """
-            )
+
+            # 確保 (symbol, date) unique index 存在（並自動處理重複）
+            self.ensure_prices_unique()
 
             # 創建報酬率數據表
             cursor.execute(
@@ -544,95 +812,162 @@ class DatabaseManager:
                 """
             )
 
-            cursor.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {self.table_institutional} (
-                    date DATE NOT NULL,
-                    market VARCHAR(10) NOT NULL,
-                    stock_no VARCHAR(20) NOT NULL,
-                    stock_name VARCHAR(100),
-                    foreign_buy BIGINT,
-                    foreign_sell BIGINT,
-                    foreign_net BIGINT,
-                    foreign_dealer_buy BIGINT,
-                    foreign_dealer_sell BIGINT,
-                    foreign_dealer_net BIGINT,
-                    foreign_total_buy BIGINT,
-                    foreign_total_sell BIGINT,
-                    foreign_total_net BIGINT,
-                    investment_trust_buy BIGINT,
-                    investment_trust_sell BIGINT,
-                    investment_trust_net BIGINT,
-                    dealer_self_buy BIGINT,
-                    dealer_self_sell BIGINT,
-                    dealer_self_net BIGINT,
-                    dealer_hedge_buy BIGINT,
-                    dealer_hedge_sell BIGINT,
-                    dealer_hedge_net BIGINT,
-                    dealer_total_buy BIGINT,
-                    dealer_total_sell BIGINT,
-                    dealer_total_net BIGINT,
-                    overall_net BIGINT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS tw_warrant_trade (
+                    out_date DATE,
+                    trade_date DATE NOT NULL,
+                    warrant_code VARCHAR(20) NOT NULL,
+                    warrant_name VARCHAR(100),
+                    turnover NUMERIC(20,2),
+                    volume BIGINT,
+                    raw_out_date_text VARCHAR(20),
+                    raw_trade_date_text VARCHAR(20),
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (date, market, stock_no)
+                    PRIMARY KEY (warrant_code, trade_date)
                 );
-                """
-            )
-            cursor.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS {self.table_institutional}_date_idx
-                ON {self.table_institutional}(date);
-                """
-            )
-            cursor.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS {self.table_institutional}_stock_idx
-                ON {self.table_institutional}(stock_no, date DESC);
-                """
-            )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS tw_warrant_trade_trade_date_idx
+                ON tw_warrant_trade(trade_date DESC);
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS tpex_warrant_master (
+                    warrant_code VARCHAR(20) PRIMARY KEY,
+                    report_date DATE,
+                    warrant_name VARCHAR(100),
+                    listed_date DATE,
+                    expiry_date DATE,
+                    underlying_code VARCHAR(20),
+                    underlying_name VARCHAR(100),
+                    warrant_type VARCHAR(20),
+                    exercise_style VARCHAR(20),
+                    cap_price NUMERIC(20,6),
+                    floor_price NUMERIC(20,6),
+                    reset_flag VARCHAR(5),
+                    latest_exercise_price NUMERIC(20,6),
+                    latest_exercise_ratio NUMERIC(20,10),
+                    initial_issuance BIGINT,
+                    accumulated_issuance BIGINT,
+                    accumulated_canceled BIGINT,
+                    market VARCHAR(10) DEFAULT 'TPEX',
+                    raw_report_date_text VARCHAR(20),
+                    raw_listed_date_text VARCHAR(20),
+                    raw_expiry_date_text VARCHAR(20),
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS tpex_warrant_master_underlying_idx
+                ON tpex_warrant_master(underlying_code);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS tpex_warrant_master_expiry_idx
+                ON tpex_warrant_master(expiry_date);
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS tpex_warrant_daily_quotes (
+                    trade_date DATE NOT NULL,
+                    warrant_code VARCHAR(20) NOT NULL,
+                    warrant_name VARCHAR(100),
+                    open_price NUMERIC(20,6),
+                    high_price NUMERIC(20,6),
+                    low_price NUMERIC(20,6),
+                    close_price NUMERIC(20,6),
+                    price_change NUMERIC(20,6),
+                    trade_volume BIGINT,
+                    transaction_count BIGINT,
+                    trade_value NUMERIC(20,2),
+                    underlying_code VARCHAR(20),
+                    underlying_name VARCHAR(100),
+                    underlying_close_price NUMERIC(20,6),
+                    underlying_price_change NUMERIC(20,6),
+                    market VARCHAR(10) DEFAULT 'TPEX',
+                    raw_trade_date_text VARCHAR(20),
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (trade_date, warrant_code)
+                );
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS tpex_warrant_daily_quotes_code_idx
+                ON tpex_warrant_daily_quotes(warrant_code, trade_date DESC);
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS tpex_warrant_daily_quotes_trade_date_idx
+                ON tpex_warrant_daily_quotes(trade_date DESC);
+            """)
 
             # 建立損益表資料表（寬表，每檔股票每期一列）
-            income_columns = [
-                '                    "股票代號" VARCHAR(20) NOT NULL',
-                '                    period VARCHAR(16) NOT NULL',
-            ]
-            income_columns.extend([
-                f'                    "{col}" NUMERIC(20,4)' for col in TARGET_ORDER
+            income_columns_sql = ",\n".join([
+                f'    "{col}" NUMERIC(20,4)' for col in TARGET_ORDER
             ])
-            income_columns.extend([
-                '                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
-                '                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
-                '                    PRIMARY KEY ("股票代號", period)',
-            ])
-            income_columns_sql = ",\n".join(income_columns)
             create_income_sql = f"""
                 CREATE TABLE IF NOT EXISTS {self.table_income} (
-{income_columns_sql}
+                    "股票代號" VARCHAR(20) NOT NULL,
+                    period VARCHAR(16) NOT NULL,
+{income_columns_sql},
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY ("股票代號", period)
                 );
             """
             cursor.execute(create_income_sql)
 
             # 建立資產負債表資料表（寬表，每檔股票每期一列）
-            balance_columns = [
-                '                    "股票代號" VARCHAR(20) NOT NULL',
-                '                    period VARCHAR(16) NOT NULL',
-            ]
-            balance_columns.extend([
-                f'                    "{col}" NUMERIC(20,4)' for col in BALANCE_TARGET_ORDER
+            balance_columns_sql = ",\n".join([
+                f'    "{col}" NUMERIC(20,4)' for col in BALANCE_TARGET_ORDER
             ])
-            balance_columns.extend([
-                '                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
-                '                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
-                '                    PRIMARY KEY ("股票代號", period)',
-            ])
-            balance_columns_sql = ",\n".join(balance_columns)
             create_balance_sql = f"""
                 CREATE TABLE IF NOT EXISTS {self.table_balance} (
-{balance_columns_sql}
+                    "股票代號" VARCHAR(20) NOT NULL,
+                    period VARCHAR(16) NOT NULL,
+{balance_columns_sql},
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY ("股票代號", period)
                 );
             """
             cursor.execute(create_balance_sql)
+
+            # 建立現金流量表（寬表，每檔股票每期一列）
+            cash_flow_columns_sql = ",\n".join([
+                f'    "{col}" NUMERIC(20,4)' for col in CASH_FLOW_TARGET_ORDER
+            ])
+            create_cash_flow_sql = f"""
+                CREATE TABLE IF NOT EXISTS {self.table_cash_flow} (
+                    "股票代號" VARCHAR(20) NOT NULL,
+                    period VARCHAR(16) NOT NULL,
+{cash_flow_columns_sql},
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY ("股票代號", period)
+                );
+            """
+            cursor.execute(create_cash_flow_sql)
+
+            ratios_columns_sql = ",\n".join([
+                f'    {col} NUMERIC(20,10)' for col in FINANCIAL_RATIO_COLS
+            ])
+            create_ratios_sql = f"""
+                CREATE TABLE IF NOT EXISTS {self.table_financial_ratios} (
+                    symbol VARCHAR(20) NOT NULL,
+                    period VARCHAR(16) NOT NULL,
+{ratios_columns_sql},
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (symbol, period)
+                );
+            """
+            cursor.execute(create_ratios_sql)
+
+            for col in FINANCIAL_RATIO_COLS:
+                try:
+                    cursor.execute(
+                        f'ALTER TABLE {self.table_financial_ratios} ADD COLUMN IF NOT EXISTS {col} NUMERIC(20,10);'
+                    )
+                except Exception as e:
+                    logger.warning("financial ratios table add column %s warning: %s", col, e)
 
             # 確保既有 tw_balance_sheets 表若是舊版，也會補齊所有目標欄位
             for col in BALANCE_TARGET_ORDER:
@@ -642,6 +977,14 @@ class DatabaseManager:
                     )
                 except Exception as e:
                     logger.warning("balance table add column %s warning: %s", col, e)
+
+            for col in CASH_FLOW_TARGET_ORDER:
+                try:
+                    cursor.execute(
+                        f'ALTER TABLE {self.table_cash_flow} ADD COLUMN IF NOT EXISTS "{col}" NUMERIC(20,4);'
+                    )
+                except Exception as e:
+                    logger.warning("cash flow table add column %s warning: %s", col, e)
             
             self.connection.commit()
             cursor.close()
@@ -649,6 +992,11 @@ class DatabaseManager:
             return True
         except Exception as e:
             logger.error(f"创建表失败: {e}")
+            try:
+                if self.connection:
+                    self.connection.rollback()
+            except Exception:
+                pass
             return False
         finally:
             # 确保释放锁
@@ -760,328 +1108,23 @@ class StockAPI:
             return None
         if isinstance(value, (int, float)):
             try:
-                return float(value)
+                v = float(value)
+                if not math.isfinite(v):
+                    return None
+                return v
             except Exception:
                 return None
         s = str(value).replace(',', '').strip()
-        if s in {'', '-', '--', '---', '----', 'NaN', 'null', 'None'}:
+        s_lower = s.lower()
+        if s_lower in {'', '-', '--', '---', '----', 'nan', 'null', 'none', 'inf', '+inf', '-inf', 'infinity', '+infinity', '-infinity'}:
             return None
         try:
-            return float(s)
+            v = float(s)
+            if not math.isfinite(v):
+                return None
+            return v
         except Exception:
             return None
-
-    def fetch_twse_t86_by_date(self, target_date):
-        dt = self._ensure_date(target_date)
-        params = {
-            'response': 'json',
-            'date': dt.strftime('%Y%m%d'),
-            'selectType': 'ALLBUT0999'
-        }
-
-        resp = self.twse_session.get(self.TWSE_T86_URL, params=params, timeout=20)
-        resp.raise_for_status()
-        payload = resp.json()
-
-        if payload.get('stat') != 'OK':
-            logger.info(f"TWSE T86 {dt} stat={payload.get('stat')}, 無資料")
-            return []
-
-        data_rows = payload.get('data') or []
-        results = []
-        for row in data_rows:
-            if len(row) < 19:
-                continue
-            fb = self._t86_parse_int(row[2])
-            fs = self._t86_parse_int(row[3])
-            fn = self._t86_parse_int(row[4])
-            fdb = self._t86_parse_int(row[5])
-            fds = self._t86_parse_int(row[6])
-            fdn = self._t86_parse_int(row[7])
-            itb = self._t86_parse_int(row[8])
-            its = self._t86_parse_int(row[9])
-            itn = self._t86_parse_int(row[10])
-            dealer_total_net = self._t86_parse_int(row[11])
-            dsb = self._t86_parse_int(row[12])
-            dss = self._t86_parse_int(row[13])
-            dsn = self._t86_parse_int(row[14])
-            dhb = self._t86_parse_int(row[15])
-            dhs = self._t86_parse_int(row[16])
-            dhn = self._t86_parse_int(row[17])
-            overall = self._t86_parse_int(row[18])
-
-            results.append({
-                'date': dt.isoformat(),
-                'market': 'TWSE',
-                'stock_no': (row[0] or '').strip(),
-                'stock_name': (row[1] or '').strip(),
-                'foreign_buy': fb,
-                'foreign_sell': fs,
-                'foreign_net': fn,
-                'foreign_dealer_buy': fdb,
-                'foreign_dealer_sell': fds,
-                'foreign_dealer_net': fdn,
-                'foreign_total_buy': fb + fdb,
-                'foreign_total_sell': fs + fds,
-                'foreign_total_net': fn + fdn,
-                'investment_trust_buy': itb,
-                'investment_trust_sell': its,
-                'investment_trust_net': itn,
-                'dealer_self_buy': dsb,
-                'dealer_self_sell': dss,
-                'dealer_self_net': dsn,
-                'dealer_hedge_buy': dhb,
-                'dealer_hedge_sell': dhs,
-                'dealer_hedge_net': dhn,
-                'dealer_total_buy': dsb + dhb,
-                'dealer_total_sell': dss + dhs,
-                'dealer_total_net': dealer_total_net if dealer_total_net else dsn + dhn,
-                'overall_net': overall,
-            })
-        logger.info(f"TWSE T86 {dt} 抓取 {len(results)} 筆")
-        return results
-
-    def fetch_tpex_t86_by_date(self, target_date):
-        dt = self._ensure_date(target_date)
-        roc_date = f"{dt.year - 1911:03d}/{dt.month:02d}/{dt.day:02d}"
-        params = {
-            'l': 'zh-tw',
-            'date': roc_date,
-            'json': '1'
-        }
-
-        resp = self.tpex_session.get(self.TPEX_T86_URL, params=params, timeout=20)
-        resp.raise_for_status()
-        payload = resp.json()
-
-        if payload.get('stat', '').lower() != 'ok':
-            logger.info(f"TPEX T86 {dt} stat={payload.get('stat')}, 無資料")
-            return []
-
-        tables = payload.get('tables') or []
-        if not tables:
-            return []
-
-        data_rows = tables[0].get('data') or []
-        results = []
-        for row in data_rows:
-            if len(row) < 24:
-                continue
-            results.append({
-                'date': dt.isoformat(),
-                'market': 'TPEX',
-                'stock_no': (row[0] or '').strip(),
-                'stock_name': (row[1] or '').strip(),
-                'foreign_buy': self._t86_parse_int(row[2]),
-                'foreign_sell': self._t86_parse_int(row[3]),
-                'foreign_net': self._t86_parse_int(row[4]),
-                'foreign_dealer_buy': self._t86_parse_int(row[5]),
-                'foreign_dealer_sell': self._t86_parse_int(row[6]),
-                'foreign_dealer_net': self._t86_parse_int(row[7]),
-                'foreign_total_buy': self._t86_parse_int(row[8]),
-                'foreign_total_sell': self._t86_parse_int(row[9]),
-                'foreign_total_net': self._t86_parse_int(row[10]),
-                'investment_trust_buy': self._t86_parse_int(row[11]),
-                'investment_trust_sell': self._t86_parse_int(row[12]),
-                'investment_trust_net': self._t86_parse_int(row[13]),
-                'dealer_self_buy': self._t86_parse_int(row[14]),
-                'dealer_self_sell': self._t86_parse_int(row[15]),
-                'dealer_self_net': self._t86_parse_int(row[16]),
-                'dealer_hedge_buy': self._t86_parse_int(row[17]),
-                'dealer_hedge_sell': self._t86_parse_int(row[18]),
-                'dealer_hedge_net': self._t86_parse_int(row[19]),
-                'dealer_total_buy': self._t86_parse_int(row[20]),
-                'dealer_total_sell': self._t86_parse_int(row[21]),
-                'dealer_total_net': self._t86_parse_int(row[22]),
-                'overall_net': self._t86_parse_int(row[23]),
-            })
-        logger.info(f"TPEX T86 {dt} 抓取 {len(results)} 筆")
-        return results
-
-    def fetch_t86_range(self, start_date, end_date, market: str = 'both', sleep_seconds: float = 0.6):
-        start_dt = self._ensure_date(start_date)
-        end_dt = self._ensure_date(end_date)
-        if start_dt > end_dt:
-            start_dt, end_dt = end_dt, start_dt
-
-        market_key = (market or 'both').lower()
-        if market_key not in {'twse', 'tpex', 'both'}:
-            raise ValueError("market 必須為 'twse'、'tpex' 或 'both'")
-
-        markets = {'twse', 'tpex'} if market_key == 'both' else {market_key}
-        results = []
-        daily_stats = []
-        total_twse = 0
-        total_tpex = 0
-
-        current = start_dt
-        while current <= end_dt:
-            day_records = []
-            twse_count = 0
-            tpex_count = 0
-
-            if 'twse' in markets:
-                try:
-                    twse_records = self.fetch_twse_t86_by_date(current)
-                except Exception as exc:
-                    logger.warning(f"TWSE T86 {current} 抓取失敗: {exc}")
-                    twse_records = []
-                day_records.extend(twse_records)
-                twse_count = len(twse_records)
-
-            if 'tpex' in markets:
-                try:
-                    tpex_records = self.fetch_tpex_t86_by_date(current)
-                except Exception as exc:
-                    logger.warning(f"TPEX T86 {current} 抓取失敗: {exc}")
-                    tpex_records = []
-                day_records.extend(tpex_records)
-                tpex_count = len(tpex_records)
-
-            if day_records:
-                results.extend(day_records)
-
-            daily_stats.append({
-                'date': current.isoformat(),
-                'twse_count': twse_count,
-                'tpex_count': tpex_count,
-                'total_count': twse_count + tpex_count,
-            })
-
-            total_twse += twse_count
-            total_tpex += tpex_count
-
-            if sleep_seconds and sleep_seconds > 0:
-                time.sleep(sleep_seconds)
-
-            current += timedelta(days=1)
-
-        summary = {
-            'start_date': start_dt.isoformat(),
-            'end_date': end_dt.isoformat(),
-            'markets': sorted(markets),
-            'days_processed': len(daily_stats),
-            'total_records': len(results),
-            'per_market': {
-                'TWSE': total_twse,
-                'TPEX': total_tpex,
-            },
-        }
-        return results, summary, daily_stats
-
-    def upsert_t86_records(self, records: list[dict], db_manager: DatabaseManager | None = None) -> int:
-        if not records:
-            return 0
-
-        own_manager = False
-        db = db_manager
-        if db is None:
-            db = DatabaseManager()
-            own_manager = True
-
-        if not db.connect():
-            raise RuntimeError("資料庫連線失敗")
-
-        try:
-            db.create_tables()
-            cursor = db.connection.cursor()
-            table_name = getattr(db, 'table_institutional', 'tw_institutional_trades')
-
-            def to_int(value):
-                try:
-                    return int(value)
-                except (TypeError, ValueError):
-                    return 0
-
-            values = []
-            for rec in records:
-                date_str = rec.get('date')
-                stock_no = (rec.get('stock_no') or '').strip()
-                if not date_str or not stock_no:
-                    continue
-                try:
-                    record_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                except Exception:
-                    continue
-
-                values.append((
-                    record_date,
-                    (rec.get('market') or '').strip().upper() or 'TWSE',
-                    stock_no,
-                    rec.get('stock_name'),
-                    to_int(rec.get('foreign_buy')),
-                    to_int(rec.get('foreign_sell')),
-                    to_int(rec.get('foreign_net')),
-                    to_int(rec.get('foreign_dealer_buy')),
-                    to_int(rec.get('foreign_dealer_sell')),
-                    to_int(rec.get('foreign_dealer_net')),
-                    to_int(rec.get('foreign_total_buy')),
-                    to_int(rec.get('foreign_total_sell')),
-                    to_int(rec.get('foreign_total_net')),
-                    to_int(rec.get('investment_trust_buy')),
-                    to_int(rec.get('investment_trust_sell')),
-                    to_int(rec.get('investment_trust_net')),
-                    to_int(rec.get('dealer_self_buy')),
-                    to_int(rec.get('dealer_self_sell')),
-                    to_int(rec.get('dealer_self_net')),
-                    to_int(rec.get('dealer_hedge_buy')),
-                    to_int(rec.get('dealer_hedge_sell')),
-                    to_int(rec.get('dealer_hedge_net')),
-                    to_int(rec.get('dealer_total_buy')),
-                    to_int(rec.get('dealer_total_sell')),
-                    to_int(rec.get('dealer_total_net')),
-                    to_int(rec.get('overall_net')),
-                ))
-
-            if not values:
-                return 0
-
-            insert_sql = f"""
-                INSERT INTO {table_name} (
-                    date, market, stock_no, stock_name,
-                    foreign_buy, foreign_sell, foreign_net,
-                    foreign_dealer_buy, foreign_dealer_sell, foreign_dealer_net,
-                    foreign_total_buy, foreign_total_sell, foreign_total_net,
-                    investment_trust_buy, investment_trust_sell, investment_trust_net,
-                    dealer_self_buy, dealer_self_sell, dealer_self_net,
-                    dealer_hedge_buy, dealer_hedge_sell, dealer_hedge_net,
-                    dealer_total_buy, dealer_total_sell, dealer_total_net,
-                    overall_net
-                )
-                VALUES %s
-                ON CONFLICT (date, market, stock_no) DO UPDATE SET
-                    stock_name = EXCLUDED.stock_name,
-                    foreign_buy = EXCLUDED.foreign_buy,
-                    foreign_sell = EXCLUDED.foreign_sell,
-                    foreign_net = EXCLUDED.foreign_net,
-                    foreign_dealer_buy = EXCLUDED.foreign_dealer_buy,
-                    foreign_dealer_sell = EXCLUDED.foreign_dealer_sell,
-                    foreign_dealer_net = EXCLUDED.foreign_dealer_net,
-                    foreign_total_buy = EXCLUDED.foreign_total_buy,
-                    foreign_total_sell = EXCLUDED.foreign_total_sell,
-                    foreign_total_net = EXCLUDED.foreign_total_net,
-                    investment_trust_buy = EXCLUDED.investment_trust_buy,
-                    investment_trust_sell = EXCLUDED.investment_trust_sell,
-                    investment_trust_net = EXCLUDED.investment_trust_net,
-                    dealer_self_buy = EXCLUDED.dealer_self_buy,
-                    dealer_self_sell = EXCLUDED.dealer_self_sell,
-                    dealer_self_net = EXCLUDED.dealer_self_net,
-                    dealer_hedge_buy = EXCLUDED.dealer_hedge_buy,
-                    dealer_hedge_sell = EXCLUDED.dealer_hedge_sell,
-                    dealer_hedge_net = EXCLUDED.dealer_hedge_net,
-                    dealer_total_buy = EXCLUDED.dealer_total_buy,
-                    dealer_total_sell = EXCLUDED.dealer_total_sell,
-                    dealer_total_net = EXCLUDED.dealer_total_net,
-                    overall_net = EXCLUDED.overall_net,
-                    updated_at = CURRENT_TIMESTAMP
-            """
-
-            execute_values(cursor, insert_sql, values, page_size=1000)
-            db.connection.commit()
-            return len(values)
-        finally:
-            if own_manager:
-                db.disconnect()
         
     def fetch_twse_symbols(self):
         """抓取台灣上市公司股票代碼"""
@@ -1241,6 +1284,11 @@ class StockAPI:
                 'market': '指數'
             },
             {
+                'symbol': '^OTC',
+                'name': '櫃買指數',
+                'market': '指數'
+            },
+            {
                 'symbol': '0050.TW',
                 'name': '元大台灣50',
                 'market': 'ETF'
@@ -1311,14 +1359,23 @@ class StockAPI:
             
             logger.info(f"下載 {symbol} 股價數據，時間範圍: {start_date} 到 {end_date}")
             
-            # 檢查是否為台灣加權指數，優先使用 yfinance 抓取
+            # 台灣加權指數 (^TWII) —— 直接使用 yfinance（不再備援 FMTQIK）
             if symbol == '^TWII':
-                logger.info(f"檢測到台灣加權指數 {symbol}，使用 yfinance 抓取歷史數據")
+                logger.info(f"檢測到台灣加權指數 {symbol}，強制使用 yfinance 抓取歷史數據（停用 FMTQIK）")
                 yf_result = self.fetch_twii_with_yfinance(start_date, end_date)
                 if yf_result:
                     return yf_result
-                logger.warning("yfinance 抓取 ^TWII 失敗，改用證交所指數API作為備援")
-                return self.fetch_twse_index_data('^TWII', start_date, end_date)
+                logger.error("yfinance 抓取 ^TWII 失敗，返回 None")
+                return None
+            
+            # 櫃買指數（OTC）
+            if symbol == '^OTC':
+                logger.info(f"檢測到櫃買指數 {symbol}，強制使用 yfinance 抓取歷史數據")
+                yf_result = self.fetch_otc_with_yfinance(start_date, end_date)
+                if yf_result:
+                    return yf_result
+                logger.warning("yfinance 抓取 ^OTC 失敗，返回 None")
+                return None
             
             # 解析股票代碼
             if '.TW' in symbol or '.TWO' in symbol:
@@ -1327,6 +1384,11 @@ class StockAPI:
             else:
                 stock_code = symbol
                 market_suffix = None
+
+            # 僅在單檔抓取路徑限制：只處理 4 碼純數字股票代號（避免 020001.TWO 這類 5/6 碼）
+            if market_suffix in ('TW', 'TWO') and str(stock_code).isdigit() and len(str(stock_code)) != 4:
+                logger.info(f"跳過非四碼股票代號: {symbol}")
+                return None
             
             # 判斷是上市還是上櫃股票：優先使用代碼後綴判斷
             if market_suffix == 'TWO':
@@ -1354,13 +1416,55 @@ class StockAPI:
                     df = pd.DataFrame(result)
                     return df
                 return result
-            
-            # 台灣API獲取失敗且禁用 Yahoo Finance 備援
-            logger.error(f"台灣API獲取失敗，且已禁用 Yahoo Finance 備援")
+
+            enable_yf = str(os.getenv('ENABLE_YFINANCE_FALLBACK', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+            if enable_yf:
+                yf_records = self.fetch_stock_with_yfinance(symbol, start_date, end_date)
+                if yf_records:
+                    logger.info(f"使用 yfinance 備援取得 {symbol} {len(yf_records)} 筆")
+                    df = pd.DataFrame(yf_records)
+                    return df
+
+            logger.error("台灣API獲取失敗")
             return None
             
         except Exception as e:
             logger.error(f"下載 {symbol} 股價失敗: {e}")
+            return None
+
+    def fetch_stock_with_yfinance(self, symbol, start_date, end_date):
+        try:
+            start_ts = pd.to_datetime(start_date)
+            end_ts = pd.to_datetime(end_date)
+
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(start=start_ts, end=end_ts + pd.Timedelta(days=1), interval="1d", auto_adjust=False)
+            if df is None or df.empty:
+                return None
+
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('UTC')
+            df.index = df.index.tz_convert('Asia/Taipei').tz_localize(None)
+
+            records = []
+            for idx, row in df.iterrows():
+                dt = idx
+                if isinstance(dt, pd.Timestamp):
+                    dt = dt.to_pydatetime()
+                records.append({
+                    'ticker': symbol,
+                    'Date': dt.strftime('%Y-%m-%d'),
+                    'Open': float(row.get('Open')) if pd.notna(row.get('Open')) else None,
+                    'High': float(row.get('High')) if pd.notna(row.get('High')) else None,
+                    'Low': float(row.get('Low')) if pd.notna(row.get('Low')) else None,
+                    'Close': float(row.get('Close')) if pd.notna(row.get('Close')) else None,
+                    'Volume': int(row.get('Volume')) if pd.notna(row.get('Volume')) else None,
+                })
+
+            records.sort(key=lambda x: x['Date'])
+            return records or None
+        except Exception as e:
+            logger.warning(f"yfinance 備援抓取 {symbol} 失敗: {e}")
             return None
     
 
@@ -1492,11 +1596,204 @@ class StockAPI:
                                 continue
                         break  # 找到目標表格後跳出迴圈
             
-            logger.info(f"批量抓取 {target_dt.strftime('%Y-%m-%d')} 成功，共 {len(result)} 檔股票")
+            logger.debug(f"批量抓取 {target_dt.strftime('%Y-%m-%d')} 成功，共 {len(result)} 檔股票")
             return result
             
         except Exception as e:
             logger.error(f"批量抓取 {target_date} 失敗: {e}")
+            return {}
+
+    def fetch_tpex_all_stocks_day(self, target_date):
+        try:
+            if isinstance(target_date, str):
+                target_dt = datetime.strptime(target_date, '%Y-%m-%d').date()
+            elif isinstance(target_date, datetime):
+                target_dt = target_date.date()
+            else:
+                target_dt = target_date
+
+            roc_date = f"{target_dt.year - 1911}/{target_dt.month:02d}/{target_dt.day:02d}"
+            url = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php"
+            params = {
+                'l': 'zh-tw',
+                'd': roc_date,
+                'se': 'AL',
+                'o': 'json'
+            }
+
+            headers = {
+                'Accept': 'application/json, text/plain, */*',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://www.tpex.org.tw/'
+            }
+
+            data = None
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    response = self.tpex_session.get(url, params=params, headers=headers, timeout=20)
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < 2:
+                        time.sleep(0.8 * (attempt + 1))
+                        continue
+                    logger.warning(
+                        f"TPEX 批量抓取 {target_dt.strftime('%Y-%m-%d')} 失敗: {type(exc).__name__}: {exc}"
+                    )
+                    return {}
+                if response.status_code != 200:
+                    if response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                        time.sleep(0.8 * (attempt + 1))
+                        continue
+                    logger.warning(f"TPEX 批量抓取 {target_dt.strftime('%Y-%m-%d')} 失敗: HTTP {response.status_code}")
+                    return {}
+
+                content_type = (response.headers.get('Content-Type') or '').lower()
+                text_head = (response.text or '')[:80].lstrip()
+                is_json_like = text_head.startswith('{') or text_head.startswith('[')
+
+                if 'application/json' not in content_type and not is_json_like:
+                    if attempt < 2:
+                        time.sleep(0.8 * (attempt + 1))
+                        continue
+                    snippet = (response.text or '')[:200].replace('\n', ' ').replace('\r', ' ')
+                    logger.warning(
+                        f"TPEX 批量抓取 {target_dt.strftime('%Y-%m-%d')} 回傳非 JSON"
+                        f" (content-type={content_type or 'n/a'})"
+                        f" head={snippet}"
+                    )
+                    return {}
+
+                try:
+                    data = response.json()
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < 2:
+                        time.sleep(0.8 * (attempt + 1))
+                        continue
+                    snippet = (response.text or '')[:200].replace('\n', ' ').replace('\r', ' ')
+                    logger.warning(
+                        f"TPEX 批量抓取 {target_dt.strftime('%Y-%m-%d')} 回傳非 JSON"
+                        f" (json_error={type(exc).__name__})"
+                        f" head={snippet}"
+                    )
+                    return {}
+
+            if data is None:
+                logger.warning(f"TPEX 批量抓取 {target_dt.strftime('%Y-%m-%d')} 失敗: {last_exc}")
+                return {}
+
+            if str(data.get('stat', '')).lower() != 'ok':
+                logger.warning(f"TPEX 批量抓取 {target_dt.strftime('%Y-%m-%d')} 回傳非 ok: {data.get('stat')}")
+                return {}
+
+            result = {}
+            tables = data.get('tables') or []
+            for table in tables:
+                rows = table.get('data') if isinstance(table, dict) else None
+                if not rows:
+                    continue
+
+                for row in rows:
+                    try:
+                        if not (isinstance(row, list) and len(row) >= 8):
+                            continue
+
+                        stock_code = str(row[0]).strip()
+                        if not stock_code or not stock_code.isdigit():
+                            continue
+
+                        close_str = str(row[2]).replace(',', '').strip()
+                        open_str = str(row[4]).replace(',', '').strip()
+                        high_str = str(row[5]).replace(',', '').strip()
+                        low_str = str(row[6]).replace(',', '').strip()
+                        volume_str = str(row[7]).replace(',', '').strip()
+
+                        invalid = {'----', '---', '--', '', '0', 'NaN', 'null', 'None'}
+                        if close_str in invalid or volume_str in invalid:
+                            continue
+
+                        close_price = float(close_str)
+                        volume = int(float(volume_str))
+                        if close_price <= 0 or volume <= 0 or close_price >= 30000:
+                            continue
+
+                        result[stock_code] = {
+                            'ticker': f"{stock_code}.TWO",
+                            'Date': target_dt.strftime('%Y-%m-%d'),
+                            'Open': float(open_str) if open_str not in invalid else None,
+                            'High': float(high_str) if high_str not in invalid else None,
+                            'Low': float(low_str) if low_str not in invalid else None,
+                            'Close': round(close_price, 2),
+                            'Volume': volume
+                        }
+                    except Exception:
+                        continue
+
+            logger.debug(f"TPEX 批量抓取 {target_dt.strftime('%Y-%m-%d')} 成功，共 {len(result)} 檔股票")
+            return result
+        except Exception as e:
+            logger.error(f"TPEX 批量抓取 {target_date} 失敗: {e}")
+            return {}
+
+    def fetch_tpex_stock_data_batch(self, stock_codes, start_date, end_date):
+        try:
+            start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+            end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+
+            dates_to_fetch = []
+            current = start_dt
+            while current <= end_dt:
+                if current.weekday() < 5:
+                    dates_to_fetch.append(current)
+                current += timedelta(days=1)
+
+            logger.info(f"TPEX 批量抓取模式：{len(stock_codes)} 檔股票，{len(dates_to_fetch)} 個交易日")
+
+            all_data = {}
+            max_workers = int(os.getenv('TPEX_BATCH_WORKERS', str(min(3, max(1, len(dates_to_fetch))))))
+            sleep_s = float(os.getenv('TPEX_BATCH_SLEEP', '0.2'))
+            processed_days = 0
+            total_days = len(dates_to_fetch)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_date = {executor.submit(self.fetch_tpex_all_stocks_day, date): date for date in dates_to_fetch}
+
+                for future in as_completed(future_to_date):
+                    date_val = future_to_date[future]
+                    try:
+                        day_data = future.result()
+                        for stock_code in stock_codes:
+                            if stock_code in day_data:
+                                all_data.setdefault(stock_code, []).append(day_data[stock_code])
+                    except Exception as e:
+                        logger.error(f"TPEX 抓取 {date_val.strftime('%Y-%m-%d')} 失敗: {e}")
+
+                    processed_days += 1
+                    if total_days and (processed_days % 50 == 0 or processed_days == total_days):
+                        pct = processed_days * 100.0 / total_days
+                        logger.info(f"TPEX 批量抓取進度: {processed_days}/{total_days} ({pct:.1f}%)")
+
+                    if sleep_s and sleep_s > 0:
+                        time.sleep(sleep_s)
+
+            for stock_code in all_data:
+                all_data[stock_code].sort(key=lambda x: x['Date'])
+
+            logger.info(f" TPEX 批量抓取完成，成功抓取 {len(all_data)} 檔股票")
+            if not all_data:
+                enable_yf = str(os.getenv('ENABLE_YFINANCE_FALLBACK', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+                max_fallback = int(os.getenv('YFINANCE_FALLBACK_MAX_SYMBOLS', '50'))
+                if enable_yf and len(stock_codes) <= max_fallback:
+                    for code in stock_codes:
+                        yf_records = self.fetch_stock_with_yfinance(f"{code}.TWO", start_date, end_date)
+                        if yf_records:
+                            all_data[code] = yf_records
+                    if all_data:
+                        logger.info(f" yfinance 備援完成，成功抓取 {len(all_data)} 檔股票")
+            return all_data
+        except Exception as e:
+            logger.error(f"TPEX 批量抓取失敗: {e}")
             return {}
 
     def fetch_twse_bwibbu_all(self, force_refresh: bool = False):
@@ -2029,6 +2326,93 @@ class StockAPI:
             if own_manager:
                 db.disconnect()
 
+    def upsert_financial_ratios(self, records: list[dict], db_manager: DatabaseManager | None = None) -> int:
+        if not records:
+            return 0
+
+        own_manager = False
+        db = db_manager
+        if db is None:
+            db = DatabaseManager(use_local=self.use_local)
+            own_manager = True
+
+        # 若外部已提供 db_manager 且連線已存在，避免每批次重複 connect/create_tables，
+        # 否則會因 create_tables 的鎖而造成嚴重延遲。
+        if getattr(db, 'connection', None) is None:
+            if not db.connect():
+                raise RuntimeError("資料庫連線失敗")
+
+        try:
+            if own_manager:
+                db.create_tables()
+            cursor = db.connection.cursor()
+            table_name = getattr(db, 'table_financial_ratios', financial_ratios_table(use_neon=db.is_neon))
+
+            metric_cols = list(FINANCIAL_RATIO_COLS)
+            insert_cols = ['symbol', 'period'] + list(metric_cols)
+            insert_cols_sql = ", ".join(insert_cols)
+
+            def _normalize_symbol(value: str) -> str:
+                s = (value or '').strip()
+                if not s:
+                    return ''
+                if '.' in s:
+                    return s
+                return f"{s}.TW"
+
+            def _to_num(value):
+                if value is None:
+                    return None
+                if isinstance(value, (int, float)):
+                    return float(value)
+                s = str(value).replace(',', '').strip()
+                if not s:
+                    return None
+                try:
+                    return float(s)
+                except Exception:
+                    return None
+
+            values = []
+            for rec in records:
+                code = _normalize_symbol(rec.get('symbol') or rec.get('股票代號') or '')
+                period = str(rec.get('period') or '').strip()
+                if not code or not period:
+                    continue
+                row_vals = [code, period]
+                for col in metric_cols:
+                    row_vals.append(_to_num(rec.get(col)))
+                values.append(tuple(row_vals))
+
+            if not values:
+                try:
+                    sample = records[0] if records else None
+                    logger.warning(
+                        "[ratios][upsert] skipped all records: total=%d sample_keys=%s sample_symbol=%s sample_period=%s",
+                        len(records),
+                        [] if not isinstance(sample, dict) else list(sample.keys())[:20],
+                        None if not isinstance(sample, dict) else sample.get('symbol'),
+                        None if not isinstance(sample, dict) else sample.get('period'),
+                    )
+                except Exception:
+                    pass
+                return 0
+
+            update_assignments = ", ".join([f"{col} = EXCLUDED.{col}" for col in metric_cols])
+            insert_sql = f"""
+                INSERT INTO {table_name} ({insert_cols_sql})
+                VALUES %s
+                ON CONFLICT (symbol, period) DO UPDATE SET
+                    {update_assignments},
+                    updated_at = CURRENT_TIMESTAMP
+            """
+            execute_values(cursor, insert_sql, values, page_size=1000)
+            db.connection.commit()
+            return len(values)
+        finally:
+            if own_manager:
+                db.disconnect()
+
     def upsert_balance_sheets(self, records: list[dict], db_manager: DatabaseManager | None = None) -> int:
         """將資產負債表寬表資料寫入 tw_balance_sheets 資料表。
 
@@ -2085,6 +2469,65 @@ class StockAPI:
             update_assignments = ", ".join([f'"{col}" = EXCLUDED."{col}"' for col in metric_cols])
             insert_sql = f"""
                 INSERT INTO {table_name} ({insert_cols_sql})
+                VALUES %s
+                ON CONFLICT ("股票代號", period) DO UPDATE SET
+                    {update_assignments},
+                    updated_at = CURRENT_TIMESTAMP
+            """
+            execute_values(cursor, insert_sql, values, page_size=1000)
+            db.connection.commit()
+            return len(values)
+        finally:
+            if own_manager:
+                db.disconnect()
+
+    def upsert_cash_flows(self, records: list[dict], db_manager: DatabaseManager | None = None) -> int:
+        """將現金流量表寬表資料新增或更新至資料庫。"""
+        if not records:
+            return 0
+
+        own_manager = False
+        db = db_manager
+        if db is None:
+            db = DatabaseManager(use_local=self.use_local)
+            own_manager = True
+        if not db.connect():
+            raise RuntimeError("資料庫連線失敗")
+
+        try:
+            db.create_tables()
+            cursor = db.connection.cursor()
+            table_name = getattr(db, 'table_cash_flow', cash_flow_table(use_neon=db.is_neon))
+            metric_cols = list(CASH_FLOW_TARGET_ORDER)
+            insert_cols = ['"股票代號"', 'period'] + [f'"{col}"' for col in metric_cols]
+
+            def _to_num(value):
+                if value is None:
+                    return None
+                if isinstance(value, (int, float)):
+                    return float(value)
+                try:
+                    return float(str(value).replace(',', '').strip())
+                except (TypeError, ValueError):
+                    return None
+
+            values = []
+            for record in records:
+                code = str(record.get('股票代號') or '').strip()
+                period = str(record.get('period') or '').strip()
+                if not code or not period:
+                    continue
+                values.append(
+                    tuple([code, period] + [_to_num(record.get(col)) for col in metric_cols])
+                )
+            if not values:
+                return 0
+
+            update_assignments = ", ".join(
+                [f'"{col}" = EXCLUDED."{col}"' for col in metric_cols]
+            )
+            insert_sql = f"""
+                INSERT INTO {table_name} ({", ".join(insert_cols)})
                 VALUES %s
                 ON CONFLICT ("股票代號", period) DO UPDATE SET
                     {update_assignments},
@@ -2607,19 +3050,90 @@ class StockAPI:
 
         df = pd.concat(tables, ignore_index=True)
 
-        # 找出標題列（第一欄為 '公司代號'）
-        first_col = df.iloc[:, 0].astype(str).str.strip()
-        header_idx_list = df.index[first_col == '公司代號'].tolist()
-        if not header_idx_list:
-            logger.info("TWSE 月營收 HTML 找不到 '公司代號' 標題列")
-            return []
-        header_idx = header_idx_list[0]
-        df.columns = df.iloc[header_idx]
-        df = df[header_idx + 1:]
+        def _norm_cell(v):
+            try:
+                s = '' if v is None else str(v)
+            except Exception:
+                s = ''
+            return s.replace('\u3000', ' ').strip()
 
-        if '公司代號' not in df.columns or '當月營收' not in df.columns:
-            logger.info("TWSE 月營收 HTML 欄位名稱不符合預期")
+        def _compact_ws(s: str) -> str:
+            return ''.join(str(s).split())
+
+        def _norm_columns(frame: pd.DataFrame) -> list[str]:
+            cols: list[str] = []
+            for c in list(frame.columns):
+                if isinstance(c, tuple):
+                    parts = [_norm_cell(p) for p in c if _norm_cell(p) and _norm_cell(p).lower() != 'nan']
+                    cols.append(''.join(parts).strip())
+                else:
+                    cols.append(_norm_cell(c))
+            return cols
+
+        def _find_col(cols: list[str], keywords: list[str]) -> str | None:
+            cols_norm = [_compact_ws(_norm_cell(c)) for c in cols]
+            keywords_norm = [_compact_ws(_norm_cell(k)) for k in keywords]
+
+            for idx, c_norm in enumerate(cols_norm):
+                for k_norm in keywords_norm:
+                    if not k_norm:
+                        continue
+                    if k_norm == c_norm or k_norm in c_norm:
+                        return cols[idx]
+            return None
+
+        df.columns = _norm_columns(df)
+        code_col = _find_col(list(df.columns), ['公司代號'])
+        month_rev_col = _find_col(list(df.columns), ['當月營收'])
+        mom_col = _find_col(list(df.columns), ['上月比較增減(%)', '上月比較增減'])
+        yoy_col = _find_col(list(df.columns), ['去年同月增減(%)', '去年同月增減'])
+        if code_col is None or month_rev_col is None:
+            try:
+                probe = df.apply(lambda col: col.map(_norm_cell))
+                header_mask = probe.apply(
+                    lambda r: r.astype(str).map(_compact_ws).str.contains(_compact_ws('公司代號'), na=False).any(),
+                    axis=1,
+                )
+                header_idx_list = probe.index[header_mask].tolist()
+            except Exception:
+                header_idx_list = []
+
+            if not header_idx_list:
+                try:
+                    sample_first_col = df.iloc[:15, 0].astype(str).map(_norm_cell).tolist()
+                except Exception:
+                    sample_first_col = []
+                logger.info(
+                    "TWSE 月營收 HTML 找不到 '公司代號' 標題列"
+                    f"; columns={list(df.columns)[:20]}"
+                    f"; first_col_sample={sample_first_col}"
+                )
+                return []
+
+            header_idx = header_idx_list[0]
+            df.columns = [_norm_cell(x) for x in df.iloc[header_idx].tolist()]
+            df = df[header_idx + 1:]
+            df.columns = _norm_columns(df)
+            code_col = _find_col(list(df.columns), ['公司代號'])
+            month_rev_col = _find_col(list(df.columns), ['當月營收'])
+            mom_col = _find_col(list(df.columns), ['上月比較增減(%)', '上月比較增減'])
+            yoy_col = _find_col(list(df.columns), ['去年同月增減(%)', '去年同月增減'])
+
+        if code_col is None or month_rev_col is None:
+            logger.info(f"TWSE 月營收 HTML 欄位名稱不符合預期; columns={list(df.columns)[:30]}")
             return []
+
+        rename_map: dict[str, str] = {}
+        if code_col != '公司代號':
+            rename_map[code_col] = '公司代號'
+        if month_rev_col != '當月營收':
+            rename_map[month_rev_col] = '當月營收'
+        if mom_col is not None and mom_col != '上月比較增減(%)':
+            rename_map[mom_col] = '上月比較增減(%)'
+        if yoy_col is not None and yoy_col != '去年同月增減(%)':
+            rename_map[yoy_col] = '去年同月增減(%)'
+        if rename_map:
+            df = df.rename(columns=rename_map)
 
         # 清理與過濾資料列
         df = df[df['公司代號'].notna()]
@@ -2704,18 +3218,90 @@ class StockAPI:
 
         df = pd.concat(tables, ignore_index=True)
 
-        first_col = df.iloc[:, 0].astype(str).str.strip()
-        header_idx_list = df.index[first_col == '公司代號'].tolist()
-        if not header_idx_list:
-            logger.info("TPEX 月營收 HTML 找不到 '公司代號' 標題列")
-            return []
-        header_idx = header_idx_list[0]
-        df.columns = df.iloc[header_idx]
-        df = df[header_idx + 1:]
+        def _norm_cell(v):
+            try:
+                s = '' if v is None else str(v)
+            except Exception:
+                s = ''
+            return s.replace('\u3000', ' ').strip()
 
-        if '公司代號' not in df.columns or '當月營收' not in df.columns:
-            logger.info("TPEX 月營收 HTML 欄位名稱不符合預期")
+        def _compact_ws(s: str) -> str:
+            return ''.join(str(s).split())
+
+        def _norm_columns(frame: pd.DataFrame) -> list[str]:
+            cols: list[str] = []
+            for c in list(frame.columns):
+                if isinstance(c, tuple):
+                    parts = [_norm_cell(p) for p in c if _norm_cell(p) and _norm_cell(p).lower() != 'nan']
+                    cols.append(''.join(parts).strip())
+                else:
+                    cols.append(_norm_cell(c))
+            return cols
+
+        def _find_col(cols: list[str], keywords: list[str]) -> str | None:
+            cols_norm = [_compact_ws(_norm_cell(c)) for c in cols]
+            keywords_norm = [_compact_ws(_norm_cell(k)) for k in keywords]
+
+            for idx, c_norm in enumerate(cols_norm):
+                for k_norm in keywords_norm:
+                    if not k_norm:
+                        continue
+                    if k_norm == c_norm or k_norm in c_norm:
+                        return cols[idx]
+            return None
+
+        df.columns = _norm_columns(df)
+        code_col = _find_col(list(df.columns), ['公司代號'])
+        month_rev_col = _find_col(list(df.columns), ['當月營收'])
+        mom_col = _find_col(list(df.columns), ['上月比較增減(%)', '上月比較增減'])
+        yoy_col = _find_col(list(df.columns), ['去年同月增減(%)', '去年同月增減'])
+        if code_col is None or month_rev_col is None:
+            try:
+                probe = df.apply(lambda col: col.map(_norm_cell))
+                header_mask = probe.apply(
+                    lambda r: r.astype(str).map(_compact_ws).str.contains(_compact_ws('公司代號'), na=False).any(),
+                    axis=1,
+                )
+                header_idx_list = probe.index[header_mask].tolist()
+            except Exception:
+                header_idx_list = []
+
+            if not header_idx_list:
+                try:
+                    sample_first_col = df.iloc[:15, 0].astype(str).map(_norm_cell).tolist()
+                except Exception:
+                    sample_first_col = []
+                logger.info(
+                    "TPEX 月營收 HTML 找不到 '公司代號' 標題列"
+                    f"; columns={list(df.columns)[:20]}"
+                    f"; first_col_sample={sample_first_col}"
+                )
+                return []
+
+            header_idx = header_idx_list[0]
+            df.columns = [_norm_cell(x) for x in df.iloc[header_idx].tolist()]
+            df = df[header_idx + 1:]
+            df.columns = _norm_columns(df)
+            code_col = _find_col(list(df.columns), ['公司代號'])
+            month_rev_col = _find_col(list(df.columns), ['當月營收'])
+            mom_col = _find_col(list(df.columns), ['上月比較增減(%)', '上月比較增減'])
+            yoy_col = _find_col(list(df.columns), ['去年同月增減(%)', '去年同月增減'])
+
+        if code_col is None or month_rev_col is None:
+            logger.info(f"TPEX 月營收 HTML 欄位名稱不符合預期; columns={list(df.columns)[:30]}")
             return []
+
+        rename_map: dict[str, str] = {}
+        if code_col != '公司代號':
+            rename_map[code_col] = '公司代號'
+        if month_rev_col != '當月營收':
+            rename_map[month_rev_col] = '當月營收'
+        if mom_col is not None and mom_col != '上月比較增減(%)':
+            rename_map[mom_col] = '上月比較增減(%)'
+        if yoy_col is not None and yoy_col != '去年同月增減(%)':
+            rename_map[yoy_col] = '去年同月增減(%)'
+        if rename_map:
+            df = df.rename(columns=rename_map)
 
         df = df[df['公司代號'].notna()]
         df['公司代號'] = df['公司代號'].astype(str).str.strip()
@@ -2947,7 +3533,7 @@ class StockAPI:
     ) -> dict:
         home_dir = os.path.expanduser("~")
         if not download_dir:
-            download_dir = os.path.join(home_dir, "Downloads", "mops_csv")
+            download_dir = os.environ.get('MOPS_DOWNLOAD_DIR') or os.path.join(home_dir, "Downloads", "mops_csv")
         download_dir = os.path.abspath(download_dir)
         os.makedirs(download_dir, exist_ok=True)
 
@@ -2981,6 +3567,11 @@ class StockAPI:
         }
         chrome_options.add_experimental_option("prefs", prefs)
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        if os.environ.get('CLOUD_DEPLOYMENT'):
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option("useAutomationExtension", False)
         chrome_options.add_argument(
@@ -3195,6 +3786,8 @@ class StockAPI:
 
             # 使用多線程並行抓取每一天的數據
             all_data = {}  # {stock_code: [records]}
+            processed_days = 0
+            total_days = len(dates_to_fetch)
 
             with ThreadPoolExecutor(max_workers=5) as executor:
                 future_to_date = {executor.submit(self.fetch_twse_all_stocks_day, date): date
@@ -3211,6 +3804,11 @@ class StockAPI:
                                 all_data.setdefault(stock_code, []).append(day_data[stock_code])
                     except Exception as e:
                         logger.error(f"抓取 {date.strftime('%Y-%m-%d')} 失敗: {e}")
+
+                    processed_days += 1
+                    if total_days and (processed_days % 50 == 0 or processed_days == total_days):
+                        pct = processed_days * 100.0 / total_days
+                        logger.info(f"TWSE 批量抓取進度: {processed_days}/{total_days} ({pct:.1f}%)")
 
                     # 避免請求過於頻繁
                     time.sleep(0.3)
@@ -3531,17 +4129,19 @@ class StockAPI:
             # 將日期轉換為datetime
             start_dt = datetime.strptime(start_date, '%Y-%m-%d')
             end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+
+            use_parallel_threshold_days = int(os.getenv('TPEX_SINGLE_PARALLEL_THRESHOLD_DAYS', '60'))
+            if (end_dt - start_dt).days + 1 >= use_parallel_threshold_days:
+                batch_data = self.fetch_tpex_stock_data_batch([stock_code], start_date, end_date)
+                return batch_data.get(stock_code, []) if isinstance(batch_data, dict) else []
             
             result = []
             current_date = start_dt
             
-            # 使用櫃買中心傳統API（提供正確歷史數據）
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Referer': 'https://www.tpex.org.tw/'
-            }
+            sleep_s = float(os.getenv('TPEX_SINGLE_SLEEP', '0.05'))
+            max_retries = int(os.getenv('TPEX_SINGLE_RETRIES', '2'))
             
-            logger.info(f"使用櫃買中心傳統API抓取 {stock_code}，日期範圍: {start_date} ~ {end_date}")
+            logger.info(f"使用櫃買中心 API 抓取 {stock_code}，日期範圍: {start_date} ~ {end_date}")
             
             # 計算總天數
             total_days = (end_dt - start_dt).days + 1
@@ -3555,111 +4155,21 @@ class StockAPI:
                     current_date = current_date + timedelta(days=1)
                     processed_days += 1
                     continue
-                
-                # 轉換為民國年格式 YYY/MM/DD（傳統API使用斜線）
-                roc_date = f"{current_date.year - 1911:03d}/{current_date.month:02d}/{current_date.day:02d}"
-                
-                url = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php"
-                params = {
-                    'l': 'zh-tw',
-                    'd': roc_date,
-                    'se': 'AL'  # 全部股票
-                }
-                
-                # 添加重試機制
-                max_retries = 3
+
                 retry_count = 0
-                success = False
-                
-                while retry_count < max_retries and not success:
+                while retry_count <= max_retries:
                     try:
-                        response = requests.get(url, params=params, headers=headers, timeout=15)
-                        
-                        if response.status_code == 200:
-                            data = response.json()
-                            
-                            if data.get('stat') == 'ok' and 'tables' in data:
-                                tables = data['tables']
-                                found_stock = False
-                                
-                                # 搜尋所有表格中的目標股票
-                                for table in tables:
-                                    if 'data' in table:
-                                        table_data = table['data']
-                                        
-                                        # 查找目標股票
-                                        for row in table_data:
-                                            if (isinstance(row, list) and len(row) >= 8 and 
-                                                row[0] == stock_code):
-                                                
-                                                found_stock = True
-                                                date_str = current_date.strftime('%Y-%m-%d')
-                                                
-                                                try:
-                                                    # 解析價格數據（傳統API格式）
-                                                    # row[0]=代碼, row[1]=名稱, row[2]=收盤, row[3]=漲跌
-                                                    # row[4]=開盤, row[5]=最高, row[6]=最低, row[7]=成交量
-                                                    
-                                                    close_str = str(row[2]).replace(',', '').strip()
-                                                    open_str = str(row[4]).replace(',', '').strip()
-                                                    high_str = str(row[5]).replace(',', '').strip()
-                                                    low_str = str(row[6]).replace(',', '').strip()
-                                                    volume_str = str(row[7]).replace(',', '').strip()
-                                                    
-                                                    # 檢查是否為有效數據（避免 "----" 等無效值）
-                                                    if (close_str not in ['----', '---', '', '0'] and 
-                                                        volume_str not in ['0', '', '----']):
-                                                        
-                                                        close_price = float(close_str)
-                                                        open_price = float(open_str) if open_str not in ['----', '---', ''] else None
-                                                        high_price = float(high_str) if high_str not in ['----', '---', ''] else None
-                                                        low_price = float(low_str) if low_str not in ['----', '---', ''] else None
-                                                        volume = int(volume_str)
-                                                        
-                                                        if close_price > 0 and volume > 0:
-                                                            result.append({
-                                                                'ticker': f"{stock_code}.TWO",
-                                                                'Date': date_str,
-                                                                'Open': round(open_price, 2) if open_price else None,
-                                                                'High': round(high_price, 2) if high_price else None,
-                                                                'Low': round(low_price, 2) if low_price else None,
-                                                                'Close': round(close_price, 2),
-                                                                'Volume': volume
-                                                            })
-                                                            success_count += 1
-                                                        
-                                                except (ValueError, IndexError) as e:
-                                                    logger.warning(f"解析 {stock_code} {date_str} 數據失敗: {e}")
-                                                
-                                                break  # 找到股票後跳出內層循環
-                                        
-                                        if found_stock:
-                                            break  # 找到股票後跳出表格循環
-                                
-                                success = True
-                            else:
-                                logger.warning(f"櫃買中心傳統API 回應狀態異常: {data.get('stat')}")
-                                success = True  # 避免重試
-                        else:
-                            logger.warning(f"櫃買中心傳統API HTTP {response.status_code}，日期: {current_date.strftime('%Y-%m-%d')}")
-                            success = True  # 跳過此日期
-                            
-                    except requests.exceptions.Timeout:
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            logger.warning(f"櫃買中心傳統API 超時，第 {retry_count} 次重試: {current_date.strftime('%Y-%m-%d')}")
-                            time.sleep(2)
-                        else:
-                            logger.error(f"櫃買中心傳統API 超時，已達最大重試次數: {current_date.strftime('%Y-%m-%d')}")
-                            break
+                        day_data = self.fetch_tpex_all_stocks_day(current_date)
+                        if day_data and stock_code in day_data:
+                            result.append(day_data[stock_code])
+                            success_count += 1
+                        break
                     except Exception as e:
                         retry_count += 1
-                        if retry_count < max_retries:
-                            logger.warning(f"櫃買中心傳統API 請求失敗: {e}，第 {retry_count} 次重試")
-                            time.sleep(2)
-                        else:
-                            logger.error(f"櫃買中心傳統API 請求失敗: {e}，已達最大重試次數")
+                        if retry_count > max_retries:
+                            logger.warning(f"TPEX 抓取失敗: {stock_code} {current_date.strftime('%Y-%m-%d')}: {e}")
                             break
+                        time.sleep(0.5)
                 
                 # 移動到下一天
                 current_date = current_date + timedelta(days=1)
@@ -3669,8 +4179,8 @@ class StockAPI:
                 if processed_days % 20 == 0:
                     logger.info(f"櫃買中心 {stock_code} 進度: {processed_days}/{total_days} 天，成功 {success_count} 筆")
                 
-                # 避免請求過於頻繁（每秒最多2次）
-                time.sleep(0.5)
+                if sleep_s and sleep_s > 0:
+                    time.sleep(sleep_s)
             
             # 按日期排序（不需要去重，因為傳統API提供正確的歷史數據）
             if result:
@@ -3707,8 +4217,14 @@ class StockAPI:
                 logger.warning("yfinance 取得 ^TWII 無資料")
                 return None
 
-            # 移除時區資訊，確保 index 為 naive datetime
-            if getattr(df.index, "tz", None) is not None:
+            # 以台北時區對齊日期：若有 tz 則轉為 Asia/Taipei 再去 tz；若無 tz 則假設為 UTC 再轉 Asia/Taipei
+            try:
+                if getattr(df.index, "tz", None) is not None:
+                    df = df.tz_convert("Asia/Taipei").tz_localize(None)
+                else:
+                    df.index = df.index.tz_localize("UTC").tz_convert("Asia/Taipei").tz_localize(None)
+            except Exception:
+                # 若轉換失敗，至少嘗試去除 tz，避免报错
                 try:
                     df = df.tz_convert(None)
                 except Exception:
@@ -3746,6 +4262,73 @@ class StockAPI:
             return records or None
         except Exception as e:
             logger.error(f"使用 yfinance 抓取 ^TWII 失敗: {e}")
+            return None
+
+    def fetch_otc_with_yfinance(self, start_date, end_date):
+        try:
+            if not start_date:
+                start_date = DEFAULT_START_DATE
+            if not end_date:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+
+            start_ts = pd.to_datetime(start_date)
+            end_ts = pd.to_datetime(end_date)
+
+            candidates = ["^TWOII", "^TWO", "^OTC", "^TPEX", "OTC.TW"]
+            records = []
+            for sym in candidates:
+                try:
+                    ticker = yf.Ticker(sym)
+                    df = ticker.history(start=start_ts, end=end_ts + pd.Timedelta(days=1), interval="1d", auto_adjust=False)
+                    if df is None or df.empty:
+                        continue
+
+                    # 與加權指數相同：先轉成台北時區再移除 tz，確保日期對齊
+                    try:
+                        if getattr(df.index, "tz", None) is not None:
+                            df = df.tz_convert("Asia/Taipei").tz_localize(None)
+                        else:
+                            df.index = df.index.tz_localize("UTC").tz_convert("Asia/Taipei").tz_localize(None)
+                    except Exception:
+                        try:
+                            df = df.tz_convert(None)
+                        except Exception:
+                            df.index = df.index.tz_localize(None)
+
+                    tmp = []
+                    for idx, row in df.iterrows():
+                        try:
+                            d = idx.date() if hasattr(idx, "date") else pd.to_datetime(idx).date()
+                            date_str = d.strftime('%Y-%m-%d')
+                            open_p = float(row.get("Open")) if not pd.isna(row.get("Open")) else None
+                            high_p = float(row.get("High")) if not pd.isna(row.get("High")) else None
+                            low_p = float(row.get("Low")) if not pd.isna(row.get("Low")) else None
+                            close_p = float(row.get("Close")) if not pd.isna(row.get("Close")) else None
+                            vol = int(row.get("Volume")) if not pd.isna(row.get("Volume")) else 0
+                        except Exception:
+                            continue
+                        if close_p is None:
+                            continue
+                        tmp.append({
+                            'ticker': '^OTC',
+                            'Date': date_str,
+                            'Open': round(open_p, 2) if open_p is not None else None,
+                            'High': round(high_p, 2) if high_p is not None else None,
+                            'Low': round(low_p, 2) if low_p is not None else None,
+                            'Close': round(close_p, 2),
+                            'Volume': vol,
+                        })
+                    if tmp:
+                        tmp.sort(key=lambda x: x['Date'])
+                        records = tmp
+                        logger.info(f"yfinance 命中 OTC 代號 {sym}，取得 {len(tmp)} 筆")
+                        break
+                except Exception:
+                    continue
+            if not records:
+                logger.warning("yfinance 未能取得任何 OTC 指數資料")
+            return records or None
+        except Exception:
             return None
 
     def fetch_twse_index_data(self, index_code, start_date, end_date):
@@ -3873,6 +4456,59 @@ class StockAPI:
             logger.error(f"從證交所獲取指數數據失敗: {e}")
             return None
 
+    def fetch_tpex_index_data(self, start_date, end_date):
+        """從櫃買中心 openapi 獲取櫃買指數 (^OTC) 數據"""
+        try:
+            start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+            end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+
+            url = "https://www.tpex.org.tw/openapi/v1/tpex_index"
+            logger.info(f"獲取櫃買指數 (^OTC) 數據，範圍 {start_date} ~ {end_date}")
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list):
+                logger.warning("櫃買指數 openapi 回應非列表，返回 None")
+                return None
+
+            results = []
+            for row in data:
+                try:
+                    raw_date = str(row.get('Date'))
+                    if len(raw_date) == 8:
+                        trade_date = datetime.strptime(raw_date, '%Y%m%d')
+                    else:
+                        trade_date = datetime.strptime(raw_date, '%Y-%m-%d')
+                    if not (start_dt <= trade_date <= end_dt):
+                        continue
+                    results.append({
+                        'ticker': '^OTC',
+                        'Date': trade_date.strftime('%Y-%m-%d'),
+                        'Open': float(row.get('Open')) if row.get('Open') not in (None, '') else None,
+                        'High': float(row.get('High')) if row.get('High') not in (None, '') else None,
+                        'Low': float(row.get('Low')) if row.get('Low') not in (None, '') else None,
+                        'Close': float(row.get('Close')) if row.get('Close') not in (None, '') else None,
+                        # openapi 未提供成交量，填 0
+                        'Volume': 0
+                    })
+                except Exception as exc:
+                    logger.debug(f"跳過無法解析的櫃買指數列: {row}, err={exc}")
+                    continue
+
+            results.sort(key=lambda x: x['Date'])
+            if results:
+                logger.info(f"成功取得櫃買指數 {len(results)} 筆")
+                return results
+            # fallback to yfinance when openapi has no data for requested range
+            yf_records = self.fetch_otc_with_yfinance(start_date, end_date)
+            if yf_records:
+                logger.info(f"使用 yfinance 備援取得 ^OTC {len(yf_records)} 筆")
+                return yf_records
+            return None
+        except Exception as e:
+            logger.error(f"從櫃買中心獲取櫃買指數失敗: {e}")
+            return None
+
     def calculate_returns(self, price_data, frequency='daily'):
         """計算報酬率"""
         if price_data is None or (hasattr(price_data, 'empty') and price_data.empty) or (isinstance(price_data, list) and len(price_data) == 0):
@@ -3957,12 +4593,12 @@ except Exception as e:
 @app.route('/')
 def index():
     """提供主頁面"""
-    return send_file(os.path.join(current_dir, 'index.html'))
+    return send_file(os.path.join(frontend_dir, 'index.html'))
 
 @app.route('/<path:filename>')
 def static_files(filename):
     """提供靜態文件"""
-    return send_from_directory(current_dir, filename)
+    return send_from_directory(frontend_dir, filename)
 
 # API 路由定義
 
@@ -4081,6 +4717,228 @@ def get_twse_bwibbu_all():
         return jsonify({'success': False, 'error': str(exc)}), 500
 
 
+@app.get('/api/financial-ratios')
+def api_financial_ratios():
+    year = request.args.get('year')
+    season = request.args.get('season')
+    code = request.args.get('code')
+    code_from = request.args.get('code_from')
+    code_to = request.args.get('code_to')
+
+    if not year or not season:
+        return jsonify({'error': 'year and season are required'}), 400
+
+    period_label = f"{str(year)}{int(str(season)):02d}"
+
+    write_raw = request.args.get('write_to_db') or request.args.get('import_db')
+    write_to_db = False
+    if write_raw is not None:
+        v = str(write_raw).strip().lower()
+        write_to_db = v in ('1', 'true', 'yes', 'y')
+
+    from datetime import datetime as _dt
+    global financial_ratios_status
+    financial_ratios_status = {
+        'running': True,
+        'startedAt': _dt.utcnow().isoformat(),
+        'finishedAt': None,
+        'phase': 'querying',
+        'year': str(year),
+        'season': str(season),
+        'period': period_label,
+        'total': None,
+        'processed': 0,
+        'success_count': 0,
+        'error_count': 0,
+        'current_code': None,
+        'error': None,
+        'db_write_enabled': bool(write_to_db),
+        'db_inserted_rows': 0,
+        'db_batches': 0,
+        'db_last_commit_at': None,
+    }
+
+    db = DatabaseManager.from_request_args(request.args)
+    if not db.connect():
+        try:
+            financial_ratios_status['running'] = False
+            financial_ratios_status['finishedAt'] = _dt.utcnow().isoformat()
+            financial_ratios_status['phase'] = 'error'
+            financial_ratios_status['error'] = '資料庫連線失敗'
+        except Exception:
+            pass
+        return jsonify({'error': '資料庫連線失敗'}), 500
+
+    inserted = 0
+    try:
+        if not db.create_tables():
+            return jsonify({'error': '資料庫初始化失敗'}), 500
+
+        where = ["i.period = %s", "b.period = %s", "i.\"股票代號\" = b.\"股票代號\""]
+        params = [period_label, period_label]
+        if code:
+            where.append("i.\"股票代號\" = %s")
+            params.append(str(code).strip())
+        else:
+            cf = str(code_from).strip() if code_from else None
+            ct = str(code_to).strip() if code_to else None
+            if cf:
+                where.append("i.\"股票代號\" >= %s")
+                params.append(cf)
+            if ct:
+                where.append("i.\"股票代號\" <= %s")
+                params.append(ct)
+
+        select_cols_income = [
+            'i."股票代號" as "股票代號"',
+            'i.period as period',
+            'i."Revenue" as "Revenue"',
+            'i."GrossProfitFromOperations" as "GrossProfitFromOperations"',
+            'i."ProfitLossFromOperatingActivities" as "ProfitLossFromOperatingActivities"',
+            'i."ProfitLoss" as "ProfitLoss"',
+        ]
+        select_cols_balance = [
+            'b."Assets" as "Assets"',
+            'b."Liabilities" as "Liabilities"',
+            'b."EquityAttributableToOwnersOfParent" as "EquityAttributableToOwnersOfParent"',
+            'b."CurrentAssets" as "CurrentAssets"',
+            'b."CurrentLiabilities" as "CurrentLiabilities"',
+            'b."CashAndCashEquivalents" as "CashAndCashEquivalents"',
+            'b."AccountsReceivableNet" as "AccountsReceivableNet"',
+            'b."OtherCurrentReceivables" as "OtherCurrentReceivables"',
+            'b."CurrentFinancialAssetsAtAmortisedCost" as "CurrentFinancialAssetsAtAmortisedCost"',
+            'b."CurrentFinancialAssetsAtFairValueThroughProfitOrLoss" as "CurrentFinancialAssetsAtFairValueThroughProfitOrLoss"',
+            'b."CurrentFinancialAssetsAtFairValueThroughOtherComprehensiveIncome" as "CurrentFinancialAssetsAtFairValueThroughOtherComprehensiveIncome"',
+            'b."OtherCurrentFinancialAssets" as "OtherCurrentFinancialAssets"',
+        ]
+
+        sql_text = (
+            "SELECT "
+            + ", ".join(select_cols_income + select_cols_balance)
+            + f" FROM {db.table_income} i JOIN {db.table_balance} b ON (i.\"股票代號\" = b.\"股票代號\" AND i.period = b.period)"
+            + " WHERE "
+            + " AND ".join(where)
+        )
+
+        with db.connection.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql_text, params)
+            rows = cur.fetchall() or []
+
+        out = []
+        missing_symbol = 0
+        invalid_period = 0
+        buffer = []
+        batches = 0
+        batch_commit_size = 500
+
+        try:
+            financial_ratios_status['total'] = int(len(rows))
+            financial_ratios_status['phase'] = 'computing'
+        except Exception:
+            pass
+
+        for idx, r in enumerate(rows, start=1):
+            try:
+                code_raw = r.get('股票代號')
+                symbol = f"{str(code_raw).strip()}.TW" if code_raw is not None and str(code_raw).strip() else None
+                if not symbol:
+                    missing_symbol += 1
+                base = {'symbol': symbol, 'period': r.get('period')}
+                if not base.get('period'):
+                    invalid_period += 1
+                base.update(_compute_ratios_record(r))
+                out.append(base)
+
+                if write_to_db:
+                    buffer.append(base)
+
+                try:
+                    financial_ratios_status['processed'] = int(idx)
+                    financial_ratios_status['current_code'] = base.get('symbol')
+                    financial_ratios_status['success_count'] = int(financial_ratios_status.get('success_count') or 0) + 1
+                except Exception:
+                    pass
+
+                if write_to_db and len(buffer) >= batch_commit_size:
+                    batch_inserted = stock_api.upsert_financial_ratios(buffer, db_manager=db)
+                    inserted += int(batch_inserted or 0)
+                    batches += 1
+                    buffer = []
+                    try:
+                        financial_ratios_status['db_inserted_rows'] = int(inserted)
+                        financial_ratios_status['db_batches'] = int(batches)
+                        financial_ratios_status['db_last_commit_at'] = _dt.utcnow().isoformat()
+                    except Exception:
+                        pass
+            except Exception as e:
+                try:
+                    financial_ratios_status['processed'] = int(idx)
+                    financial_ratios_status['error_count'] = int(financial_ratios_status.get('error_count') or 0) + 1
+                    financial_ratios_status['error'] = str(e)
+                except Exception:
+                    pass
+
+        if write_to_db and buffer:
+            batch_inserted = stock_api.upsert_financial_ratios(buffer, db_manager=db)
+            inserted += int(batch_inserted or 0)
+            batches += 1
+            try:
+                financial_ratios_status['db_inserted_rows'] = int(inserted)
+                financial_ratios_status['db_batches'] = int(batches)
+                financial_ratios_status['db_last_commit_at'] = _dt.utcnow().isoformat()
+            except Exception:
+                pass
+
+        try:
+            financial_ratios_status['running'] = False
+            financial_ratios_status['finishedAt'] = _dt.utcnow().isoformat()
+            financial_ratios_status['phase'] = 'done'
+        except Exception:
+            pass
+
+        payload = {
+            'meta': {
+                'year': str(year),
+                'season': str(season),
+                'period': period_label,
+                'rows': len(out),
+                'write_to_db': bool(write_to_db),
+                'inserted': int(inserted),
+                'batches': int(batches),
+                'missing_symbol': int(missing_symbol),
+                'invalid_period': int(invalid_period),
+            },
+            'data': out,
+        }
+        return jsonify(payload)
+    except Exception as exc:
+        try:
+            financial_ratios_status['running'] = False
+            financial_ratios_status['finishedAt'] = _dt.utcnow().isoformat()
+            financial_ratios_status['phase'] = 'error'
+            financial_ratios_status['error'] = str(exc)
+        except Exception:
+            pass
+        logger.error(f"financial-ratios error: {exc}")
+        return jsonify({'error': str(exc)}), 500
+    finally:
+        try:
+            db.disconnect()
+        except Exception:
+            pass
+
+
+@app.get('/api/financial-ratios/status')
+def api_financial_ratios_status():
+    """Return current progress status of financial-ratios computation."""
+
+    try:
+        return jsonify({'success': True, 'status': financial_ratios_status})
+    except Exception as e:
+        logger.error(f"financial-ratios status error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/twse/bwibbu/refresh_range', methods=['POST'])
 def refresh_twse_bwibbu_range():
     """批次刷新指定日期區間的 BWIBBU 指標（使用 BWIBBU_d）。
@@ -4176,17 +5034,42 @@ def refresh_twse_bwibbu():
         return jsonify({'success': False, 'error': str(exc)}), 500
 
 
-def _upsert_prices(cursor, symbol, price_records):
+def _upsert_prices(cursor, symbol, price_records, prices_table: str = None):
     """將價格資料批量 upsert 進 tw_stock_prices。price_records: list[dict] with keys Date/Open/High/Low/Close/Volume 或對應小寫欄位。
     """
     if not price_records:
         logger.warning(f"_upsert_prices: {symbol} 收到空資料，跳過")
         return 0
     logger.info(f"_upsert_prices: 準備寫入 {symbol} 的 {len(price_records)} 筆資料")
-    values = []
+    def _norm_date(val):
+        if val is None:
+            return None
+        if isinstance(val, pd.Timestamp):
+            return val.to_pydatetime().date().strftime('%Y-%m-%d')
+        if isinstance(val, datetime):
+            return val.date().strftime('%Y-%m-%d')
+        if isinstance(val, date):
+            return val.strftime('%Y-%m-%d')
+        if isinstance(val, str):
+            return val[:10]
+        try:
+            if hasattr(val, 'to_pydatetime'):
+                return val.to_pydatetime().date().strftime('%Y-%m-%d')
+        except Exception:
+            pass
+        return None
+
+    raw_values = []
     for pr in price_records:
-        record_date = pr.get('date') or pr.get('Date')
-        values.append(
+        record_date = _norm_date(pr.get('date') or pr.get('Date'))
+        if not record_date:
+            continue
+        volume_value = None
+        if 'volume' in pr:
+            volume_value = pr.get('volume')
+        elif 'Volume' in pr:
+            volume_value = pr.get('Volume')
+        raw_values.append(
             (
                 symbol,
                 record_date,
@@ -4194,13 +5077,23 @@ def _upsert_prices(cursor, symbol, price_records):
                 pr.get('high_price') or pr.get('High'),
                 pr.get('low_price') or pr.get('Low'),
                 pr.get('close_price') or pr.get('Close'),
-                pr.get('volume') or pr.get('Volume')
+                volume_value
             )
         )
-    if not values:
+    if not raw_values:
         return 0
-    upsert_sql = """
-        INSERT INTO tw_stock_prices (symbol, date, open_price, high_price, low_price, close_price, volume)
+
+    # 去重以避免同一批次內重複 (symbol, date) 造成 ON CONFLICT 二次命中
+    dedup = {}
+    for v in raw_values:
+        dedup[(v[0], v[1])] = v
+    values = list(dedup.values())
+
+    if not prices_table:
+        prices_table = getattr(cursor, 'table_prices', None) or 'tw_stock_prices'
+
+    upsert_sql = f"""
+        INSERT INTO {prices_table} (symbol, date, open_price, high_price, low_price, close_price, volume)
         VALUES %s
         ON CONFLICT (symbol, date) DO UPDATE SET
             open_price = EXCLUDED.open_price,
@@ -4233,13 +5126,128 @@ def import_twii_from_yfinance():
 
         inserted = 0
         count = 0
+        deleted = 0
+        kept = 0
+        skipped = 0
+        duplicated = 0
         try:
             db.create_tables()
+            # on conflict 需要 unique index；若 create_tables 因鎖超時略過，也要補上
+            db.ensure_prices_unique()
             records = stock_api.fetch_twii_with_yfinance(start_str, end_str)
+            # 指數成交金額：使用 TWSE FMTQIK 的「成交金額」（單位：元）覆寫 Volume
+            def _normalize_to_date_str(value):
+                if value is None:
+                    return None
+                if isinstance(value, str):
+                    return value[:10]
+                if isinstance(value, datetime):
+                    return value.date().isoformat()
+                if isinstance(value, date):
+                    return value.isoformat()
+                return str(value)[:10]
+
+            def _parse_roc_date(roc_str):
+                try:
+                    y, m, d = str(roc_str).split('/')
+                    return date(int(y) + 1911, int(m), int(d))
+                except Exception:
+                    return None
+
+            def _month_start_iter(start_d, end_d):
+                cur = date(start_d.year, start_d.month, 1)
+                end_anchor = date(end_d.year, end_d.month, 1)
+                while cur <= end_anchor:
+                    yield cur
+                    if cur.month == 12:
+                        cur = date(cur.year + 1, 1, 1)
+                    else:
+                        cur = date(cur.year, cur.month + 1, 1)
+
+            def fetch_twse_turnover_map(start_iso, end_iso):
+                try:
+                    start_d = date.fromisoformat(str(start_iso)[:10])
+                    end_d = date.fromisoformat(str(end_iso)[:10])
+                except Exception:
+                    return {}
+                if end_d < start_d:
+                    return {}
+
+                turnover_by_date = {}
+                session = requests.Session()
+                for anchor in _month_start_iter(start_d, end_d):
+                    try:
+                        resp = session.get(
+                            FMTQIK_URL,
+                            params={'response': 'json', 'date': anchor.strftime('%Y%m%d')},
+                            timeout=15,
+                        )
+                        if resp.status_code != 200:
+                            continue
+                        payload = resp.json()
+                        if payload.get('stat') != 'OK' or not payload.get('data'):
+                            continue
+                        fields = payload.get('fields') or []
+                        amount_idx = 2
+                        try:
+                            if '成交金額' in fields:
+                                amount_idx = fields.index('成交金額')
+                        except Exception:
+                            amount_idx = 2
+                        for row in payload.get('data', []):
+                            if not row or len(row) <= amount_idx:
+                                continue
+                            d_obj = _parse_roc_date(row[0])
+                            if not d_obj:
+                                continue
+                            if d_obj < start_d or d_obj > end_d:
+                                continue
+                            raw_amount = row[amount_idx]
+                            if raw_amount in (None, '', '--', '---'):
+                                continue
+                            try:
+                                amount = int(str(raw_amount).replace(',', ''))
+                            except Exception:
+                                continue
+                            turnover_by_date[d_obj.isoformat()] = amount
+                    except Exception:
+                        continue
+                return turnover_by_date
+
+            turnover_map = fetch_twse_turnover_map(start_str, end_str)
+            # 你的需求：沒對到 FMTQIK 的日期不要出現 -> 只保留能取得成交金額的日期
+            def _try_parse_date(s):
+                try:
+                    return date.fromisoformat(str(s)[:10])
+                except Exception:
+                    return None
+
+            start_range = _try_parse_date(start_str)
+            end_range = _try_parse_date(end_str)
+            if start_range and end_range and end_range < start_range:
+                start_range, end_range = end_range, start_range
+
+            def _pick_turnover_match(d_str):
+                if not isinstance(turnover_map, dict) or not turnover_map:
+                    return None, None, False
+                if d_str in turnover_map:
+                    return turnover_map.get(d_str), d_str, False
+                d_obj = _try_parse_date(d_str)
+                if not d_obj:
+                    return None, None, False
+                d_prev = (d_obj - timedelta(days=1)).isoformat()
+                if d_prev in turnover_map:
+                    return turnover_map.get(d_prev), d_prev, True
+                d_next = (d_obj + timedelta(days=1)).isoformat()
+                if d_next in turnover_map:
+                    return turnover_map.get(d_next), d_next, True
+                return None, None, False
+
+            # 已改為完全依賴 yfinance 資料，不再套用 FMTQIK turnover 覆寫/去重，直接寫入
             if records:
                 count = len(records)
                 cur = db.connection.cursor()
-                inserted = _upsert_prices(cur, '^TWII', records)
+                inserted = _upsert_prices(cur, '^TWII', records, prices_table=db.table_prices)
                 db.connection.commit()
             return jsonify({
                 'success': True,
@@ -4247,7 +5255,10 @@ def import_twii_from_yfinance():
                 'start': start_str,
                 'end': end_str,
                 'fetched': count,
-                'inserted': inserted
+                'inserted': inserted,
+                'deleted_in_range': deleted,
+                'skipped_no_turnover': skipped,
+                'skipped_duplicate_date': duplicated
             })
         finally:
             db.disconnect()
@@ -4441,6 +5452,33 @@ def api_balance_sheet_import():
         logger.error(f"balance-sheet import error: {exc}")
         return jsonify({'success': False, 'error': str(exc)}), 500
 
+
+@app.route('/api/cash-flow-statement/import', methods=['POST', 'OPTIONS'])
+def api_cash_flow_import():
+    """將前端提供的現金流量表寬表資料寫入資料庫。"""
+    try:
+        if request.method == 'OPTIONS':
+            return jsonify({'success': True}), 200
+        if not request.is_json:
+            return jsonify({'success': False, 'error': '需要 JSON body'}), 400
+        body = request.get_json() or {}
+        rows = body.get('rows') or body.get('data') or []
+        if not isinstance(rows, list):
+            return jsonify({'success': False, 'error': 'rows 必須為陣列'}), 400
+
+        db = DatabaseManager.from_request_payload(body)
+        if not db.connect():
+            return jsonify({'success': False, 'error': '資料庫連線失敗'}), 500
+        try:
+            inserted = stock_api.upsert_cash_flows(rows, db_manager=db)
+            return jsonify({'success': True, 'inserted': inserted, 'count': len(rows)})
+        finally:
+            db.disconnect()
+    except Exception as exc:
+        logger.error(f"cash-flow-statement import error: {exc}")
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
 @app.route('/api/anomalies/export', methods=['GET'])
 def export_anomalies():
     """匯出異常清單（CSV，Excel 可開啟）。Query: symbol, start, end, threshold=0.2"""
@@ -4580,7 +5618,7 @@ def fix_anomalies():
                     # 刪除+重抓模式下，預設不進行驗證過濾（確保能覆蓋錯值），可由參數覆寫
                     eff_thresh = (rv_thresh if refetch_only else None)
                     recs_filtered, recs_skipped = _validate_refetched_records(cur, sym, recs, threshold=eff_thresh)
-                    symbol_inserted = _upsert_prices(cur, sym, recs_filtered)
+                    symbol_inserted = _upsert_prices(cur, sym, recs_filtered, prices_table=db.table_prices)
                     total_refetched += symbol_inserted
 
                 # 稽核紀錄
@@ -4631,6 +5669,8 @@ def fix_anomalies_stream():
         end_date = request.args.get('end')
         threshold = float(request.args.get('threshold', '0.2'))
         pad_days = int(request.args.get('refetchPaddingDays', '5'))
+        # 串流期間可能因 debug middleware 失去 request context，先把 args 快照下來
+        args_snapshot = request.args.to_dict(flat=True)
         # 新增：重抓驗證門檻（串流端點為 refetch-only 模式，預設 0.5，可由 query 覆寫）
         rv_thresh_param = request.args.get('refetchValidationThreshold')
         rv_thresh = None
@@ -4644,20 +5684,86 @@ def fix_anomalies_stream():
             return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
         def generate():
-            db = DatabaseManager.from_request_args(request.args)
+            db = DatabaseManager.from_request_args(args_snapshot)
             if not db.connect():
                 yield sse_format({'type': 'error', 'message': '資料庫連線失敗'})
                 return
-            cur = db.connection.cursor()
             try:
                 try:
                     db.create_tables()
                 except Exception:
                     pass
 
+                # 先送出一筆資料，避免瀏覽器/代理以為連線閒置而中斷
+                yield sse_format({'type': 'ping'})
                 yield sse_format({'type': 'start', 'symbol': symbol, 'start': start_date, 'end': end_date, 'threshold': threshold})
 
-                anomalies = _detect_price_anomalies(cur, symbol, start_date, end_date, threshold)
+                def _ensure_connection():
+                    if db.connection is None or getattr(db.connection, 'closed', 1) != 0:
+                        try:
+                            db.disconnect()
+                        except Exception:
+                            pass
+                        if not db.connect():
+                            raise RuntimeError('資料庫連線失敗')
+                        try:
+                            db.create_tables()
+                        except Exception:
+                            pass
+
+                def _is_retryable_db_error(err: Exception) -> bool:
+                    if not isinstance(err, psycopg2.Error):
+                        return False
+                    msg = str(err)
+                    return (
+                        isinstance(err, (psycopg2.OperationalError, psycopg2.InterfaceError))
+                        or 'connection already closed' in msg
+                        or 'cursor already closed' in msg
+                        or 'SSL connection has been closed unexpectedly' in msg
+                        or 'server closed the connection unexpectedly' in msg
+                        or 'terminating connection' in msg
+                        or 'current transaction is aborted' in msg
+                    )
+
+                def _run_db(step: str, op, *, commit: bool = False):
+                    last_err = None
+                    for attempt in range(2):
+                        cur_local = None
+                        try:
+                            _ensure_connection()
+                            cur_local = db.connection.cursor()
+                            result = op(cur_local)
+                            if commit:
+                                db.connection.commit()
+                            return result
+                        except Exception as e:
+                            last_err = e
+                            try:
+                                if getattr(db, 'connection', None) is not None:
+                                    db.connection.rollback()
+                            except Exception:
+                                pass
+                            if attempt == 0 and _is_retryable_db_error(e):
+                                try:
+                                    db.disconnect()
+                                except Exception:
+                                    pass
+                                continue
+                            raise RuntimeError(f"{step} 失敗: {e}")
+                        finally:
+                            if cur_local is not None:
+                                try:
+                                    cur_local.close()
+                                except Exception:
+                                    pass
+                    if last_err is not None:
+                        raise last_err
+
+                anomalies = _run_db(
+                    'detect_anomalies',
+                    lambda cur: _detect_price_anomalies(cur, symbol, start_date, end_date, threshold),
+                    commit=False,
+                )
                 if not anomalies:
                     yield sse_format({'type': 'done', 'success': True, 'count': 0, 'refetched': 0, 'details': []})
                     return
@@ -4698,22 +5804,25 @@ def fix_anomalies_stream():
                         recs = price_df.to_dict('records') if hasattr(price_df, 'to_dict') else price_df
                         fetched_count = len(recs)
                         # 驗證與過濾（串流端點預設 refetch-only，使用 rv_thresh）
-                        recs_filtered, recs_skipped = _validate_refetched_records(cur, sym, recs, threshold=rv_thresh)
-                        symbol_inserted = _upsert_prices(cur, sym, recs_filtered)
+                        def _upsert_op(cur):
+                            recs_filtered, recs_skipped = _validate_refetched_records(cur, sym, recs, threshold=rv_thresh)
+                            return _upsert_prices(cur, sym, recs_filtered, prices_table=db.table_prices)
+
+                        symbol_inserted = int(_run_db(f'upsert_prices[{sym}]', _upsert_op, commit=True) or 0)
                         total_refetched += symbol_inserted
 
                     # 稽核（以refetch-only記錄）
-                    cur.execute(
-                        """
-                            INSERT INTO stock_anomaly_audit
-                                (symbol, start_date, end_date, deleted_count, refetched_count, rule_version, threshold)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        [sym, start_date or rs_str, end_date or re_str, 0, total_refetched, 'rules_v1_pct', threshold]
-                    )
+                    def _audit_op(cur):
+                        cur.execute(
+                            """
+                                INSERT INTO stock_anomaly_audit
+                                    (symbol, start_date, end_date, deleted_count, refetched_count, rule_version, threshold)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            [sym, start_date or rs_str, end_date or re_str, 0, total_refetched, 'rules_v1_pct', threshold]
+                        )
 
-                    # 每檔提交，讓資料在過程中即時生效
-                    db.connection.commit()
+                    _run_db(f'audit_insert[{sym}]', _audit_op, commit=True)
 
                     info = {
                         'symbol': sym,
@@ -4724,24 +5833,276 @@ def fix_anomalies_stream():
                     details.append(info)
                     yield sse_format({'type': 'symbol_done', **info})
 
-                # 最終提交（多數情況已於每檔提交，這裡作為保險）
-                db.connection.commit()
+                try:
+                    if getattr(db, 'connection', None) is not None:
+                        db.connection.commit()
+                except Exception:
+                    pass
                 yield sse_format({'type': 'done', 'success': True, 'count': len(anomalies), 'refetched': total_refetched, 'details': details})
+            except GeneratorExit:
+                try:
+                    pass
+                finally:
+                    return
             except Exception as e:
-                db.connection.rollback()
-                yield sse_format({'type': 'error', 'message': str(e)})
+                try:
+                    if getattr(db, 'connection', None) is not None:
+                        db.connection.rollback()
+                except Exception:
+                    pass
+                yield sse_format({'type': 'error', 'message': str(e), 'error_type': type(e).__name__})
             finally:
-                db.disconnect()
+                try:
+                    db.disconnect()
+                except Exception:
+                    pass
 
         headers = {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*'
+            'Connection': 'keep-alive'
         }
-        return Response(generate(), headers=headers)
+        return Response(stream_with_context(generate()), headers=headers)
     except Exception as e:
-        logger.error(f"fix_anomalies_stream 錯誤: {e}")
+        logger.error(f"fix_anomalies_stream 外層錯誤: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/prices/refetch_range', methods=['POST'])
+def refetch_prices_range():
+    """刪除指定股票在日期區間內的全部股價資料，並整段重抓後寫回。
+    JSON body: { symbol, start, end, use_local_db?: bool }
+    """
+    try:
+        if not request.is_json:
+            return jsonify({'success': False, 'error': '需要 JSON body'}), 400
+
+        body = request.get_json() or {}
+        symbol = body.get('symbol')
+        start_date = body.get('start')
+        end_date = body.get('end')
+
+        if not symbol or not start_date or not end_date:
+            return jsonify({'success': False, 'error': '需要參數 symbol, start, end'}), 400
+
+        db = DatabaseManager.from_request_payload(body)
+        if not db.connect():
+            return jsonify({'success': False, 'error': '資料庫連線失敗'}), 500
+
+        cur = db.connection.cursor()
+        try:
+            try:
+                db.create_tables()
+            except Exception:
+                pass
+
+            # 先備份整段（沿用 stock_prices_backup_anomaly 表）
+            cur.execute(
+                """
+                    INSERT INTO stock_prices_backup_anomaly
+                        (symbol, date, open_price, high_price, low_price, close_price, volume, reason, rule_version, threshold)
+                    SELECT symbol, date, open_price, high_price, low_price, close_price, volume,
+                           'range_refetch', 'range_refetch', NULL
+                    FROM tw_stock_prices
+                    WHERE symbol = %s AND date >= %s AND date <= %s
+                """,
+                [symbol, start_date, end_date]
+            )
+
+            # 刪除整段
+            cur.execute(
+                """
+                    DELETE FROM tw_stock_prices
+                    WHERE symbol = %s AND date >= %s AND date <= %s
+                """,
+                [symbol, start_date, end_date]
+            )
+            deleted_count = cur.rowcount if cur.rowcount else 0
+            db.connection.commit()
+
+            # 整段重抓並寫回（upsert）
+            price_df = stock_api.fetch_stock_data(symbol, start_date, end_date)
+            fetched_count = 0
+            inserted_count = 0
+
+            if price_df is not None and (
+                (hasattr(price_df, 'empty') and not price_df.empty)
+                or (isinstance(price_df, list) and price_df)
+            ):
+                recs = price_df.to_dict('records') if hasattr(price_df, 'to_dict') else price_df
+                fetched_count = len(recs)
+                inserted_count = _upsert_prices(cur, symbol, recs, prices_table=db.table_prices)
+                db.connection.commit()
+
+            return jsonify({
+                'success': True,
+                'symbol': symbol,
+                'start': start_date,
+                'end': end_date,
+                'deleted': deleted_count,
+                'fetched': fetched_count,
+                'inserted': inserted_count,
+            })
+        except Exception as e:
+            try:
+                db.connection.rollback()
+            except Exception:
+                pass
+            logger.error(f"refetch_prices_range 失敗: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+        finally:
+            db.disconnect()
+    except Exception as e:
+        logger.error(f"refetch_prices_range 外層錯誤: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/prices/refetch_range_by_anomalies', methods=['POST'])
+def refetch_prices_range_by_anomalies():
+    try:
+        if not request.is_json:
+            return jsonify({'success': False, 'error': '需要 JSON body'}), 400
+
+        body = request.get_json() or {}
+        symbol = body.get('symbol')
+        start_date = body.get('start')
+        end_date = body.get('end')
+        threshold = float(body.get('threshold', 0.2))
+
+        if not start_date or not end_date:
+            return jsonify({'success': False, 'error': '需要參數 start, end'}), 400
+
+        db = DatabaseManager.from_request_payload(body)
+        if not db.connect():
+            return jsonify({'success': False, 'error': '資料庫連線失敗'}), 500
+
+        cur = db.connection.cursor()
+        try:
+            try:
+                db.create_tables()
+            except Exception:
+                pass
+
+            anomalies = _detect_price_anomalies(cur, symbol, start_date, end_date, threshold)
+            symbols = sorted({a.get('symbol') for a in (anomalies or []) if a.get('symbol')})
+            if not symbols:
+                return jsonify({
+                    'success': True,
+                    'message': '未發現異常',
+                    'start': start_date,
+                    'end': end_date,
+                    'threshold': threshold,
+                    'symbols': [],
+                    'details': [],
+                    'deleted': 0,
+                    'fetched': 0,
+                    'inserted': 0,
+                })
+
+            details = []
+            total_deleted = 0
+            total_fetched = 0
+            total_inserted = 0
+
+            anomalies_by_symbol = {}
+            for a in (anomalies or []):
+                try:
+                    sym = a.get('symbol')
+                    d = a.get('date')
+                    if not sym or not d:
+                        continue
+                    anomalies_by_symbol.setdefault(sym, set()).add(str(d))
+                except Exception:
+                    continue
+
+            for sym in symbols:
+                anomaly_dates = sorted(anomalies_by_symbol.get(sym, set()))
+                if not anomaly_dates:
+                    continue
+
+                anomaly_dates_param = []
+                for d in anomaly_dates:
+                    try:
+                        anomaly_dates_param.append(datetime.strptime(str(d), '%Y-%m-%d').date())
+                    except Exception:
+                        continue
+                if not anomaly_dates_param:
+                    continue
+
+                cur.execute(
+                    """
+                        INSERT INTO stock_prices_backup_anomaly
+                            (symbol, date, open_price, high_price, low_price, close_price, volume, reason, rule_version, threshold)
+                        SELECT symbol, date, open_price, high_price, low_price, close_price, volume,
+                               'anomaly_date_refetch', 'anomaly_date_refetch', %s
+                        FROM tw_stock_prices
+                        WHERE symbol = %s AND date = ANY(%s)
+                    """,
+                    [threshold, sym, anomaly_dates_param]
+                )
+
+                cur.execute(
+                    """
+                        DELETE FROM tw_stock_prices
+                        WHERE symbol = %s AND date = ANY(%s)
+                    """,
+                    [sym, anomaly_dates_param]
+                )
+                deleted_count = cur.rowcount if cur.rowcount else 0
+                total_deleted += deleted_count
+                db.connection.commit()
+
+                fetched_count = 0
+                inserted_count = 0
+                for d in anomaly_dates:
+                    try:
+                        price_df = stock_api.fetch_stock_data(sym, d, d)
+                        if price_df is None:
+                            continue
+                        if not ((hasattr(price_df, 'empty') and not price_df.empty) or (isinstance(price_df, list) and price_df)):
+                            continue
+                        recs = price_df.to_dict('records') if hasattr(price_df, 'to_dict') else price_df
+                        if not recs:
+                            continue
+                        fetched_count += len(recs)
+                        inserted_count += _upsert_prices(cur, sym, recs, prices_table=db.table_prices)
+                        db.connection.commit()
+                    except Exception as _:
+                        continue
+
+                total_fetched += fetched_count
+                total_inserted += inserted_count
+
+                details.append({
+                    'symbol': sym,
+                    'anomaly_dates': anomaly_dates,
+                    'deleted': deleted_count,
+                    'fetched': fetched_count,
+                    'inserted': inserted_count,
+                })
+
+            return jsonify({
+                'success': True,
+                'start': start_date,
+                'end': end_date,
+                'threshold': threshold,
+                'symbols': symbols,
+                'details': details,
+                'deleted': total_deleted,
+                'fetched': total_fetched,
+                'inserted': total_inserted,
+            })
+        except Exception as e:
+            try:
+                db.connection.rollback()
+            except Exception:
+                pass
+            logger.error(f"refetch_prices_range_by_anomalies 失敗: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+        finally:
+            db.disconnect()
+    except Exception as e:
+        logger.error(f"refetch_prices_range_by_anomalies 外層錯誤: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/symbols', methods=['GET'])
@@ -4778,11 +6139,158 @@ def get_symbols():
             'count': len(symbols)
         })
     except Exception as e:
-        logger.error(f"獲取股票代碼失敗: {e}")
+        logger.exception('批量更新失敗')
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+
+
+@app.route('/api/symbols/refresh_from_exchanges', methods=['POST'])
+def refresh_symbols_from_exchanges():
+    """Refresh symbols table from official exchanges (TWSE/TPEx).
+
+    Body(JSON):
+      - target: 'local' | 'remote' | 'both' (default: 'both')
+      - table: table name (default: 'tw_stock_symbols')
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        target = str(body.get('target') or 'both').strip().lower()
+        table = str(body.get('table') or 'tw_stock_symbols').strip()
+        if target not in ('local', 'remote', 'both'):
+            return jsonify({'success': False, 'error': 'invalid target'}), 400
+
+        script_path = os.path.join(os.path.dirname(__file__), 'scripts', 'seed_stock_symbols_from_exchanges.py')
+        if not os.path.exists(script_path):
+            return jsonify({'success': False, 'error': f'seeder script not found: {script_path}'}), 500
+
+        def run_once(mode: str):
+            env = os.environ.copy()
+            env['SYMBOLS_TABLE'] = table
+            if mode == 'local':
+                env['FORCE_LOCAL_DB'] = '1'
+            else:
+                env.pop('FORCE_LOCAL_DB', None)
+
+            if mode == 'remote':
+                if not (env.get('DATABASE_URL') or env.get('NEON_DATABASE_URL')):
+                    try:
+                        # Align with DatabaseManager behavior: use fallback Neon URL if env not provided
+                        fallback_url = DatabaseManager(use_local=False).db_url
+                        if fallback_url:
+                            env['NEON_DATABASE_URL'] = fallback_url
+                    except Exception:
+                        pass
+                if not (env.get('DATABASE_URL') or env.get('NEON_DATABASE_URL')):
+                    return {
+                        'mode': mode,
+                        'ok': False,
+                        'returncode': None,
+                        'stdout': '',
+                        'stderr': 'NEON_DATABASE_URL not configured',
+                    }
+
+            cmd = [sys.executable, script_path]
+            res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900)
+            return {
+                'mode': mode,
+                'ok': res.returncode == 0,
+                'returncode': res.returncode,
+                'stdout': res.stdout[-20000:] if res.stdout else '',
+                'stderr': res.stderr[-20000:] if res.stderr else '',
+            }
+
+        results = []
+        if target == 'local':
+            results.append(run_once('local'))
+        elif target == 'remote':
+            results.append(run_once('remote'))
+        else:
+            results.append(run_once('local'))
+            results.append(run_once('remote'))
+
+        ok = all(r.get('ok') for r in results)
+        return jsonify({'success': ok, 'results': results})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'refresh timed out'}), 504
+    except Exception as e:
+        logger.exception('refresh symbols from exchanges failed')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/symbols/refresh_etf_names', methods=['POST'])
+def refresh_etf_names_from_isin():
+    """Refresh ETF symbols/names into symbols table from ISIN (ETF list).
+
+    Body(JSON):
+      - target: 'local' | 'remote' | 'both' (default: 'both')
+      - table: table name (default: 'tw_stock_symbols')
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        target = str(body.get('target') or 'both').strip().lower()
+        table = str(body.get('table') or 'tw_stock_symbols').strip()
+        if target not in ('local', 'remote', 'both'):
+            return jsonify({'success': False, 'error': 'invalid target'}), 400
+
+        script_path = os.path.join(os.path.dirname(__file__), 'scripts', 'seed_etf_symbols_from_isin.py')
+        if not os.path.exists(script_path):
+            return jsonify({'success': False, 'error': f'seeder script not found: {script_path}'}), 500
+
+        def run_once(mode: str):
+            env = os.environ.copy()
+            env['SYMBOLS_TABLE'] = table
+            if mode == 'local':
+                env['FORCE_LOCAL_DB'] = '1'
+            else:
+                env.pop('FORCE_LOCAL_DB', None)
+
+            if mode == 'remote':
+                if not (env.get('DATABASE_URL') or env.get('NEON_DATABASE_URL')):
+                    try:
+                        fallback_url = DatabaseManager(use_local=False).db_url
+                        if fallback_url:
+                            env['NEON_DATABASE_URL'] = fallback_url
+                    except Exception:
+                        pass
+                if not (env.get('DATABASE_URL') or env.get('NEON_DATABASE_URL')):
+                    return {
+                        'mode': mode,
+                        'ok': False,
+                        'returncode': None,
+                        'stdout': '',
+                        'stderr': 'NEON_DATABASE_URL not configured',
+                    }
+
+            cmd = [sys.executable, script_path]
+            res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900)
+            return {
+                'mode': mode,
+                'ok': res.returncode == 0,
+                'returncode': res.returncode,
+                'stdout': res.stdout[-20000:] if res.stdout else '',
+                'stderr': res.stderr[-20000:] if res.stderr else '',
+            }
+
+        results = []
+        if target == 'local':
+            results.append(run_once('local'))
+        elif target == 'remote':
+            results.append(run_once('remote'))
+        else:
+            results.append(run_once('local'))
+            results.append(run_once('remote'))
+
+        ok = all(r.get('ok') for r in results)
+        return jsonify({'success': ok, 'results': results})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'refresh timed out'}), 504
+    except Exception as e:
+        logger.exception('refresh etf names failed')
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.get('/api/income-statement')
@@ -4792,6 +6300,10 @@ def api_income_statement():
     Query params:
         year:   e.g. 2025
         season: 1-4
+        code:   optional, single stock code
+        code_from/code_to: optional range filter
+        pause_every/pause_minutes: optional throttle controls
+        retry_on_block/retry_wait_minutes/retry_max: optional resume controls
     """
 
     from datetime import datetime as _dt
@@ -4806,6 +6318,9 @@ def api_income_statement():
     pause_seconds: float = 0.0
     pause_every_raw = request.args.get('pause_every')
     pause_minutes_raw = request.args.get('pause_minutes')
+    retry_on_block_raw = request.args.get('retry_on_block')
+    retry_wait_minutes_raw = request.args.get('retry_wait_minutes')
+    retry_max_raw = request.args.get('retry_max')
     try:
         if pause_every_raw is not None:
             v = int(str(pause_every_raw).strip())
@@ -4820,6 +6335,32 @@ def api_income_statement():
                 pause_seconds = mv * 60.0
     except Exception:
         pause_seconds = 0.0
+
+    retry_on_block = False
+    try:
+        if retry_on_block_raw is not None:
+            rv = str(retry_on_block_raw).strip().lower()
+            retry_on_block = rv in ('1', 'true', 'yes', 'y')
+    except Exception:
+        retry_on_block = False
+
+    retry_wait_seconds = 300.0
+    try:
+        if retry_wait_minutes_raw is not None:
+            mw = float(str(retry_wait_minutes_raw).strip())
+            if mw > 0:
+                retry_wait_seconds = mw * 60.0
+    except Exception:
+        retry_wait_seconds = 300.0
+
+    retry_max = 1
+    try:
+        if retry_max_raw is not None:
+            rm = int(str(retry_max_raw).strip())
+            if rm >= 0:
+                retry_max = rm
+    except Exception:
+        retry_max = 1
 
     if pause_every and pause_seconds > 0:
         logger.info(
@@ -4857,6 +6398,10 @@ def api_income_statement():
         'error_count': 0,
         'current_code': None,
         'error': None,
+        'stopped_reason': None,
+        'paused': False,
+        'resumeAt': None,
+        'block_count': 0,
     }
 
     def _income_progress_cb(idx, total, code, status, detail):
@@ -4872,6 +6417,16 @@ def api_income_statement():
             # 只記錄最後一個錯誤訊息即可
             if detail:
                 st['error'] = str(detail)
+                low = str(detail).lower()
+                if (
+                    'mops' in low
+                    or 'blocked' in low
+                    or 'too many requests' in low
+                    or 'captcha' in low
+                    or '驗證' in str(detail)
+                    or '封鎖' in str(detail)
+                ):
+                    st['stopped_reason'] = 'mops_blocked'
 
     write_raw = request.args.get('write_to_db') or request.args.get('import_db')
     write_to_db = False
@@ -4983,16 +6538,79 @@ def api_income_statement():
             return jsonify({'error': '資料庫初始化失敗'}), 500
 
     try:
-        df = fetch_all_incomes(
-            str(year),
-            str(season),
-            progress_cb=_income_progress_cb,
-            row_cb=row_cb,
-            code_from=code_from,
-            code_to=code_to,
-            pause_every=pause_every,
-            pause_seconds=pause_seconds,
-        )
+        import time as _time
+        from datetime import timedelta as _td
+        from income_statement_service import MopsBlockedError as _IncomeMopsBlockedError
+
+        df_parts = []
+        resume_from_code = None
+        block_count = 0
+
+        while True:
+            try:
+                df_part = fetch_all_incomes(
+                    str(year),
+                    str(season),
+                    progress_cb=_income_progress_cb,
+                    row_cb=row_cb,
+                    code_from=(resume_from_code or code_from),
+                    code_to=code_to,
+                    pause_every=pause_every,
+                    pause_seconds=pause_seconds,
+                    raise_on_block=bool(retry_on_block),
+                )
+                if df_part is not None and not df_part.empty:
+                    df_parts.append(df_part)
+                break
+            except _IncomeMopsBlockedError as e:
+                if (not retry_on_block) or (block_count >= retry_max):
+                    raise
+
+                block_count += 1
+                resume_from_code = income_fetch_status.get('current_code') or resume_from_code
+                try:
+                    income_fetch_status['block_count'] = int(block_count)
+                except Exception:
+                    pass
+
+                if write_to_db and db is not None and cursor is not None and buffer_values:
+                    batch_len = len(buffer_values)
+                    logger.info(
+                        "[income][db-batch] flushing %d buffered row(s) before retry",
+                        batch_len,
+                    )
+                    execute_values(cursor, insert_sql, buffer_values, page_size=batch_size)
+                    db.connection.commit()
+                    inserted_rows += batch_len
+                    batches_committed += 1
+                    buffer_values.clear()
+
+                try:
+                    income_fetch_status['paused'] = True
+                    income_fetch_status['resumeAt'] = (_dt.utcnow() + _td(seconds=retry_wait_seconds)).isoformat()
+                    income_fetch_status['error'] = str(e)
+                    income_fetch_status['stopped_reason'] = 'mops_blocked'
+                except Exception:
+                    pass
+
+                _time.sleep(retry_wait_seconds)
+
+                try:
+                    income_fetch_status['paused'] = False
+                    income_fetch_status['resumeAt'] = None
+                except Exception:
+                    pass
+                continue
+
+        if df_parts:
+            non_empty = [d for d in df_parts if d is not None and not d.empty]
+            if non_empty:
+                df = pd.concat(non_empty, ignore_index=True)
+            else:
+                df = pd.DataFrame()
+        else:
+            df = pd.DataFrame()
+
         if write_to_db and db is not None and cursor is not None and buffer_values:
             batch_len = len(buffer_values)
             logger.info(
@@ -5010,13 +6628,46 @@ def api_income_statement():
                 batches_committed,
             )
             buffer_values.clear()
+
         income_fetch_status['running'] = False
         income_fetch_status['finishedAt'] = _dt.utcnow().isoformat()
     except Exception as e:
+        from income_statement_service import MopsBlockedError as _IncomeMopsBlockedError
+        if isinstance(e, _IncomeMopsBlockedError):
+            logger.warning(f"income-statement blocked by MOPS: {e}")
+            income_fetch_status['running'] = False
+            income_fetch_status['finishedAt'] = _dt.utcnow().isoformat()
+            income_fetch_status['error'] = str(e)
+            income_fetch_status['stopped_reason'] = 'mops_blocked'
+            if write_to_db and db is not None:
+                try:
+                    if db.connection is not None:
+                        db.connection.rollback()
+                except Exception:
+                    pass
+            if write_to_db and db is not None:
+                try:
+                    db.disconnect()
+                except Exception:
+                    pass
+            return (
+                jsonify(
+                    {
+                        'error': (
+                            'MOPS/TWSE 顯示「因安全性考量無法存取」頁面，可能已觸發防護機制。'
+                            '請降低抓取頻率（提高 pause_every / pause_minutes）、縮小 code_from/code_to 範圍，'
+                            '或稍後再試。'
+                        )
+                    }
+                ),
+                429,
+            )
         logger.error(f"income-statement fetch failed: {e}")
         income_fetch_status['running'] = False
         income_fetch_status['finishedAt'] = _dt.utcnow().isoformat()
         income_fetch_status['error'] = str(e)
+        if income_fetch_status.get('stopped_reason') is None:
+            income_fetch_status['stopped_reason'] = 'server_error'
         if write_to_db and db is not None:
             try:
                 if db.connection is not None:
@@ -5028,6 +6679,29 @@ def api_income_statement():
                 db.disconnect()
             except Exception:
                 pass
+
+        msg = str(e)
+        low = msg.lower()
+        if (
+            'connection reset' in low
+            or 'connection aborted' in low
+            or 'connectionerror' in low
+            or 'read timed out' in low
+            or 'timed out' in low
+            or 'isin' in low
+        ):
+            return (
+                jsonify(
+                    {
+                        'error': (
+                            '抓取股票清單（ISIN）時網路連線被重設/逾時，請稍後再試。\n'
+                            '若持續發生，可降低抓取頻率或先確認網路/DNS 是否穩定。'
+                        )
+                    }
+                ),
+                503,
+            )
+
         return jsonify({'error': 'internal error fetching income statements'}), 500
     finally:
         if write_to_db and db is not None:
@@ -5050,8 +6724,45 @@ def api_income_statement():
     if df.empty:
         return jsonify([])
 
-    data_json = df.to_json(orient='records', force_ascii=False)
-    return Response(data_json, mimetype='application/json; charset=utf-8')
+    meta = dict(income_fetch_status or {})
+    meta['returned_rows'] = int(getattr(df, 'shape', [0])[0] or 0)
+    meta['write_to_db'] = bool(write_to_db)
+    if write_to_db:
+        meta['db_inserted_rows'] = int(inserted_rows)
+        meta['db_batches'] = int(batches_committed)
+
+    include_meta_raw = request.args.get('include_meta') or request.args.get('with_meta')
+    include_meta = False
+    if include_meta_raw is not None:
+        include_meta = str(include_meta_raw).strip().lower() in ('1', 'true', 'yes', 'y')
+
+    if include_meta:
+        payload = {
+            'meta': meta,
+            'data': df.to_dict(orient='records'),
+        }
+        resp = jsonify(payload)
+    else:
+        data_json = df.to_json(orient='records', force_ascii=False)
+        resp = Response(data_json, mimetype='application/json; charset=utf-8')
+
+    try:
+        resp.headers['X-Income-Year'] = str(year)
+        resp.headers['X-Income-Season'] = str(season)
+        resp.headers['X-Income-Total'] = '' if meta.get('total') is None else str(meta.get('total'))
+        resp.headers['X-Income-Processed'] = str(meta.get('processed') or 0)
+        resp.headers['X-Income-Success'] = str(meta.get('success_count') or 0)
+        resp.headers['X-Income-Errors'] = str(meta.get('error_count') or 0)
+        resp.headers['X-Income-Stopped-Reason'] = '' if meta.get('stopped_reason') is None else str(meta.get('stopped_reason'))
+        resp.headers['X-Income-Last-Error'] = '' if meta.get('error') is None else str(meta.get('error'))[:500]
+        resp.headers['X-Income-Returned-Rows'] = str(meta.get('returned_rows') or 0)
+        if write_to_db:
+            resp.headers['X-Income-DB-Inserted-Rows'] = str(meta.get('db_inserted_rows') or 0)
+            resp.headers['X-Income-DB-Batches'] = str(meta.get('db_batches') or 0)
+    except Exception:
+        pass
+
+    return resp
 
 
 @app.get('/api/balance-sheet')
@@ -5526,6 +7237,227 @@ def api_balance_sheet_status():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.get('/api/cash-flow-statement')
+def api_cash_flow_statement():
+    """抓取單一股票、代號範圍或全市場的現金流量表。"""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    import time as _time
+
+    year = request.args.get('year')
+    season = request.args.get('season')
+    code = (request.args.get('code') or '').strip()
+    code_from = (request.args.get('code_from') or '').strip() or None
+    code_to = (request.args.get('code_to') or '').strip() or None
+    if not year or not season:
+        return jsonify({'error': 'year and season are required'}), 400
+    try:
+        if int(season) not in (1, 2, 3, 4):
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({'error': 'season must be 1-4'}), 400
+
+    def _bool_arg(name, default=False):
+        value = request.args.get(name)
+        if value is None:
+            return default
+        return str(value).strip().lower() in ('1', 'true', 'yes', 'y')
+
+    def _int_arg(name, default, minimum=0):
+        try:
+            return max(minimum, int(str(request.args.get(name, default)).strip()))
+        except (TypeError, ValueError):
+            return default
+
+    def _float_arg(name, default, minimum=0.0):
+        try:
+            return max(minimum, float(str(request.args.get(name, default)).strip()))
+        except (TypeError, ValueError):
+            return default
+
+    if code:
+        try:
+            frame = fetch_cash_flow_row(code, str(year), str(season))
+            if frame.empty:
+                return jsonify([])
+            return Response(
+                frame.to_json(orient='records', force_ascii=False),
+                mimetype='application/json; charset=utf-8',
+            )
+        except CashFlowMopsBlockedError:
+            return jsonify({'error': 'MOPS/TWSE 暫時封鎖存取，請稍後再試。'}), 429
+        except Exception as exc:
+            logger.exception("cash-flow single fetch failed")
+            return jsonify({'error': f'internal error fetching cash flow: {exc}'}), 500
+
+    pause_every = _int_arg('pause_every', 0) or None
+    pause_seconds = _float_arg('pause_minutes', 0.0) * 60
+    retry_on_block = _bool_arg('retry_on_block')
+    retry_wait_seconds = _float_arg('retry_wait_minutes', 5.0, 0.01) * 60
+    retry_max = _int_arg('retry_max', 1)
+    write_to_db = _bool_arg('write_to_db') or _bool_arg('import_db')
+
+    global cash_flow_fetch_status
+    cash_flow_fetch_status = {
+        'running': True,
+        'startedAt': _dt.now(_tz.utc).isoformat(),
+        'finishedAt': None,
+        'year': str(year),
+        'season': str(season),
+        'total': None,
+        'processed': 0,
+        'success_count': 0,
+        'error_count': 0,
+        'current_code': None,
+        'error': None,
+        'db_write_enabled': write_to_db,
+        'db_inserted_rows': 0,
+        'paused': False,
+        'resumeAt': None,
+        'block_count': 0,
+    }
+
+    collected: dict[tuple[str, str], dict] = {}
+    db = None
+    insert_sql = None
+
+    def _to_num(value):
+        if value is None:
+            return None
+        try:
+            return float(str(value).replace(',', '').strip())
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        if write_to_db:
+            db = DatabaseManager.from_request_args(request.args)
+            if not db.connect() or not db.create_tables():
+                raise RuntimeError('資料庫初始化失敗')
+            table_name = getattr(db, 'table_cash_flow', cash_flow_table(use_neon=db.is_neon))
+            columns = ['"股票代號"', 'period'] + [
+                f'"{column}"' for column in CASH_FLOW_TARGET_ORDER
+            ]
+            updates = ", ".join(
+                f'"{column}" = EXCLUDED."{column}"'
+                for column in CASH_FLOW_TARGET_ORDER
+            )
+            insert_sql = f"""
+                INSERT INTO {table_name} ({", ".join(columns)})
+                VALUES %s
+                ON CONFLICT ("股票代號", period) DO UPDATE SET
+                    {updates}, updated_at = CURRENT_TIMESTAMP
+            """
+
+        def _row_cb(_code, row_frame):
+            if row_frame is None or row_frame.empty:
+                return
+            for record in row_frame.to_dict(orient='records'):
+                key = (str(record.get('股票代號') or ''), str(record.get('period') or ''))
+                if not all(key):
+                    continue
+                collected[key] = record
+                if db is not None and insert_sql is not None:
+                    values = tuple(
+                        [key[0], key[1]]
+                        + [_to_num(record.get(column)) for column in CASH_FLOW_TARGET_ORDER]
+                    )
+                    with db.connection.cursor() as cursor:
+                        execute_values(cursor, insert_sql, [values], page_size=1)
+                    db.connection.commit()
+                    cash_flow_fetch_status['db_inserted_rows'] = (
+                        int(cash_flow_fetch_status.get('db_inserted_rows') or 0) + 1
+                    )
+
+        from income_statement_service import fetch_all_stock_codes as _fetch_codes
+        all_codes = _fetch_codes()
+        if code_from or code_to:
+            lower, upper = code_from, code_to
+            if lower and upper and lower > upper:
+                lower, upper = upper, lower
+            all_codes = [
+                item for item in all_codes
+                if (not lower or item >= lower) and (not upper or item <= upper)
+            ]
+        code_index = {item: index for index, item in enumerate(all_codes, 1)}
+        total_codes = len(all_codes)
+        resume_from = None
+        block_count = 0
+
+        while True:
+            offset = code_index.get(resume_from, 0) if resume_from else 0
+
+            def _progress_cb(index, _total, current_code, status, detail):
+                state = cash_flow_fetch_status
+                state['total'] = total_codes
+                state['processed'] = min(total_codes, offset + int(index))
+                state['current_code'] = current_code
+                if status == 'success':
+                    state['success_count'] = len(collected)
+                elif status == 'error':
+                    state['error_count'] = int(state.get('error_count') or 0) + 1
+                    state['error'] = detail
+
+            try:
+                fetch_all_cash_flows(
+                    str(year),
+                    str(season),
+                    progress_cb=_progress_cb,
+                    row_cb=_row_cb,
+                    code_from=(resume_from or code_from),
+                    code_to=code_to,
+                    resume_after=bool(resume_from),
+                    pause_every=pause_every,
+                    pause_seconds=pause_seconds,
+                )
+                break
+            except CashFlowMopsBlockedError as exc:
+                if not retry_on_block or block_count >= retry_max:
+                    raise
+                block_count += 1
+                resume_from = cash_flow_fetch_status.get('current_code') or resume_from
+                cash_flow_fetch_status.update({
+                    'paused': True,
+                    'resumeAt': (_dt.now(_tz.utc) + _td(seconds=retry_wait_seconds)).isoformat(),
+                    'block_count': block_count,
+                    'error': str(exc),
+                })
+                _time.sleep(retry_wait_seconds)
+                cash_flow_fetch_status.update({'paused': False, 'resumeAt': None})
+
+        cash_flow_fetch_status.update({
+            'running': False,
+            'finishedAt': _dt.now(_tz.utc).isoformat(),
+            'processed': total_codes,
+            'success_count': len(collected),
+            'current_code': None,
+            'error': None,
+        })
+        return jsonify(list(collected.values()))
+    except CashFlowMopsBlockedError as exc:
+        cash_flow_fetch_status.update({
+            'running': False,
+            'finishedAt': _dt.now(_tz.utc).isoformat(),
+            'error': str(exc),
+        })
+        return jsonify({'error': 'MOPS/TWSE 暫時封鎖存取，請降低頻率或稍後再試。'}), 429
+    except Exception as exc:
+        logger.exception("cash-flow fetch failed")
+        cash_flow_fetch_status.update({
+            'running': False,
+            'finishedAt': _dt.now(_tz.utc).isoformat(),
+            'error': str(exc),
+        })
+        return jsonify({'error': f'internal error fetching cash flow: {exc}'}), 500
+    finally:
+        if db is not None:
+            db.disconnect()
+
+
+@app.get('/api/cash-flow-statement/status')
+def api_cash_flow_statement_status():
+    return jsonify({'success': True, 'status': cash_flow_fetch_status})
+
+
 @app.get('/api/income-statement/status')
 def api_income_statement_status():
     """Return current progress status of income-statement fetching."""
@@ -5553,6 +7485,193 @@ def list_routes():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _is_safe_identifier(name: str) -> bool:
+    if not name:
+        return False
+    try:
+        return re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', str(name)) is not None
+    except Exception:
+        return False
+
+
+def _resolve_table_override(cursor, table_name: str) -> str:
+    if not _is_safe_identifier(table_name):
+        raise ValueError('invalid table name')
+    cursor.execute(
+        """
+            SELECT COUNT(*) AS cnt
+            FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = %s
+        """,
+        [table_name],
+    )
+    row = cursor.fetchone()
+    cnt = 0
+    if isinstance(row, dict):
+        cnt = int(row.get('cnt') or 0)
+    elif isinstance(row, (list, tuple)) and row:
+        cnt = int(row[0] or 0)
+    if cnt <= 0:
+        raise ValueError('table not found')
+    return table_name
+
+
+@app.route('/api/tables', methods=['GET'])
+def list_tables_for_query():
+    try:
+        db_manager = DatabaseManager.from_request_args(request.args)
+        if not db_manager.connect():
+            return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
+        try:
+            cursor = db_manager.connection.cursor()
+            cursor.execute(
+                """
+                    SELECT tablename
+                    FROM pg_tables
+                    WHERE schemaname = 'public'
+                    ORDER BY tablename
+                """
+            )
+            rows = cursor.fetchall() or []
+            tables = []
+            for r in rows:
+                if isinstance(r, dict):
+                    name = r.get('tablename')
+                elif isinstance(r, (list, tuple)) and r:
+                    name = r[0]
+                else:
+                    name = None
+                if name:
+                    tables.append({'name': str(name)})
+            return jsonify({'success': True, 'tables': tables})
+        finally:
+            db_manager.disconnect()
+    except Exception as e:
+        logger.error(f"list_tables_for_query failed: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/query/table', methods=['GET'])
+def query_table_generic():
+    try:
+        table = request.args.get('table')
+        if not table:
+            return jsonify({'success': False, 'error': 'missing table'}), 400
+
+        limit = request.args.get('limit')
+        offset = request.args.get('offset')
+        symbol = request.args.get('symbol')
+        start_date = request.args.get('start')
+        end_date = request.args.get('end')
+
+        try:
+            limit = int(limit) if limit not in (None, '', 'null') else 200
+        except Exception:
+            limit = 200
+        try:
+            offset = int(offset) if offset not in (None, '', 'null') else 0
+        except Exception:
+            offset = 0
+        limit = max(1, min(int(limit), 2000))
+        offset = max(0, int(offset))
+
+        db_manager = DatabaseManager.from_request_args(request.args)
+        if not db_manager.connect():
+            return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
+        try:
+            cursor = db_manager.connection.cursor()
+            table_name = _resolve_table_override(cursor, str(table).strip())
+
+            cursor.execute(
+                """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = %s
+                    ORDER BY ordinal_position
+                """,
+                [table_name],
+            )
+            col_rows = cursor.fetchall() or []
+            columns = []
+            for r in col_rows:
+                if isinstance(r, dict):
+                    c = r.get('column_name')
+                elif isinstance(r, (list, tuple)) and r:
+                    c = r[0]
+                else:
+                    c = None
+                if c:
+                    columns.append(str(c))
+
+            if not columns:
+                return jsonify({'success': False, 'error': 'table has no columns'}), 400
+
+            where_parts = [sql.SQL('TRUE')]
+            params = []
+
+            if symbol and 'symbol' in columns:
+                symbol_list = [s.strip() for s in str(symbol).split(',') if s.strip()]
+                if len(symbol_list) == 1:
+                    where_parts.append(sql.SQL('symbol = %s'))
+                    params.append(symbol_list[0])
+                elif len(symbol_list) > 1:
+                    where_parts.append(sql.SQL('symbol = ANY(%s)'))
+                    params.append(symbol_list)
+
+            if start_date and 'date' in columns:
+                where_parts.append(sql.SQL('date >= %s'))
+                params.append(start_date)
+            if end_date and 'date' in columns:
+                where_parts.append(sql.SQL('date <= %s'))
+                params.append(end_date)
+
+            query = sql.SQL('SELECT * FROM {} WHERE ').format(sql.Identifier(table_name))
+            query = sql.Composed([query, sql.SQL(' AND ').join(where_parts)])
+
+            if 'date' in columns:
+                query = sql.Composed([query, sql.SQL(' ORDER BY date DESC')])
+
+            query = sql.Composed([query, sql.SQL(' LIMIT %s OFFSET %s')])
+            params.extend([limit, offset])
+
+            cursor.execute(query, params)
+            rows = cursor.fetchall() or []
+
+            # Normalize rows to list[dict]
+            out_rows = []
+            for r in rows:
+                if isinstance(r, dict):
+                    out_rows.append(r)
+                elif isinstance(r, (list, tuple)):
+                    out_rows.append({columns[i]: r[i] if i < len(r) else None for i in range(len(columns))})
+                else:
+                    out_rows.append({'value': r})
+
+            # JSON-safe date conversion
+            for rr in out_rows:
+                if not isinstance(rr, dict):
+                    continue
+                for k, v in list(rr.items()):
+                    if isinstance(v, (datetime, date)):
+                        rr[k] = v.strftime('%Y-%m-%d')
+            return jsonify({
+                'success': True,
+                'table': table_name,
+                'columns': columns,
+                'rows': out_rows,
+                'count': len(out_rows),
+                'limit': limit,
+                'offset': offset,
+            })
+        finally:
+            db_manager.disconnect()
+    except ValueError as ve:
+        return jsonify({'success': False, 'error': str(ve)}), 400
+    except Exception as e:
+        logger.exception('query_table_generic failed')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # 權證匯入進度狀態（提供前端查詢進度用）
 income_fetch_status = {
     'running': False,
@@ -5568,6 +7687,78 @@ income_fetch_status = {
     'error': None,
 }
 
+tpex_warrant_master_import_status = {
+    'running': False,
+    'startedAt': None,
+    'finishedAt': None,
+    'total': None,
+    'processed': 0,
+    'importedCount': 0,
+    'error': None,
+}
+
+tpex_warrant_daily_import_status = {
+    'running': False,
+    'startedAt': None,
+    'finishedAt': None,
+    'total': None,
+    'processed': 0,
+    'importedCount': 0,
+    'tradeDate': None,
+    'error': None,
+}
+
+
+def _parse_roc_date_text(text: str | None):
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s.isdigit() or len(s) != 7:
+        return None
+    try:
+        roc_year = int(s[:3])
+        month = int(s[3:5])
+        day = int(s[5:7])
+        year = roc_year + 1911
+        return date(year, month, day)
+    except Exception:
+        return None
+
+
+def _to_decimal_or_none(val):
+    if val is None:
+        return None
+    s = str(val).replace(',', '').strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _to_int_or_none(val):
+    num = _to_decimal_or_none(val)
+    if num is None:
+        return None
+    try:
+        return int(num)
+    except Exception:
+        return None
+
+
+def _fetch_json_list(url: str):
+    resp = requests.get(url, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f'API 狀態碼 {resp.status_code}')
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f'API JSON 格式錯誤: {e}')
+    if not isinstance(data, list) or not data:
+        raise RuntimeError('API 回傳資料為空')
+    return data
+
 
 balance_fetch_status = {
     'running': False,
@@ -5581,6 +7772,25 @@ balance_fetch_status = {
     'error_count': 0,
     'current_code': None,
     'error': None,
+}
+
+cash_flow_fetch_status = {
+    'running': False,
+    'startedAt': None,
+    'finishedAt': None,
+    'year': None,
+    'season': None,
+    'total': None,
+    'processed': 0,
+    'success_count': 0,
+    'error_count': 0,
+    'current_code': None,
+    'error': None,
+    'db_write_enabled': False,
+    'db_inserted_rows': 0,
+    'paused': False,
+    'resumeAt': None,
+    'block_count': 0,
 }
 
 
@@ -5820,9 +8030,270 @@ def get_warrants_import_status_api():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/warrants/dates', methods=['GET'])
-def get_warrant_dates():
-    """取得 tw_warrant_trade 中可用的交易日期清單。"""
+@app.route('/api/warrants/tpex/import-master', methods=['POST'])
+def import_tpex_warrant_master():
+    """從 TPEX API 抓取上櫃權證主檔並匯入 tpex_warrant_master。"""
+    try:
+        global tpex_warrant_master_import_status
+        tpex_warrant_master_import_status = {
+            'running': True,
+            'startedAt': datetime.utcnow().isoformat(),
+            'finishedAt': None,
+            'total': None,
+            'processed': 0,
+            'importedCount': 0,
+            'error': None,
+        }
+
+        db_manager = DatabaseManager.from_request_args(request.args)
+        if not db_manager.connect():
+            return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
+
+        try:
+            db_manager.create_tables()
+            data = _fetch_json_list('https://www.tpex.org.tw/openapi/v1/tpex_warrant_issue')
+            cursor = db_manager.connection.cursor()
+            cursor.execute('BEGIN')
+
+            sql = """
+                INSERT INTO tpex_warrant_master (
+                    warrant_code, report_date, warrant_name, listed_date, expiry_date,
+                    underlying_code, underlying_name, warrant_type, exercise_style,
+                    cap_price, floor_price, reset_flag, latest_exercise_price,
+                    latest_exercise_ratio, initial_issuance, accumulated_issuance,
+                    accumulated_canceled, raw_report_date_text, raw_listed_date_text,
+                    raw_expiry_date_text, updated_at
+                ) VALUES %s
+                ON CONFLICT (warrant_code) DO UPDATE SET
+                    report_date = EXCLUDED.report_date,
+                    warrant_name = EXCLUDED.warrant_name,
+                    listed_date = EXCLUDED.listed_date,
+                    expiry_date = EXCLUDED.expiry_date,
+                    underlying_code = EXCLUDED.underlying_code,
+                    underlying_name = EXCLUDED.underlying_name,
+                    warrant_type = EXCLUDED.warrant_type,
+                    exercise_style = EXCLUDED.exercise_style,
+                    cap_price = EXCLUDED.cap_price,
+                    floor_price = EXCLUDED.floor_price,
+                    reset_flag = EXCLUDED.reset_flag,
+                    latest_exercise_price = EXCLUDED.latest_exercise_price,
+                    latest_exercise_ratio = EXCLUDED.latest_exercise_ratio,
+                    initial_issuance = EXCLUDED.initial_issuance,
+                    accumulated_issuance = EXCLUDED.accumulated_issuance,
+                    accumulated_canceled = EXCLUDED.accumulated_canceled,
+                    raw_report_date_text = EXCLUDED.raw_report_date_text,
+                    raw_listed_date_text = EXCLUDED.raw_listed_date_text,
+                    raw_expiry_date_text = EXCLUDED.raw_expiry_date_text,
+                    updated_at = NOW()
+            """
+
+            total = len(data)
+            tpex_warrant_master_import_status['total'] = total
+            rows = []
+            batch_size = 1000
+            affected = 0
+
+            for item in data:
+                code = str(item.get('Code') or '').strip()
+                if not code:
+                    continue
+                rows.append((
+                    code,
+                    _parse_roc_date_text(item.get('Date')),
+                    str(item.get('Name') or '').strip() or None,
+                    _parse_roc_date_text(item.get('ListedDate')),
+                    _parse_roc_date_text(item.get('ExpiryDate')),
+                    str(item.get('UnderlyingStockCode') or '').strip() or None,
+                    str(item.get('UnderlyingStock') or '').strip() or None,
+                    str(item.get('Type') or '').strip() or None,
+                    str(item.get('American/European') or '').strip() or None,
+                    _to_decimal_or_none(item.get('CapPrice/Index')),
+                    _to_decimal_or_none(item.get('FloorPrice/Index')),
+                    str(item.get('Reset') or '').strip() or None,
+                    _to_decimal_or_none(item.get('LatestExercisePrice')),
+                    _to_decimal_or_none(item.get('Latest ExerciseRatio')),
+                    _to_int_or_none(item.get('InitialIssuance')),
+                    _to_int_or_none(item.get('Accum.Accum.Issuance')),
+                    _to_int_or_none(item.get('Accum.CanceledWarrant')),
+                    item.get('Date'),
+                    item.get('ListedDate'),
+                    item.get('ExpiryDate'),
+                ))
+                if len(rows) >= batch_size:
+                    execute_values(cursor, sql, rows, template='(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())', page_size=batch_size)
+                    affected += len(rows)
+                    tpex_warrant_master_import_status['processed'] = affected
+                    tpex_warrant_master_import_status['importedCount'] = affected
+                    rows = []
+
+            if rows:
+                execute_values(cursor, sql, rows, template='(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())', page_size=batch_size)
+                affected += len(rows)
+
+            db_manager.connection.commit()
+            tpex_warrant_master_import_status['running'] = False
+            tpex_warrant_master_import_status['finishedAt'] = datetime.utcnow().isoformat()
+            tpex_warrant_master_import_status['processed'] = affected
+            tpex_warrant_master_import_status['importedCount'] = affected
+            return jsonify({'success': True, 'message': 'TPEX 權證主檔匯入完成', 'importedCount': affected})
+        except Exception as e:
+            logger.exception('匯入 TPEX 權證主檔失敗')
+            try:
+                db_manager.connection.rollback()
+            except Exception:
+                pass
+            tpex_warrant_master_import_status['running'] = False
+            tpex_warrant_master_import_status['finishedAt'] = datetime.utcnow().isoformat()
+            tpex_warrant_master_import_status['error'] = str(e)
+            return jsonify({'success': False, 'error': str(e)}), 500
+        finally:
+            db_manager.disconnect()
+    except Exception as e:
+        logger.exception('匯入 TPEX 權證主檔失敗（外層）')
+        tpex_warrant_master_import_status['running'] = False
+        tpex_warrant_master_import_status['finishedAt'] = datetime.utcnow().isoformat()
+        tpex_warrant_master_import_status['error'] = str(e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/warrants/tpex/import-daily', methods=['POST'])
+def import_tpex_warrant_daily():
+    """從 TPEX API 抓取上櫃權證日行情並匯入 tpex_warrant_daily_quotes。"""
+    try:
+        global tpex_warrant_daily_import_status
+        tpex_warrant_daily_import_status = {
+            'running': True,
+            'startedAt': datetime.utcnow().isoformat(),
+            'finishedAt': None,
+            'total': None,
+            'processed': 0,
+            'importedCount': 0,
+            'tradeDate': None,
+            'error': None,
+        }
+
+        db_manager = DatabaseManager.from_request_args(request.args)
+        if not db_manager.connect():
+            return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
+
+        try:
+            db_manager.create_tables()
+            data = _fetch_json_list('https://www.tpex.org.tw/openapi/v1/tpex_warrant_daily_quts')
+            first_trade_date = _parse_roc_date_text(data[0].get('Date'))
+            trade_date_str = first_trade_date.strftime('%Y-%m-%d') if first_trade_date else None
+            tpex_warrant_daily_import_status['tradeDate'] = trade_date_str
+
+            cursor = db_manager.connection.cursor()
+            cursor.execute('BEGIN')
+
+            sql = """
+                INSERT INTO tpex_warrant_daily_quotes (
+                    trade_date, warrant_code, warrant_name, open_price, high_price, low_price,
+                    close_price, price_change, trade_volume, transaction_count, trade_value,
+                    underlying_code, underlying_name, underlying_close_price,
+                    underlying_price_change, raw_trade_date_text, updated_at
+                ) VALUES %s
+                ON CONFLICT (trade_date, warrant_code) DO UPDATE SET
+                    warrant_name = EXCLUDED.warrant_name,
+                    open_price = EXCLUDED.open_price,
+                    high_price = EXCLUDED.high_price,
+                    low_price = EXCLUDED.low_price,
+                    close_price = EXCLUDED.close_price,
+                    price_change = EXCLUDED.price_change,
+                    trade_volume = EXCLUDED.trade_volume,
+                    transaction_count = EXCLUDED.transaction_count,
+                    trade_value = EXCLUDED.trade_value,
+                    underlying_code = EXCLUDED.underlying_code,
+                    underlying_name = EXCLUDED.underlying_name,
+                    underlying_close_price = EXCLUDED.underlying_close_price,
+                    underlying_price_change = EXCLUDED.underlying_price_change,
+                    raw_trade_date_text = EXCLUDED.raw_trade_date_text,
+                    updated_at = NOW()
+            """
+
+            total = len(data)
+            tpex_warrant_daily_import_status['total'] = total
+            rows = []
+            batch_size = 1000
+            affected = 0
+
+            for item in data:
+                trade_date = _parse_roc_date_text(item.get('Date'))
+                code = str(item.get('Code') or '').strip()
+                if trade_date is None or not code:
+                    continue
+                rows.append((
+                    trade_date,
+                    code,
+                    str(item.get('Name') or '').strip() or None,
+                    _to_decimal_or_none(item.get('Open')),
+                    _to_decimal_or_none(item.get('High')),
+                    _to_decimal_or_none(item.get('Low')),
+                    _to_decimal_or_none(item.get('Close')),
+                    _to_decimal_or_none(item.get('Change')),
+                    _to_int_or_none(item.get('TradeVol.')),
+                    _to_int_or_none(item.get('No.OfTransactions')),
+                    _to_decimal_or_none(item.get('TradeValue')),
+                    str(item.get('UnderlyingStockCode') or '').strip() or None,
+                    str(item.get('UnderlyingStock') or '').strip() or None,
+                    _to_decimal_or_none(item.get('UnderlyingStockClosePrice')),
+                    _to_decimal_or_none(item.get('UnderlyingStock PriceChange')),
+                    item.get('Date'),
+                ))
+                if len(rows) >= batch_size:
+                    execute_values(cursor, sql, rows, template='(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())', page_size=batch_size)
+                    affected += len(rows)
+                    tpex_warrant_daily_import_status['processed'] = affected
+                    tpex_warrant_daily_import_status['importedCount'] = affected
+                    rows = []
+
+            if rows:
+                execute_values(cursor, sql, rows, template='(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())', page_size=batch_size)
+                affected += len(rows)
+
+            db_manager.connection.commit()
+            tpex_warrant_daily_import_status['running'] = False
+            tpex_warrant_daily_import_status['finishedAt'] = datetime.utcnow().isoformat()
+            tpex_warrant_daily_import_status['processed'] = affected
+            tpex_warrant_daily_import_status['importedCount'] = affected
+            return jsonify({'success': True, 'message': 'TPEX 權證日行情匯入完成', 'importedCount': affected, 'tradeDate': trade_date_str})
+        except Exception as e:
+            logger.exception('匯入 TPEX 權證日行情失敗')
+            try:
+                db_manager.connection.rollback()
+            except Exception:
+                pass
+            tpex_warrant_daily_import_status['running'] = False
+            tpex_warrant_daily_import_status['finishedAt'] = datetime.utcnow().isoformat()
+            tpex_warrant_daily_import_status['error'] = str(e)
+            return jsonify({'success': False, 'error': str(e)}), 500
+        finally:
+            db_manager.disconnect()
+    except Exception as e:
+        logger.exception('匯入 TPEX 權證日行情失敗（外層）')
+        tpex_warrant_daily_import_status['running'] = False
+        tpex_warrant_daily_import_status['finishedAt'] = datetime.utcnow().isoformat()
+        tpex_warrant_daily_import_status['error'] = str(e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/warrants/tpex/import-status', methods=['GET'])
+def get_tpex_warrant_import_status_api():
+    """回傳 TPEX 權證主檔與日行情匯入狀態。"""
+    try:
+        return jsonify({
+            'success': True,
+            'master': tpex_warrant_master_import_status,
+            'daily': tpex_warrant_daily_import_status,
+        })
+    except Exception as e:
+        logger.exception('取得 TPEX 權證匯入狀態失敗')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/warrants/tpex/dates', methods=['GET'])
+def get_tpex_warrant_dates():
+    """取得 tpex_warrant_daily_quotes 中可用的交易日期清單。"""
     try:
         limit = request.args.get('limit', default=60, type=int)
         if not isinstance(limit, int) or limit <= 0:
@@ -5834,17 +8305,197 @@ def get_warrant_dates():
             return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
 
         try:
+            db_manager.create_tables()
             cursor = db_manager.connection.cursor()
             cursor.execute(
                 """
                 SELECT DISTINCT trade_date
-                FROM tw_warrant_trade
+                FROM tpex_warrant_daily_quotes
                 WHERE trade_date IS NOT NULL
                 ORDER BY trade_date DESC
                 LIMIT %s
                 """,
                 (limit,),
             )
+            rows = cursor.fetchall()
+        finally:
+            db_manager.disconnect()
+
+        dates = []
+        for row in rows:
+            d = row.get('trade_date') if isinstance(row, dict) else (row[0] if row else None)
+            if isinstance(d, (datetime, date)):
+                dates.append(d.strftime('%Y-%m-%d'))
+            elif isinstance(d, str):
+                dates.append(d[:10])
+        return jsonify({'success': True, 'dates': dates})
+    except Exception as e:
+        logger.exception('取得 TPEX 權證日期列表失敗')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/warrants/tpex', methods=['GET'])
+def query_tpex_warrants():
+    """依日期與關鍵字查詢 TPEX 權證日行情。"""
+    try:
+        date_str = request.args.get('date')
+        keyword = (request.args.get('keyword') or '').strip()
+        page = request.args.get('page', default=1, type=int) or 1
+        page_size = request.args.get('pageSize', default=50, type=int) or 50
+
+        page = max(1, page)
+        page_size = max(10, min(200, page_size))
+        offset = (page - 1) * page_size
+
+        db_manager = DatabaseManager.from_request_args(request.args)
+        if not db_manager.connect():
+            return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
+
+        try:
+            db_manager.create_tables()
+            cursor = db_manager.connection.cursor()
+
+            target_date = date_str
+            if not target_date:
+                cursor.execute("SELECT MAX(trade_date) AS latest FROM tpex_warrant_daily_quotes")
+                row = cursor.fetchone()
+                latest = row.get('latest') if isinstance(row, dict) else (row[0] if row else None)
+                if not latest:
+                    return jsonify({'success': True, 'data': [], 'total': 0, 'page': page, 'pageSize': page_size, 'date': None})
+                target_date = latest.strftime('%Y-%m-%d') if isinstance(latest, (datetime, date)) else str(latest)[:10]
+
+            where_clauses = ['trade_date = %s']
+            params = [target_date]
+            if keyword:
+                where_clauses.append('(warrant_code ILIKE %s OR warrant_name ILIKE %s OR underlying_code ILIKE %s OR underlying_name ILIKE %s)')
+                pattern = f'%{keyword}%'
+                params.extend([pattern, pattern, pattern, pattern])
+            where_sql = ' WHERE ' + ' AND '.join(where_clauses)
+
+            cursor.execute(f'SELECT COUNT(*) AS cnt FROM tpex_warrant_daily_quotes{where_sql}', params)
+            row = cursor.fetchone()
+            total = int((row.get('cnt', 0) if isinstance(row, dict) else (row[0] if row else 0)) or 0)
+
+            query_params = list(params) + [page_size, offset]
+            cursor.execute(
+                f"""
+                SELECT
+                    trade_date, warrant_code, warrant_name, open_price, high_price, low_price,
+                    close_price, price_change, trade_volume, transaction_count, trade_value,
+                    underlying_code, underlying_name, underlying_close_price, underlying_price_change
+                FROM tpex_warrant_daily_quotes
+                {where_sql}
+                ORDER BY trade_value DESC NULLS LAST,
+                         trade_volume DESC NULLS LAST,
+                         warrant_code ASC
+                LIMIT %s OFFSET %s
+                """,
+                query_params,
+            )
+            rows = cursor.fetchall()
+        finally:
+            db_manager.disconnect()
+
+        data = []
+        for row in rows:
+            if isinstance(row, dict):
+                item = row
+            else:
+                item = {
+                    'trade_date': row[0],
+                    'warrant_code': row[1],
+                    'warrant_name': row[2],
+                    'open_price': row[3],
+                    'high_price': row[4],
+                    'low_price': row[5],
+                    'close_price': row[6],
+                    'price_change': row[7],
+                    'trade_volume': row[8],
+                    'transaction_count': row[9],
+                    'trade_value': row[10],
+                    'underlying_code': row[11],
+                    'underlying_name': row[12],
+                    'underlying_close_price': row[13],
+                    'underlying_price_change': row[14],
+                }
+            tdate = item.get('trade_date')
+            data.append({
+                'trade_date': tdate.strftime('%Y-%m-%d') if isinstance(tdate, (datetime, date)) else (str(tdate)[:10] if tdate else None),
+                'warrant_code': item.get('warrant_code'),
+                'warrant_name': item.get('warrant_name'),
+                'open_price': float(item['open_price']) if item.get('open_price') is not None else None,
+                'high_price': float(item['high_price']) if item.get('high_price') is not None else None,
+                'low_price': float(item['low_price']) if item.get('low_price') is not None else None,
+                'close_price': float(item['close_price']) if item.get('close_price') is not None else None,
+                'price_change': float(item['price_change']) if item.get('price_change') is not None else None,
+                'trade_volume': int(item['trade_volume']) if item.get('trade_volume') is not None else None,
+                'transaction_count': int(item['transaction_count']) if item.get('transaction_count') is not None else None,
+                'trade_value': float(item['trade_value']) if item.get('trade_value') is not None else None,
+                'underlying_code': item.get('underlying_code'),
+                'underlying_name': item.get('underlying_name'),
+                'underlying_close_price': float(item['underlying_close_price']) if item.get('underlying_close_price') is not None else None,
+                'underlying_price_change': float(item['underlying_price_change']) if item.get('underlying_price_change') is not None else None,
+            })
+
+        return jsonify({'success': True, 'data': data, 'total': total, 'page': page, 'pageSize': page_size, 'date': target_date})
+    except Exception as e:
+        logger.exception('查詢 TPEX 權證日行情失敗')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/warrants/dates', methods=['GET'])
+def get_warrant_dates():
+    """取得權證可用的交易日期清單，支援 TWSE / TPEX / 全市場。"""
+    try:
+        limit = request.args.get('limit', default=60, type=int)
+        market = (request.args.get('market') or 'twse').strip().lower()
+        if not isinstance(limit, int) or limit <= 0:
+            limit = 60
+        limit = min(limit, 365)
+
+        db_manager = DatabaseManager.from_request_args(request.args)
+        if not db_manager.connect():
+            return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
+
+        try:
+            db_manager.create_tables()
+            cursor = db_manager.connection.cursor()
+            if market == 'tpex':
+                cursor.execute(
+                    """
+                    SELECT DISTINCT trade_date
+                    FROM tpex_warrant_daily_quotes
+                    WHERE trade_date IS NOT NULL
+                    ORDER BY trade_date DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            elif market in {'both', 'all'}:
+                cursor.execute(
+                    """
+                    SELECT trade_date
+                    FROM (
+                        SELECT DISTINCT trade_date FROM tw_warrant_trade WHERE trade_date IS NOT NULL
+                        UNION
+                        SELECT DISTINCT trade_date FROM tpex_warrant_daily_quotes WHERE trade_date IS NOT NULL
+                    ) t
+                    ORDER BY trade_date DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT trade_date
+                    FROM tw_warrant_trade
+                    WHERE trade_date IS NOT NULL
+                    ORDER BY trade_date DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
             rows = cursor.fetchall()
         finally:
             db_manager.disconnect()
@@ -5868,17 +8519,19 @@ def get_warrant_dates():
 
 @app.route('/api/warrants', methods=['GET'])
 def query_warrants():
-    """依日期與關鍵字查詢權證資料。
+    """依日期、關鍵字與市場查詢權證資料。
 
     Query parameters:
         date: 交易日期 (YYYY-MM-DD)，若未提供則使用資料表中最新日期
         keyword: 權證代號或名稱關鍵字（模糊查詢）
+        market: twse | tpex | both，預設 twse
         page: 第幾頁（預設 1）
         pageSize: 每頁筆數（預設 50，區間 10~200）
     """
     try:
         date_str = request.args.get('date')
         keyword = (request.args.get('keyword') or '').strip()
+        market = (request.args.get('market') or 'twse').strip().lower()
         page = request.args.get('page', default=1, type=int) or 1
         page_size = request.args.get('pageSize', default=50, type=int) or 50
 
@@ -5891,11 +8544,26 @@ def query_warrants():
             return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
 
         try:
+            db_manager.create_tables()
             cursor = db_manager.connection.cursor()
 
             target_date = date_str
             if not target_date:
-                cursor.execute("SELECT MAX(trade_date) AS latest FROM tw_warrant_trade")
+                if market == 'tpex':
+                    cursor.execute("SELECT MAX(trade_date) AS latest FROM tpex_warrant_daily_quotes")
+                elif market in {'both', 'all'}:
+                    cursor.execute(
+                        """
+                        SELECT MAX(trade_date) AS latest
+                        FROM (
+                            SELECT trade_date FROM tw_warrant_trade
+                            UNION ALL
+                            SELECT trade_date FROM tpex_warrant_daily_quotes
+                        ) t
+                        """
+                    )
+                else:
+                    cursor.execute("SELECT MAX(trade_date) AS latest FROM tw_warrant_trade")
                 row = cursor.fetchone()
                 latest = None
                 if row:
@@ -5921,15 +8589,86 @@ def query_warrants():
             params: list = [target_date]
 
             if keyword:
-                where_clauses.append("(warrant_code ILIKE %s OR warrant_name ILIKE %s)")
                 pattern = f"%{keyword}%"
-                params.extend([pattern, pattern])
+                if market == 'tpex':
+                    where_clauses.append("(warrant_code ILIKE %s OR warrant_name ILIKE %s OR underlying_code ILIKE %s OR underlying_name ILIKE %s)")
+                    params.extend([pattern, pattern, pattern, pattern])
+                elif market in {'both', 'all'}:
+                    where_clauses.append("(warrant_code ILIKE %s OR warrant_name ILIKE %s OR underlying_code ILIKE %s OR underlying_name ILIKE %s)")
+                    params.extend([pattern, pattern, pattern, pattern])
+                else:
+                    where_clauses.append("(warrant_code ILIKE %s OR warrant_name ILIKE %s)")
+                    params.extend([pattern, pattern])
 
             where_sql = " WHERE " + " AND ".join(where_clauses)
 
-            # 統計總筆數
+            if market == 'tpex':
+                base_sql = f"""
+                    SELECT
+                        'TPEX' AS market,
+                        trade_date,
+                        warrant_code,
+                        warrant_name,
+                        underlying_code,
+                        underlying_name,
+                        trade_value,
+                        trade_volume
+                    FROM tpex_warrant_daily_quotes
+                    {where_sql}
+                """
+            elif market in {'both', 'all'}:
+                base_sql = f"""
+                    SELECT
+                        market,
+                        trade_date,
+                        warrant_code,
+                        warrant_name,
+                        underlying_code,
+                        underlying_name,
+                        trade_value,
+                        trade_volume
+                    FROM (
+                        SELECT
+                            'TWSE' AS market,
+                            trade_date,
+                            warrant_code,
+                            warrant_name,
+                            NULL::VARCHAR(20) AS underlying_code,
+                            NULL::VARCHAR(100) AS underlying_name,
+                            turnover AS trade_value,
+                            volume AS trade_volume
+                        FROM tw_warrant_trade
+                        UNION ALL
+                        SELECT
+                            'TPEX' AS market,
+                            trade_date,
+                            warrant_code,
+                            warrant_name,
+                            underlying_code,
+                            underlying_name,
+                            trade_value,
+                            trade_volume
+                        FROM tpex_warrant_daily_quotes
+                    ) merged
+                    {where_sql}
+                """
+            else:
+                base_sql = f"""
+                    SELECT
+                        'TWSE' AS market,
+                        trade_date,
+                        warrant_code,
+                        warrant_name,
+                        NULL::VARCHAR(20) AS underlying_code,
+                        NULL::VARCHAR(100) AS underlying_name,
+                        turnover AS trade_value,
+                        volume AS trade_volume
+                    FROM tw_warrant_trade
+                    {where_sql}
+                """
+
             cursor.execute(
-                f"SELECT COUNT(*) AS cnt FROM tw_warrant_trade{where_sql}",
+                f"SELECT COUNT(*) AS cnt FROM ({base_sql}) q",
                 params,
             )
             row = cursor.fetchone()
@@ -5939,20 +8678,21 @@ def query_warrants():
                 total = row[0] if row else 0
             total = int(total or 0)
 
-            # 查詢實際資料
             params_with_paging = list(params) + [page_size, offset]
             cursor.execute(
                 f"""
                 SELECT
+                    market,
                     trade_date,
                     warrant_code,
                     warrant_name,
-                    turnover,
-                    volume
-                FROM tw_warrant_trade
-                {where_sql}
-                ORDER BY turnover DESC NULLS LAST,
-                         volume DESC NULLS LAST,
+                    underlying_code,
+                    underlying_name,
+                    trade_value,
+                    trade_volume
+                FROM ({base_sql}) q
+                ORDER BY trade_value DESC NULLS LAST,
+                         trade_volume DESC NULLS LAST,
                          warrant_code ASC
                 LIMIT %s OFFSET %s
                 """,
@@ -5965,13 +8705,16 @@ def query_warrants():
         data = []
         for row in rows:
             if isinstance(row, dict):
+                market_name = row.get('market')
                 tdate = row.get('trade_date')
                 code = row.get('warrant_code')
                 name = row.get('warrant_name')
-                turnover = row.get('turnover')
-                volume = row.get('volume')
+                underlying_code = row.get('underlying_code')
+                underlying_name = row.get('underlying_name')
+                trade_value = row.get('trade_value')
+                trade_volume = row.get('trade_volume')
             else:
-                tdate, code, name, turnover, volume = row
+                market_name, tdate, code, name, underlying_code, underlying_name, trade_value, trade_volume = row
 
             if isinstance(tdate, (datetime, date)):
                 tdate_str = tdate.strftime('%Y-%m-%d')
@@ -5981,21 +8724,26 @@ def query_warrants():
                 tdate_str = None
 
             try:
-                turnover_val = float(turnover) if turnover is not None else None
+                trade_value_val = float(trade_value) if trade_value is not None else None
             except Exception:
-                turnover_val = None
+                trade_value_val = None
 
             try:
-                volume_val = int(volume) if volume is not None else None
+                trade_volume_val = int(trade_volume) if trade_volume is not None else None
             except Exception:
-                volume_val = None
+                trade_volume_val = None
 
             data.append({
+                'market': market_name,
                 'trade_date': tdate_str,
                 'warrant_code': code,
                 'warrant_name': name,
-                'turnover': turnover_val,
-                'volume': volume_val,
+                'underlying_code': underlying_code,
+                'underlying_name': underlying_name,
+                'trade_value': trade_value_val,
+                'trade_volume': trade_volume_val,
+                'turnover': trade_value_val,
+                'volume': trade_volume_val,
             })
 
         return jsonify({
@@ -6005,6 +8753,7 @@ def query_warrants():
             'page': page,
             'pageSize': page_size,
             'date': target_date,
+            'market': market,
         })
     except Exception as e:
         logger.exception('查詢權證資料失敗')
@@ -6297,6 +9046,8 @@ def fetch_revenue_range_api():
         end = request.args.get('end')
         market = request.args.get('market', 'both')
         sleep_param = request.args.get('sleep')
+        include_data_flag = (request.args.get('include_data', 'false').lower() == 'true')
+        max_records_param = request.args.get('max_records')
 
         if not start or not end:
             return jsonify({'success': False, 'error': '需要 start 與 end 參數 (YYYY-MM)'}), 400
@@ -6333,11 +9084,20 @@ def fetch_revenue_range_api():
         except ValueError:
             sleep_seconds = 1.0
 
+        try:
+            max_records = int(max_records_param) if max_records_param is not None else 2000
+        except Exception:
+            max_records = 2000
+        if max_records < 0:
+            max_records = 0
+
         persist_flag = (request.args.get('persist', 'true').lower() != 'false')
 
         total_inserted = 0
         total_records = 0
         monthly_stats = []
+        merged_records: list[dict] = []
+        total_per_market = {'TWSE': 0, 'TPEX': 0}
 
         db_manager = None
         if persist_flag:
@@ -6368,8 +9128,23 @@ def fetch_revenue_range_api():
                         logger.exception('月營收歷史資料寫入失敗')
                         month_inserted = 0
 
+                if include_data_flag and records and max_records != 0:
+                    if max_records > 0:
+                        remaining = max_records - len(merged_records)
+                        if remaining > 0:
+                            merged_records.extend(records[:remaining])
+                    else:
+                        merged_records.extend(records)
+
                 total_inserted += month_inserted
                 total_records += len(records)
+
+                try:
+                    per_market = summary.get('per_market') or {}
+                    total_per_market['TWSE'] += int(per_market.get('TWSE') or 0)
+                    total_per_market['TPEX'] += int(per_market.get('TPEX') or 0)
+                except Exception:
+                    pass
 
                 monthly_stats.append({
                     'year': summary.get('year'),
@@ -6386,9 +9161,13 @@ def fetch_revenue_range_api():
             summary_out = {
                 'start': start,
                 'end': end,
+                'period': f"{start} ~ {end}",
                 'monthsProcessed': len(months),
+                'total_records': total_records,
+                'per_market': total_per_market,
                 'totalInserted': total_inserted,
                 'persist_enabled': persist_flag,
+                'include_data': include_data_flag,
             }
 
             return jsonify({
@@ -6396,6 +9175,7 @@ def fetch_revenue_range_api():
                 'summary': summary_out,
                 'monthly_stats': monthly_stats,
                 'count': total_records,
+                'data': merged_records if include_data_flag else [],
             })
         finally:
             if db_manager is not None:
@@ -6688,6 +9468,7 @@ def get_stock_prices(symbol):
     try:
         start_date = request.args.get('start')
         end_date = request.args.get('end')
+        table_override = request.args.get('table')
 
         # 如果是台灣加權指數，直接從 API 抓取
         if symbol == '^TWII':
@@ -6801,7 +9582,7 @@ def get_stock_prices(symbol):
             })
 
         # 對於其他股票，從資料庫查詢
-        db_manager = DatabaseManager.from_request_payload(data)
+        db_manager = DatabaseManager.from_request_args(request.args)
         if not db_manager.connect():
             return jsonify({
                 'success': False,
@@ -6811,6 +9592,8 @@ def get_stock_prices(symbol):
         try:
             cursor = db_manager.connection.cursor()
             prices_table = db_manager.table_prices
+            if table_override:
+                prices_table = _resolve_table_override(cursor, str(table_override).strip())
 
             # 先檢查表是否存在並獲取欄位資訊
             cursor.execute(
@@ -6861,25 +9644,21 @@ def get_stock_prices(symbol):
             
             # 根據實際欄位構建查詢
             if 'open_price' in columns:
-                query = f"""
-                    SELECT date, open_price, high_price, low_price, close_price, volume
-                    FROM {prices_table} 
-                    WHERE symbol = %s
-                """
+                query = sql.SQL(
+                    "SELECT date, open_price, high_price, low_price, close_price, volume FROM {} WHERE symbol = %s"
+                ).format(sql.Identifier(prices_table))
             else:
                 # 如果沒有 open_price 等欄位，可能是舊的表結構
-                query = f"""
-                    SELECT date, close_price, volume
-                    FROM {prices_table} 
-                    WHERE symbol = %s
-                """
+                query = sql.SQL(
+                    "SELECT date, close_price, volume FROM {} WHERE symbol = %s"
+                ).format(sql.Identifier(prices_table))
             
             # 支援多種股票代碼格式查詢
             # 如果輸入的是純數字代碼，嘗試匹配完整格式
             if symbol.isdigit():
                 # 先嘗試直接查詢，如果沒有結果，再嘗試添加後綴
                 cursor.execute(
-                    f"SELECT COUNT(*) FROM {prices_table} WHERE symbol = %s",
+                    sql.SQL("SELECT COUNT(*) FROM {} WHERE symbol = %s").format(sql.Identifier(prices_table)),
                     [symbol]
                 )
                 result = cursor.fetchone()
@@ -6888,11 +9667,9 @@ def get_stock_prices(symbol):
                 if count == 0:
                     # 嘗試查找帶有 .TW 或 .TWO 後綴的股票
                     cursor.execute(
-                        f"""
-                        SELECT symbol FROM {prices_table} 
-                        WHERE symbol IN (%s, %s) 
-                        LIMIT 1
-                        """,
+                        sql.SQL(
+                            "SELECT symbol FROM {} WHERE symbol IN (%s, %s) LIMIT 1"
+                        ).format(sql.Identifier(prices_table)),
                         [f"{symbol}.TW", f"{symbol}.TWO"]
                     )
                     
@@ -6905,15 +9682,15 @@ def get_stock_prices(symbol):
             params = [symbol]
             
             if start_date:
-                query += " AND date >= %s"
+                query = sql.Composed([query, sql.SQL(" AND date >= %s")])
                 params.append(start_date)
-            
+
             if end_date:
-                query += " AND date <= %s"
+                query = sql.Composed([query, sql.SQL(" AND date <= %s")])
                 params.append(end_date)
-                
-            query += " ORDER BY date ASC"
-            
+
+            query = sql.Composed([query, sql.SQL(" ORDER BY date ASC")])
+
             cursor.execute(query, params)
             results = cursor.fetchall()
             
@@ -6976,6 +9753,7 @@ def get_stock_returns(symbol):
     try:
         start_date = request.args.get('start')
         end_date = request.args.get('end')
+        table_override = request.args.get('table')
         
         # 連接資料庫
         db_manager = DatabaseManager.from_request_args(request.args)
@@ -6987,29 +9765,35 @@ def get_stock_returns(symbol):
         
         try:
             cursor = db_manager.connection.cursor()
+
+            returns_table = db_manager.table_returns
+            if table_override:
+                returns_table = _resolve_table_override(cursor, str(table_override).strip())
             
             # 構建查詢語句
-            query = """
-                SELECT date, daily_return, weekly_return, monthly_return, cumulative_return
-                FROM tw_stock_returns 
-                WHERE symbol = %s
-            """
+            query = sql.SQL(
+                "SELECT date, daily_return, weekly_return, monthly_return, cumulative_return FROM {} WHERE symbol = %s"
+            ).format(sql.Identifier(returns_table))
             
             # 支援多種股票代碼格式查詢
             # 如果輸入的是純數字代碼，嘗試匹配完整格式
             if symbol.isdigit():
                 # 先嘗試直接查詢，如果沒有結果，再嘗試添加後綴
-                cursor.execute("SELECT COUNT(*) FROM tw_stock_returns WHERE symbol = %s", [symbol])
+                cursor.execute(
+                    sql.SQL("SELECT COUNT(*) FROM {} WHERE symbol = %s").format(sql.Identifier(returns_table)),
+                    [symbol],
+                )
                 result = cursor.fetchone()
                 count = result[0] if isinstance(result, (list, tuple)) else result.get('count', 0)
                 
                 if count == 0:
                     # 嘗試查找帶有 .TW 或 .TWO 後綴的股票
-                    cursor.execute("""
-                        SELECT symbol FROM tw_stock_returns 
-                        WHERE symbol IN (%s, %s) 
-                        LIMIT 1
-                    """, [f"{symbol}.TW", f"{symbol}.TWO"])
+                    cursor.execute(
+                        sql.SQL("SELECT symbol FROM {} WHERE symbol IN (%s, %s) LIMIT 1").format(
+                            sql.Identifier(returns_table)
+                        ),
+                        [f"{symbol}.TW", f"{symbol}.TWO"],
+                    )
                     
                     result = cursor.fetchone()
                     if result:
@@ -7020,15 +9804,15 @@ def get_stock_returns(symbol):
             params = [symbol]
             
             if start_date:
-                query += " AND date >= %s"
+                query = sql.Composed([query, sql.SQL(" AND date >= %s")])
                 params.append(start_date)
             
             if end_date:
-                query += " AND date <= %s"
+                query = sql.Composed([query, sql.SQL(" AND date <= %s")])
                 params.append(end_date)
-                
-            query += " ORDER BY date ASC"
-            
+
+            query = sql.Composed([query, sql.SQL(" ORDER BY date ASC")])
+
             cursor.execute(query, params)
             results = cursor.fetchall()
             
@@ -7105,6 +9889,7 @@ def compute_returns_api():
             return jsonify({'success': False, 'error': '需要 JSON body'}), 400
 
         body = request.get_json() or {}
+        symbols = body.get('symbols')
         symbol = body.get('symbol')
         start = body.get('start')
         end = body.get('end')
@@ -7113,9 +9898,16 @@ def compute_returns_api():
         fill_missing = bool(body.get('fillMissing', body.get('fill_missing', False)))
         use_local_db = bool(body.get('use_local_db', False))
         upload_to_neon = bool(body.get('upload_to_neon', False))
+        batch_size = body.get('batch_size')
+        max_workers = body.get('max_workers')
 
-        # 若未提供 symbol 且未指定 all，就預設 all=true
-        if not symbol and not all_flag:
+        if isinstance(symbols, list):
+            symbols = [s for s in symbols if isinstance(s, str) and s.strip()]
+        else:
+            symbols = None
+
+        # 若未提供 symbol/symbols 且未指定 all，就預設 all=true
+        if not symbol and not symbols and not all_flag:
             all_flag = True
 
         # use_local_db=True 表示使用本地資料庫，use_neon=False
@@ -7123,6 +9915,7 @@ def compute_returns_api():
         use_neon = not use_local_db
 
         result = compute_returns_task(
+            symbols=symbols,
             symbol=symbol,
             start=start,
             end=end,
@@ -7131,6 +9924,8 @@ def compute_returns_api():
             fill_missing=fill_missing,
             use_neon=use_neon,
             upload_to_neon=upload_to_neon,
+            batch_size=batch_size,
+            max_workers=max_workers,
         )
         return jsonify({'success': True, **result})
     except Exception as e:
@@ -7151,6 +9946,12 @@ def compute_returns_stream():
                 return val
             return str(val).lower() in ('1', 'true', 'yes', 'on')
 
+        symbols = params.getlist('symbols') if hasattr(params, 'getlist') else None
+        if symbols:
+            symbols = [s for s in symbols if isinstance(s, str) and s.strip()]
+        else:
+            symbols = None
+
         symbol = params.get('symbol')
         start = params.get('start')
         end = params.get('end')
@@ -7160,8 +9961,18 @@ def compute_returns_stream():
         fill_missing = _to_bool(params.get('fillMissing') or params.get('fill_missing'), False)
         use_local_db = _to_bool(params.get('use_local_db'), False)
         upload_to_neon = _to_bool(params.get('upload_to_neon'), False)
+        batch_size = params.get('batch_size')
+        max_workers = params.get('max_workers')
+        try:
+            batch_size = int(batch_size) if batch_size not in (None, '', 'null') else None
+        except Exception:
+            batch_size = None
+        try:
+            max_workers = int(max_workers) if max_workers not in (None, '', 'null') else None
+        except Exception:
+            max_workers = None
 
-        if not symbol and not all_flag:
+        if not symbol and not symbols and not all_flag:
             all_flag = True
 
         use_neon = not use_local_db
@@ -7177,6 +9988,7 @@ def compute_returns_stream():
         def run_task():
             try:
                 result = compute_returns_task(
+                    symbols=symbols,
                     symbol=symbol,
                     start=start,
                     end=end,
@@ -7185,6 +9997,8 @@ def compute_returns_stream():
                     fill_missing=fill_missing,
                     use_neon=use_neon,
                     upload_to_neon=upload_to_neon,
+                    batch_size=batch_size,
+                    max_workers=max_workers,
                     progress_callback=progress_callback,
                 )
                 progress_queue.put({'event': 'summary', 'summary': result})
@@ -7199,19 +10013,26 @@ def compute_returns_stream():
         worker.start()
 
         def event_stream():
-            # 先送出握手訊息
-            yield f"data: {json.dumps({'event': 'connected'})}\n\n"
+            # 心跳避免前端斷線
+            heartbeat_interval = 10
+            last_heartbeat = time.time()
             while True:
-                item = progress_queue.get()
-                if item is None:
-                    break
                 try:
-                    payload = json.dumps(item, ensure_ascii=False)
-                except TypeError as encode_err:
-                    logger.exception('progress encode 失敗: %s', encode_err)
-                    payload = json.dumps({'event': 'error', 'error': 'encode_failed'})
-                yield f"data: {payload}\n\n"
-
+                    item = progress_queue.get(timeout=1)
+                    if item is None:
+                        break
+                    try:
+                        payload = json.dumps(item, ensure_ascii=False)
+                    except TypeError as encode_err:
+                        logger.exception('progress encode 失敗: %s', encode_err)
+                        payload = json.dumps({'event': 'error', 'error': 'encode_failed'})
+                    yield f"data: {payload}\n\n"
+                except Exception:
+                    pass
+                now = time.time()
+                if now - last_heartbeat >= heartbeat_interval:
+                    last_heartbeat = now
+                    yield "data: {\"event\":\"heartbeat\"}\n\n"
         headers = {
             'Content-Type': 'text/event-stream; charset=utf-8',
             'Cache-Control': 'no-cache, no-transform',
@@ -7227,8 +10048,12 @@ def compute_returns_stream():
 def update_stocks():
     """批量更新股票數據"""
     db_manager = None
+    acquired_update_lock = update_lock.acquire(blocking=False)
+    if not acquired_update_lock:
+        logger.warning("已有 /api/update 流程正在執行，拒絕並行請求")
+        return jsonify({'success': False, 'error': '已有更新作業正在執行，請稍後再試'}), 429
     try:
-        index_symbol = '^TWII'
+        index_symbols = None
 
         def _parse_date_str(val: str | None):
             if not val:
@@ -7257,7 +10082,7 @@ def update_stocks():
                 'success': False,
                 'error': '請求必須是 JSON 格式'
             }), 400
-            
+        
         data = request.get_json()
         if data is None:
             return jsonify({
@@ -7274,25 +10099,42 @@ def update_stocks():
         respect_requested_range = bool(data.get('respect_requested_range', False))
         # 新增：是否使用批量抓取模式（預設 True，可提升速度）
         use_batch_mode = bool(data.get('use_batch_mode', True))
-        # 僅抓取股價資料，停用報酬率計算
-        update_returns = False
+        # 是否同步計算報酬率（預設啟用）
+        update_returns = bool(data.get('update_returns', True))
         # ⚠️ 預設不再同步加權指數，僅在明確指定 fetch_market_index=true 時才執行
         fetch_market_index = bool(data.get('fetch_market_index', False))
+        # 指定要同步哪些市場指數（例如 ['^OTC']），未指定時預設同時同步 ^TWII 與 ^OTC
+        if index_symbols is None:
+            try:
+                req_indices = data.get('index_symbols') if isinstance(data, dict) else None
+                if isinstance(req_indices, list) and req_indices:
+                    index_symbols = [str(s) for s in req_indices]
+                else:
+                    index_symbols = ['^TWII', '^OTC'] if fetch_market_index else []
+            except Exception:
+                index_symbols = ['^TWII', '^OTC'] if fetch_market_index else []
+        # 若只想同步市場指數（例如 ^TWII / ^OTC），避免 symbols 為空時自動載入股票清單
+        only_market_index = bool(data.get('only_market_index', False))
         
         if not symbols:
-            # 如果沒有指定股票，獲取所有股票
-            try:
-                all_symbols = stock_api.get_all_symbols()
-                symbols = [s['symbol'] for s in all_symbols[:50]]  # 限制50檔避免超時
-            except Exception as e:
-                logger.error(f"獲取股票代碼失敗: {e}")
-                return jsonify({
-                    'success': False,
-                    'error': f'獲取股票代碼失敗: {str(e)}'
-                }), 500
+            if only_market_index and fetch_market_index:
+                symbols = []
+            else:
+                # 如果沒有指定股票，獲取所有股票
+                try:
+                    all_symbols = stock_api.get_all_symbols()
+                    symbols = [s['symbol'] for s in all_symbols[:50]]  # 限制50檔避免超時
+                except Exception as e:
+                    logger.error(f"獲取股票代碼失敗: {e}")
+                    return jsonify({
+                        'success': False,
+                        'error': f'獲取股票代碼失敗: {str(e)}'
+                    }), 500
         
         results = []
         errors = []
+        missing_symbols_batch = []
+        missing_symbols_individual = []
         
         # 連接資料庫
         db_manager = DatabaseManager.from_request_payload(data)
@@ -7312,6 +10154,8 @@ def update_stocks():
                 'error': '資料庫連接物件為空'
             }), 500
         
+        cursor = None
+
         # 確保資料庫表格存在
         try:
             db_manager.create_tables()
@@ -7322,7 +10166,64 @@ def update_stocks():
                 'success': False,
                 'error': f'建立資料庫表格失敗: {str(e)}'
             }), 500
+
+        def _reconnect_db():
+            nonlocal cursor
+            try:
+                if cursor is not None:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+                    cursor = None
+                db_manager.disconnect()
+            except Exception:
+                pass
+            if not db_manager.connect():
+                raise RuntimeError('資料庫重新連線失敗')
+            db_manager.create_tables()
+            cursor = db_manager.connection.cursor()
+
+        def _execute_values_with_retry(upsert_sql, values, *, page_size=1000, max_retries=1):
+            last_err = None
+            for attempt in range(max_retries + 1):
+                try:
+                    if db_manager.connection is None or getattr(db_manager.connection, 'closed', 1) != 0:
+                        _reconnect_db()
+                    cur_local = db_manager.connection.cursor()
+                    try:
+                        execute_values(cur_local, upsert_sql, values, page_size=page_size)
+                        db_manager.connection.commit()
+                        return
+                    finally:
+                        try:
+                            cur_local.close()
+                        except Exception:
+                            pass
+                except psycopg2.Error as e:
+                    last_err = e
+                    msg = str(e)
+                    # 若交易已中止，必須先 rollback，否則後續 SQL 會全部被拒絕
+                    try:
+                        if db_manager.connection is not None:
+                            db_manager.connection.rollback()
+                    except Exception:
+                        pass
+                    retryable = (
+                        isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError))
+                        or 'connection already closed' in msg
+                        or 'cursor already closed' in msg
+                        or 'SSL connection has been closed unexpectedly' in msg
+                        or 'current transaction is aborted' in msg
+                    )
+                    if attempt >= max_retries or not retryable:
+                        raise
+                    try:
+                        _reconnect_db()
+                    except Exception:
+                        raise last_err
         
+        returns_started = False
         try:
             # 再次確認連接狀態
             if db_manager.connection is None:
@@ -7338,172 +10239,114 @@ def update_stocks():
             # 預先查詢每個 symbol 在 prices/returns 的最新日期，用於增量更新
             latest_price_date_map = {}
             try:
-                # 使用單次查詢獲取所有 symbols 的最新日期
-                placeholders = ','.join(['%s'] * len(symbols))
-                cursor.execute(f"""
-                    SELECT symbol, MAX(date) AS max_date
-                    FROM tw_stock_prices
-                    WHERE symbol IN ({placeholders})
-                    GROUP BY symbol
-                """, symbols)
-                for row in cursor.fetchall():
-                    # row 是 RealDictCursor，鍵為 'symbol', 'max_date'
-                    latest_price_date_map[row['symbol']] = row['max_date']
+                if symbols:
+                    # 使用單次查詢獲取所有 symbols 的最新日期
+                    placeholders = ','.join(['%s'] * len(symbols))
+                    cursor.execute(f"""
+                        SELECT symbol, MAX(date) AS max_date
+                        FROM {prices_table}
+                        WHERE symbol IN ({placeholders})
+                        GROUP BY symbol
+                    """, symbols)
+                    for row in cursor.fetchall():
+                        # row 是 RealDictCursor，鍵為 'symbol', 'max_date'
+                        latest_price_date_map[row['symbol']] = row['max_date']
             except Exception as e:
+                # 若前序 SQL 失敗導致交易中止，必須 rollback 才能繼續執行後續指數同步
+                if isinstance(e, psycopg2.Error):
+                    try:
+                        db_manager.connection.rollback()
+                    except Exception:
+                        pass
                 logger.warning(f"查詢最新股價日期失敗，將以請求日期為準: {e}")
                 latest_price_date_map = {}
 
-            # 同步加權指數的資料範圍
-            index_sync_summary = None
+            # 同步市場指數的資料範圍（加權、櫃買）
+            index_sync_summary = []
             if update_prices and fetch_market_index:
-                try:
-                    cursor.execute(
-                        "SELECT MAX(date) AS max_date FROM tw_stock_prices WHERE symbol = %s",
-                        (index_symbol,)
-                    )
-                    row = cursor.fetchone() or {}
-                    latest_index_date = row.get('max_date') if isinstance(row, dict) else (row[0] if row else None)
-
-                    requested_start = force_start_date or start_date or DEFAULT_START_DATE
-                    requested_end = end_date or datetime.now().strftime('%Y-%m-%d')
-
-                    effective_index_start = requested_start
-                    if respect_requested_range and start_date:
-                        effective_index_start = start_date
-                    elif not force_full_refresh and latest_index_date is not None:
+                for index_symbol in index_symbols:
+                    try:
+                        # 若交易處於 aborted 狀態，先 rollback 以恢復可用狀態
                         try:
-                            next_day = (latest_index_date + timedelta(days=1)).strftime('%Y-%m-%d')
-                            if next_day > effective_index_start:
-                                effective_index_start = next_day
+                            if getattr(db_manager, 'connection', None) is not None:
+                                db_manager.connection.rollback()
                         except Exception:
                             pass
-
-                    if effective_index_start and requested_end and effective_index_start <= requested_end:
-                        logger.info(
-                            f"同步加權指數 {index_symbol}，日期範圍: {effective_index_start} ~ {requested_end}"
+                        cursor.execute(
+                            f"SELECT MAX(date) AS max_date FROM {prices_table} WHERE symbol = %s",
+                            (index_symbol,)
                         )
-                        index_data = stock_api.fetch_stock_data(index_symbol, effective_index_start, requested_end)
-                        if index_data is not None:
-                            if isinstance(index_data, pd.DataFrame):
-                                raw_records = index_data.to_dict('records')
-                            else:
-                                raw_records = index_data if isinstance(index_data, list) else []
+                        row = cursor.fetchone() or {}
+                        latest_index_date = row.get('max_date') if isinstance(row, dict) else (row[0] if row else None)
 
-                            rows = []
+                        requested_start = force_start_date or start_date or DEFAULT_START_DATE
+                        requested_end = end_date or datetime.now().strftime('%Y-%m-%d')
 
-                            def _to_float(val):
-                                if val in (None, '', '--', '---'):
-                                    return None
-                                try:
-                                    return float(val)
-                                except Exception:
-                                    try:
-                                        return float(str(val).replace(',', ''))
-                                    except Exception:
+                        effective_index_start = requested_start
+                        if respect_requested_range and start_date:
+                            effective_index_start = start_date
+                        elif not force_full_refresh and latest_index_date is not None:
+                            try:
+                                next_day = (latest_index_date + timedelta(days=1)).strftime('%Y-%m-%d')
+                                if next_day > effective_index_start:
+                                    effective_index_start = next_day
+                            except Exception:
+                                pass
+
+                        if effective_index_start and requested_end and effective_index_start <= requested_end:
+                            logger.info(
+                                f"同步市場指數 {index_symbol}，日期範圍: {effective_index_start} ~ {requested_end}"
+                            )
+                            index_data = stock_api.fetch_stock_data(index_symbol, effective_index_start, requested_end)
+                            if index_data is not None:
+                                if isinstance(index_data, pd.DataFrame):
+                                    raw_records = index_data.to_dict('records')
+                                else:
+                                    raw_records = index_data if isinstance(index_data, list) else []
+
+                                rows = []
+
+                                def _to_float(val):
+                                    if val in (None, '', '--', '---'):
                                         return None
-
-                            def _to_int(val):
-                                if val in (None, '', '--', '---'):
-                                    return 0
-                                try:
-                                    return int(val)
-                                except Exception:
                                     try:
-                                        return int(float(str(val).replace(',', '')))
+                                        return float(val)
                                     except Exception:
+                                        try:
+                                            return float(str(val).replace(',', ''))
+                                        except Exception:
+                                            return None
+
+                                def _to_int(val):
+                                    if val in (None, '', '--', '---'):
                                         return 0
+                                    try:
+                                        return int(val)
+                                    except Exception:
+                                        try:
+                                            return int(float(str(val).replace(',', '')))
+                                        except Exception:
+                                            return 0
 
-                            for rec in raw_records:
-                                if not isinstance(rec, dict):
-                                    continue
-                                date_val = _normalize_date(rec.get('date') or rec.get('Date'))
-                                if not date_val:
-                                    continue
-                                rows.append((
-                                    index_symbol,
-                                    date_val,
-                                    _to_float(rec.get('open_price') or rec.get('Open') or rec.get('open')),
-                                    _to_float(rec.get('high_price') or rec.get('High') or rec.get('high')),
-                                    _to_float(rec.get('low_price') or rec.get('Low') or rec.get('low')),
-                                    _to_float(rec.get('close_price') or rec.get('Close') or rec.get('close')),
-                                    _to_int(rec.get('volume') or rec.get('Volume'))
-                                ))
+                                for rec in raw_records:
+                                    if not isinstance(rec, dict):
+                                        continue
+                                    date_val = _normalize_date(rec.get('date') or rec.get('Date'))
+                                    if not date_val:
+                                        continue
+                                    rows.append(
+                                        (
+                                            index_symbol,
+                                            date_val,
+                                            _to_float(rec.get('open_price') or rec.get('Open') or rec.get('open')),
+                                            _to_float(rec.get('high_price') or rec.get('High') or rec.get('high')),
+                                            _to_float(rec.get('low_price') or rec.get('Low') or rec.get('low')),
+                                            _to_float(rec.get('close_price') or rec.get('Close') or rec.get('close')),
+                                            _to_int(rec.get('volume') or rec.get('Volume'))
+                                        )
+                                    )
 
-                            if rows:
-                                execute_values(
-                                    cursor,
-                                    f"""
-                                    INSERT INTO {prices_table} (symbol, date, open_price, high_price, low_price, close_price, volume)
-                                    VALUES %s
-                                    ON CONFLICT (symbol, date) DO UPDATE SET
-                                        open_price = EXCLUDED.open_price,
-                                        high_price = EXCLUDED.high_price,
-                                        low_price = EXCLUDED.low_price,
-                                        close_price = EXCLUDED.close_price,
-                                        volume = EXCLUDED.volume
-                                    """,
-                                    rows,
-                                    page_size=500
-                                )
-                                db_manager.connection.commit()
-                                index_sync_summary = {
-                                    'symbol': index_symbol,
-                                    'status': 'success',
-                                    'prices_updated': len(rows),
-                                    'mode': 'index'
-                                }
-                                logger.info(f"加權指數同步完成，寫入 {len(rows)} 筆資料")
-                            else:
-                                logger.info("加權指數資料為空，略過寫入")
-                        else:
-                            logger.warning("加權指數抓取結果為 None，略過寫入")
-                    else:
-                        logger.info("加權指數無需更新（起始日期晚於結束日期）")
-                except Exception as index_exc:
-                    logger.exception(f"同步加權指數失敗: {index_exc}")
-                    errors.append({'symbol': index_symbol, 'error': str(index_exc)})
-
-            # 🚀 批量抓取模式：一次性抓取所有股票
-            if update_prices and use_batch_mode and len(symbols) > 1:
-                logger.info(f"🚀 啟用批量抓取模式，準備抓取 {len(symbols)} 檔股票")
-                
-                # 過濾出上市股票代碼（去除 .TW 後綴）
-                twse_codes = []
-                for sym in symbols:
-                    if '.TW' in sym:
-                        code = sym.split('.')[0]
-                        if code.isdigit():
-                            twse_codes.append(code)
-                
-                if twse_codes:
-                    # 決定實際開始日期
-                    effective_start_date = force_start_date or start_date
-                    if not end_date:
-                        end_date = datetime.now().strftime('%Y-%m-%d')
-                    
-                    logger.info(f"批量抓取 {len(twse_codes)} 檔上市股票，日期範圍: {effective_start_date} ~ {end_date}")
-                    
-                    # 批量抓取
-                    batch_data = stock_api.fetch_twse_stock_data_batch(twse_codes, effective_start_date, end_date)
-                    
-                    # 將批量數據寫入資料庫
-                    for stock_code, price_records in batch_data.items():
-                        symbol = f"{stock_code}.TW"
-                        try:
-                            if price_records:
-                                values = []
-                                for pr in price_records:
-                                    values.append((
-                                        symbol,
-                                        pr.get('Date'),
-                                        pr.get('Open'),
-                                        pr.get('High'),
-                                        pr.get('Low'),
-                                        pr.get('Close'),
-                                        pr.get('Volume')
-                                    ))
-                                
-                                if values:
+                                if rows:
                                     upsert_sql = f"""
                                         INSERT INTO {prices_table} (symbol, date, open_price, high_price, low_price, close_price, volume)
                                         VALUES %s
@@ -7514,25 +10357,31 @@ def update_stocks():
                                             close_price = EXCLUDED.close_price,
                                             volume = EXCLUDED.volume
                                     """
-                                    execute_values(cursor, upsert_sql, values, page_size=1000)
-                                    db_manager.connection.commit()
-                                    
-                                    results.append({
-                                        'symbol': symbol,
+                                    _execute_values_with_retry(upsert_sql, rows, page_size=500)
+                                    index_sync_summary.append({
+                                        'symbol': index_symbol,
                                         'status': 'success',
-                                        'prices_updated': len(values),
-                                        'mode': 'batch'
+                                        'prices_updated': len(rows),
+                                        'mode': 'index'
                                     })
-                                    logger.info(f"✅ {symbol} 批量寫入 {len(values)} 筆")
-                        except Exception as e:
-                            logger.error(f"批量寫入 {symbol} 失敗: {e}")
-                            errors.append({'symbol': symbol, 'error': str(e)})
-                    
-                    logger.info(f"🎉 批量抓取完成，成功處理 {len(results)} 檔股票")
-            
-            # 🔄 逐檔抓取模式（備用或非批量模式）
-            else:
-                for i, symbol in enumerate(symbols):
+                                    logger.info(f"{index_symbol} 指數同步完成，寫入 {len(rows)} 筆資料")
+                                else:
+                                    logger.info(f"{index_symbol} 指數資料為空，略過寫入")
+                            else:
+                                logger.info(f"{index_symbol} 指數抓取結果為 None，略過寫入")
+                        else:
+                            logger.info(f"{index_symbol} 指數無需更新（起始日期晚於結束日期）")
+                    except Exception as index_exc:
+                        logger.exception(f"同步指數 {index_symbol} 失敗: {index_exc}")
+                        if isinstance(index_exc, psycopg2.Error):
+                            try:
+                                db_manager.connection.rollback()
+                            except Exception:
+                                pass
+                        errors.append({'symbol': index_symbol, 'error': str(index_exc)})
+
+            def _process_symbols_individual(symbols_to_process):
+                for i, symbol in enumerate(symbols_to_process):
                     try:
                         result = {'symbol': symbol, 'status': 'success'}
                         
@@ -7589,18 +10438,24 @@ def update_stocks():
 
                                 # 準備批量資料
                                 values = []
+                                dedup = {}
                                 for pr in price_records:
                                     record_date = pr.get('date') or pr.get('Date')
-                                    dates.append(record_date)
-                                    values.append((
+                                    if not record_date:
+                                        continue
+                                    key = (symbol, str(record_date)[:10])
+                                    dedup[key] = (
                                         symbol,
-                                        record_date,
+                                        str(record_date)[:10],
                                         pr.get('open_price') or pr.get('Open'),
                                         pr.get('high_price') or pr.get('High'),
                                         pr.get('low_price') or pr.get('Low'),
                                         pr.get('close_price') or pr.get('Close'),
                                         pr.get('volume') or pr.get('Volume')
-                                    ))
+                                    )
+                                if dedup:
+                                    values = list(dedup.values())
+                                    dates.extend([v[1] for v in values])
 
                                 duplicate_count = 0
                                 if values:
@@ -7636,11 +10491,17 @@ def update_stocks():
                                             else:
                                                 logger.info(f"✅ {symbol} 無重複，全部為新數據")
                                     except Exception as e:
+                                        # 若是 psycopg2 造成交易中止，需 rollback 才能繼續後續 SQL
+                                        if isinstance(e, psycopg2.Error):
+                                            try:
+                                                db_manager.connection.rollback()
+                                            except Exception:
+                                                pass
                                         logger.warning(f"統計 {symbol} 既有日期失敗，略過重複統計: {e}")
                                         duplicate_count = 0
 
-                                    upsert_sql = """
-                                        INSERT INTO tw_stock_prices (symbol, date, open_price, high_price, low_price, close_price, volume)
+                                    upsert_sql = f"""
+                                        INSERT INTO {prices_table} (symbol, date, open_price, high_price, low_price, close_price, volume)
                                         VALUES %s
                                         ON CONFLICT (symbol, date) DO UPDATE SET
                                             open_price = EXCLUDED.open_price,
@@ -7650,16 +10511,17 @@ def update_stocks():
                                             volume = EXCLUDED.volume
                                     """
                                     try:
-                                        execute_values(cursor, upsert_sql, values, page_size=1000)
-                                        db_manager.connection.commit()
+                                        _execute_values_with_retry(upsert_sql, values, page_size=1000)
                                     except Exception as e:
                                         logger.warning(f"批量寫入 {symbol} 價格數據失敗，將嘗試較小批次: {e}")
                                         # 回退為小批次
                                         batch = 200
                                         for idx in range(0, len(values), batch):
                                             sub = values[idx:idx+batch]
-                                            execute_values(cursor, upsert_sql, sub, page_size=len(sub))
-                                        db_manager.connection.commit()
+                                            _execute_values_with_retry(upsert_sql, sub, page_size=len(sub))
+                                else:
+                                    # 沒有任何有效資料
+                                    missing_symbols_individual.append(symbol)
                                 # 真正新增筆數 = 擬寫入總筆數 - 已存在筆數（近似計算）
                                 new_insert_count = max(len(values) - duplicate_count, 0)
                                 result['price_records'] = new_insert_count
@@ -7680,6 +10542,7 @@ def update_stocks():
                             else:
                                 result['price_records'] = 0
                                 result['status'] = 'partial'
+                                missing_symbols_individual.append(symbol)
                                 if existing_total is not None:
                                     result['existing_records'] = existing_total
                         
@@ -7689,117 +10552,275 @@ def update_stocks():
                         
                         if False:  # 報酬率計算區塊已完全停用
                             pass  # 以下代碼不會執行
-                            if weekly_returns:
-                                for wr in weekly_returns:
-                                    week_end_date = pd.to_datetime(wr['Date'])
-                                    # 找到該週的所有交易日
-                                    for dr in daily_returns:
-                                        daily_date = pd.to_datetime(dr['Date'])
-                                        # 檢查是否在同一週（週日為一週開始）
-                                        if daily_date.isocalendar()[1] == week_end_date.isocalendar()[1] and daily_date.year == week_end_date.year:
-                                            weekly_dict[dr['Date']] = wr['return']
-                            
-                            # 為月報酬率建立映射 - 將月報酬率分配給該月的所有交易日
-                            if monthly_returns:
-                                for mr in monthly_returns:
-                                    month_end_date = pd.to_datetime(mr['Date'])
-                                    # 找到該月的所有交易日
-                                    for dr in daily_returns:
-                                        daily_date = pd.to_datetime(dr['Date'])
-                                        # 檢查是否在同一月
-                                        if daily_date.year == month_end_date.year and daily_date.month == month_end_date.month:
-                                            monthly_dict[dr['Date']] = mr['return']
-                            for return_record in daily_returns:
-                                try:
-                                    date_str = return_record.get('Date')
-                                    weekly_return = None
-                                    monthly_return = None
-                                    
-                                    if weekly_returns:
-                                        for wr in weekly_returns:
-                                            week_end_date = pd.to_datetime(wr['Date'])
-                                            # 找到該週的所有交易日
-                                            daily_date = pd.to_datetime(date_str)
-                                            # 檢查是否在同一週（週日為一週開始）
-                                            if daily_date.isocalendar()[1] == week_end_date.isocalendar()[1] and daily_date.year == week_end_date.year:
-                                                weekly_return = wr['return']
-                                                break
-                                    
-                                    if monthly_returns:
-                                        for mr in monthly_returns:
-                                            month_end_date = pd.to_datetime(mr['Date'])
-                                            # 找到該月的所有交易日
-                                            daily_date = pd.to_datetime(date_str)
-                                            # 檢查是否在同一月
-                                            if daily_date.year == month_end_date.year and daily_date.month == month_end_date.month:
-                                                monthly_return = mr['return']
-                                                break
-                                    
-                                    daily_return = return_record.get('return')
-                                    cumulative_return = return_record.get('cumulative_return')
-
-                                    if daily_return is not None and (math.isinf(daily_return) or math.isnan(daily_return)):
-                                        daily_return = None
-                                    if weekly_return is not None and (math.isinf(weekly_return) or math.isnan(weekly_return)):
-                                        weekly_return = None
-                                    if monthly_return is not None and (math.isinf(monthly_return) or math.isnan(monthly_return)):
-                                        monthly_return = None
-                                    if cumulative_return is not None and (math.isinf(cumulative_return) or math.isnan(cumulative_return)):
-                                        cumulative_return = None
-
-                                    return_values.append((
-                                        symbol,
-                                        date_str,
-                                        daily_return,
-                                        weekly_return,
-                                        monthly_return,
-                                        cumulative_return
-                                    ))
-                                    return_dates.append(date_str)
-                                except Exception as e:
-                                    logger.warning(f"準備 {symbol} 報酬率數據失敗: {e}")
-
-                            if return_values:
-                                returns_upsert_sql = """
-                                    INSERT INTO tw_stock_returns (symbol, date, daily_return, weekly_return, monthly_return, cumulative_return)
-                                    VALUES %s
-                                    ON CONFLICT (symbol, date)
-                                    DO UPDATE SET
-                                        daily_return = EXCLUDED.daily_return,
-                                        weekly_return = EXCLUDED.weekly_return,
-                                        monthly_return = EXCLUDED.monthly_return,
-                                        cumulative_return = EXCLUDED.cumulative_return
-                                """
-                                try:
-                                    execute_values(cursor, returns_upsert_sql, return_values, page_size=2000)
-                                    db_manager.connection.commit()
-                                except Exception as e:
-                                    logger.warning(f"批量寫入報酬率失敗，改用小批次: {e}")
-                                    batch = 500
-                                    for idx in range(0, len(return_values), batch):
-                                        sub = return_values[idx:idx+batch]
-                                        execute_values(cursor, returns_upsert_sql, sub, page_size=len(sub))
-                                    db_manager.connection.commit()
-
-                            result['return_records'] = len(return_values)
-                            
-                            # 添加報酬率日期範圍資訊
-                            if return_dates:
-                                return_dates.sort()
-                                result['return_date_range'] = {
-                                    'start': return_dates[0],
-                                    'end': return_dates[-1],
-                                    'requested_start': start_date,
-                                    'requested_end': end_date,
-                                    'trading_days_count': len(return_dates)
-                                }
-                    
+                        
                         results.append(result)
                     
                     except Exception as e:
                         errors.append({'symbol': symbol, 'error': str(e)})
                         logger.error(f"更新 {symbol} 失敗: {e}")
-            
+
+            # 🚀 批量抓取模式：一次性抓取所有股票
+            if update_prices and use_batch_mode and len(symbols) > 1:
+                logger.info(f"🚀 啟用批量抓取模式，準備抓取 {len(symbols)} 檔股票")
+                
+                # 過濾出上市股票代碼（去除 .TW 後綴）
+                twse_codes = []
+                tpex_codes = []
+                for sym in symbols:
+                    if sym.endswith('.TW'):
+                        code = sym.split('.')[0]
+                        if code.isdigit():
+                            twse_codes.append(code)
+                    elif sym.endswith('.TWO'):
+                        code = sym.split('.')[0]
+                        if code.isdigit():
+                            tpex_codes.append(code)
+
+                processed_twse_symbols = set()
+                processed_tpex_symbols = set()
+                
+                if twse_codes:
+                    # 決定實際開始日期
+                    effective_start_date = force_start_date or start_date
+                    if not end_date:
+                        end_date = datetime.now().strftime('%Y-%m-%d')
+                    
+                    logger.info(f"批量抓取 {len(twse_codes)} 檔上市股票，日期範圍: {effective_start_date} ~ {end_date}")
+                    
+                    # 批量抓取
+                    batch_data = stock_api.fetch_twse_stock_data_batch(twse_codes, effective_start_date, end_date)
+                    
+                    # 將批量數據寫入資料庫
+                    for stock_code, price_records in batch_data.items():
+                        symbol = f"{stock_code}.TW"
+                        try:
+                            if price_records:
+                                dedup = {}
+                                for pr in price_records:
+                                    d = pr.get('Date')
+                                    if not d:
+                                        continue
+                                    key = (symbol, str(d)[:10])
+                                    dedup[key] = (
+                                        symbol,
+                                        str(d)[:10],
+                                        pr.get('Open'),
+                                        pr.get('High'),
+                                        pr.get('Low'),
+                                        pr.get('Close'),
+                                        pr.get('Volume')
+                                    )
+                                values = list(dedup.values())
+                                
+                                if values:
+                                    upsert_sql = f"""
+                                        INSERT INTO {prices_table} (symbol, date, open_price, high_price, low_price, close_price, volume)
+                                        VALUES %s
+                                        ON CONFLICT (symbol, date) DO UPDATE SET
+                                            open_price = EXCLUDED.open_price,
+                                            high_price = EXCLUDED.high_price,
+                                            low_price = EXCLUDED.low_price,
+                                            close_price = EXCLUDED.close_price,
+                                            volume = EXCLUDED.volume
+                                    """
+                                    _execute_values_with_retry(upsert_sql, values, page_size=1000)
+
+                                    processed_twse_symbols.add(symbol)
+                                    
+                                    results.append({
+                                        'symbol': symbol,
+                                        'status': 'success',
+                                        'prices_updated': len(values),
+                                        'mode': 'batch'
+                                    })
+                                    logger.info(f"✅ {symbol} 批量寫入 {len(values)} 筆")
+                                else:
+                                    missing_symbols_batch.append(symbol)
+                            else:
+                                missing_symbols_batch.append(symbol)
+                        except Exception as e:
+                            logger.error(f"批量寫入 {symbol} 失敗: {e}")
+                            errors.append({'symbol': symbol, 'error': str(e)})
+                    
+                    logger.info(f"🎉 批量抓取完成，成功處理 {len(results)} 檔股票")
+
+                if tpex_codes:
+                    effective_start_date = force_start_date or start_date
+                    if not end_date:
+                        end_date = datetime.now().strftime('%Y-%m-%d')
+
+                    logger.info(f"批量抓取 {len(tpex_codes)} 檔上櫃股票，日期範圍: {effective_start_date} ~ {end_date}")
+                    batch_data = stock_api.fetch_tpex_stock_data_batch(tpex_codes, effective_start_date, end_date)
+
+                    # 將全部股票的值一次性 upsert，避免逐檔執行多次 SQL 造成開銷
+                    all_values_for_db = []
+                    per_symbol_counts = {}
+
+                    for stock_code, price_records in batch_data.items():
+                        symbol = f"{stock_code}.TWO"
+                        try:
+                            if price_records:
+                                dedup = {}
+                                for pr in price_records:
+                                    d = pr.get('Date')
+                                    if not d:
+                                        continue
+                                    key = (symbol, str(d)[:10])
+                                    dedup[key] = (
+                                        symbol,
+                                        str(d)[:10],
+                                        pr.get('Open'),
+                                        pr.get('High'),
+                                        pr.get('Low'),
+                                        pr.get('Close'),
+                                        pr.get('Volume')
+                                    )
+
+                                values = list(dedup.values())
+
+                                if values:
+                                    all_values_for_db.extend(values)
+                                    per_symbol_counts[symbol] = per_symbol_counts.get(symbol, 0) + len(values)
+                                    processed_tpex_symbols.add(symbol)
+                                else:
+                                    missing_symbols_batch.append(symbol)
+                            else:
+                                missing_symbols_batch.append(symbol)
+                        except Exception as e:
+                            logger.error(f"批量寫入 {symbol} 失敗: {e}")
+                            errors.append({'symbol': symbol, 'error': str(e)})
+
+                    if all_values_for_db:
+                        upsert_sql = f"""
+                            INSERT INTO {prices_table} (symbol, date, open_price, high_price, low_price, close_price, volume)
+                            VALUES %s
+                            ON CONFLICT (symbol, date) DO UPDATE SET
+                                open_price = EXCLUDED.open_price,
+                                high_price = EXCLUDED.high_price,
+                                low_price = EXCLUDED.low_price,
+                                close_price = EXCLUDED.close_price,
+                                volume = EXCLUDED.volume
+                        """
+                        _execute_values_with_retry(upsert_sql, all_values_for_db, page_size=2000)
+
+                        for sym, cnt in per_symbol_counts.items():
+                            results.append({
+                                'symbol': sym,
+                                'status': 'success',
+                                'prices_updated': cnt,
+                                'mode': 'batch'
+                            })
+                            logger.info(f"✅ {sym} 批量寫入 {cnt} 筆")
+                    else:
+                        # 全部空資料
+                        missing_symbols_batch.extend([f"{code}.TWO" for code in tpex_codes])
+
+                remaining_symbols = [s for s in symbols if s not in processed_twse_symbols and s not in processed_tpex_symbols]
+
+            # 🔄 逐檔抓取模式（備用或非批量模式）
+            else:
+                remaining_symbols = symbols
+
+            if remaining_symbols:
+                _process_symbols_individual(remaining_symbols)
+
+            # ✅ 股價更新完成後，自動啟動報酬率計算（背景執行，避免阻塞 API 回應）
+            if update_returns:
+                try:
+                    use_neon = not bool(data.get('use_local_db', False))
+                    returns_end = end_date or datetime.now().strftime('%Y-%m-%d')
+
+                    returns_t0 = time.perf_counter()
+                    returns_last_emit_t = 0.0
+                    returns_last_index = 0
+
+                    def _returns_progress(event: dict):
+                        try:
+                            # 確保 payload 可 JSON 序列化
+                            safe = event if isinstance(event, dict) else {'event': 'progress', 'message': str(event)}
+                            evt = safe.get('event', 'progress')
+
+                            nonlocal returns_last_emit_t, returns_last_index
+                            msg = safe.get('message')
+
+                            # 針對 progress 事件補齊 message（前端較容易顯示）
+                            if evt == 'progress':
+                                idx = int(safe.get('index') or 0)
+                                total = int(safe.get('total') or 0)
+
+                                # 簡易節流：至少前進 1 檔，且每 0.25 秒最多推一次
+                                now_t = time.perf_counter()
+                                if idx <= returns_last_index and (now_t - returns_last_emit_t) < 0.25:
+                                    return
+                                returns_last_index = max(returns_last_index, idx)
+                                returns_last_emit_t = now_t
+
+                                pct = round((idx / total) * 100, 2) if total else None
+                                elapsed_s = now_t - returns_t0
+                                eta_s = None
+                                if idx > 0 and total and elapsed_s > 0:
+                                    avg = elapsed_s / idx
+                                    eta_s = max(0.0, avg * (total - idx))
+
+                                sym = safe.get('symbol')
+                                written = safe.get('written')
+                                reason = safe.get('reason')
+                                error = safe.get('error')
+
+                                parts = []
+                                if total:
+                                    parts.append(f"{idx}/{total}")
+                                if pct is not None:
+                                    parts.append(f"{pct}%")
+                                if sym:
+                                    parts.append(str(sym))
+                                if error:
+                                    parts.append(f"ERROR: {error}")
+                                else:
+                                    if written is not None:
+                                        parts.append(f"written={written}")
+                                    if reason:
+                                        parts.append(f"reason={reason}")
+                                if eta_s is not None:
+                                    eta_min = int(eta_s // 60)
+                                    eta_sec = int(eta_s % 60)
+                                    parts.append(f"ETA {eta_min}m{eta_sec:02d}s")
+
+                                msg = "🧮 報酬率進度: " + " | ".join(parts)
+                                safe['progress_pct'] = pct
+                                safe['eta_seconds'] = int(eta_s) if eta_s is not None else None
+
+                            push_sse('returns', evt, msg, **safe)
+                        except Exception:
+                            pass
+
+                    def _run_returns():
+                        try:
+                            logger.info("📈 開始計算報酬率")
+                            push_sse('returns', 'start', '開始計算報酬率')
+                            report = compute_returns_task(
+                                symbols=symbols,
+                                start=start_date,
+                                end=returns_end,
+                                all=False,
+                                limit=None,
+                                fill_missing=True,
+                                use_neon=use_neon,
+                                upload_to_neon=False,
+                                progress_callback=_returns_progress,
+                            )
+                            push_sse('returns', 'summary', '報酬率計算完成', summary=report)
+                            push_sse('returns', 'done', '報酬率計算完成')
+                            logger.info("📈 報酬率計算完成")
+                        except Exception as exc:
+                            push_sse('returns', 'error', str(exc))
+                            logger.error(f"報酬率計算失敗: {exc}")
+
+                    threading.Thread(target=_run_returns, daemon=True).start()
+                    returns_started = True
+                except Exception as exc:
+                    logger.error(f"初始化報酬率計算失敗: {exc}")
+
             db_manager.connection.commit()
         except Exception as batch_error:
             db_manager.connection.rollback()
@@ -7808,10 +10829,27 @@ def update_stocks():
         finally:
             db_manager.disconnect()
         
+        error_message = None
+        if errors:
+            try:
+                error_message = errors[0].get('error') if isinstance(errors[0], dict) else str(errors[0])
+            except Exception:
+                error_message = None
+
         return jsonify({
             'success': len(errors) == 0,
             'results': results,
             'errors': errors,
+            'index_sync_summary': index_sync_summary,
+            'missing_symbols': {
+                'batch': sorted(list(set(missing_symbols_batch))),
+                'individual': sorted(list(set(missing_symbols_individual)))
+            },
+            'returns': {
+                'enabled': bool(update_returns),
+                'started': bool(returns_started)
+            },
+            'error': error_message,
             'summary': {
                 'total': len(symbols),
                 'success': len(results),
@@ -7824,12 +10862,18 @@ def update_stocks():
         if db_manager:
             try:
                 db_manager.disconnect()
-            except:
+            except Exception:
                 pass
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+    finally:
+        if acquired_update_lock:
+            try:
+                update_lock.release()
+            except Exception:
+                pass
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -8250,7 +11294,6 @@ def database_sync_status():
         neon_url = (
             os.environ.get('DATABASE_URL')
             or os.environ.get('NEON_DATABASE_URL')
-            or 'postgresql://neondb_owner:npg_6vuayEsIl4Qb@ep-wispy-sky-adgltyd1-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require'
         )
         if not neon_url:
             return jsonify({
@@ -8282,17 +11325,51 @@ def database_sync_status():
 
 @app.route('/api/database-sync/tables', methods=['GET'])
 def get_database_tables():
-    """獲取本地資料庫的所有表格列表"""
+    """獲取指定資料庫（本機/Neon）的所有表格列表"""
     try:
-        local_config = {
-            'host': os.environ.get('DB_HOST', 'localhost'),
-            'port': os.environ.get('DB_PORT', '5432'),
-            'user': os.environ.get('DB_USER', 'postgres'),
-            'password': os.environ.get('DB_PASSWORD', 's8304021'),
-            'database': os.environ.get('DB_NAME', 'postgres')
-        }
-        
-        conn = psycopg2.connect(**local_config, cursor_factory=RealDictCursor)
+        source = (request.args.get('source') or '').strip().lower()
+        use_local_flag = DatabaseManager._resolve_use_local(request.args.get('use_local_db'))
+
+        # Compatibility:
+        # - if source is provided, prefer it
+        # - else fall back to use_local_db
+        is_local = True
+        if source == 'neon':
+            is_local = False
+        elif source == 'local':
+            is_local = True
+        else:
+            is_local = bool(use_local_flag)
+
+        if is_local:
+            conn = psycopg2.connect(
+                host=os.environ.get('DB_HOST', 'localhost'),
+                port=os.environ.get('DB_PORT', '5432'),
+                user=os.environ.get('DB_USER', 'postgres'),
+                password=os.environ.get('DB_PASSWORD', ''),
+                database=os.environ.get('DB_NAME', 'postgres'),
+                cursor_factory=RealDictCursor,
+                sslmode=os.environ.get('DB_SSLMODE', 'prefer'),
+            )
+        else:
+            neon_url = (
+                os.environ.get('DATABASE_URL')
+                or os.environ.get('NEON_DATABASE_URL')
+            )
+            if not neon_url:
+                return jsonify({'success': False, 'error': 'NEON_DATABASE_URL not configured'}), 500
+            from urllib.parse import urlparse
+            parsed = urlparse(neon_url)
+            conn = psycopg2.connect(
+                host=parsed.hostname,
+                port=parsed.port or 5432,
+                user=parsed.username,
+                password=parsed.password,
+                database=parsed.path.lstrip('/') if parsed.path else 'postgres',
+                cursor_factory=RealDictCursor,
+                sslmode='require',
+            )
+
         cursor = conn.cursor()
         
         # 獲取所有表格及其行數
@@ -8312,7 +11389,9 @@ def get_database_tables():
         for table in tables:
             table_name = table['tablename']
             try:
-                cursor.execute(f'SELECT COUNT(*) as count FROM "{table_name}"')
+                cursor.execute(
+                    sql.SQL('SELECT COUNT(*) as count FROM {}').format(sql.Identifier(table_name))
+                )
                 row_count = cursor.fetchone()['count']
                 table_list.append({
                     'name': table_name,
@@ -8341,6 +11420,161 @@ def get_database_tables():
             'error': str(e)
         }), 500
 
+
+@app.route('/api/database-sync/debug_routes', methods=['GET'])
+def database_sync_debug_routes():
+    try:
+        routes = []
+        for rule in app.url_map.iter_rules():
+            if str(rule.rule).startswith('/api/database-sync'):
+                routes.append({
+                    'rule': str(rule.rule),
+                    'methods': sorted([m for m in rule.methods if m not in ('HEAD', 'OPTIONS')]),
+                    'endpoint': str(rule.endpoint),
+                })
+        routes.sort(key=lambda x: x['rule'])
+        return jsonify({'success': True, 'routes': routes})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/database-sync/export_csv', methods=['GET', 'POST'])
+def export_database_tables_csv_zip():
+    try:
+        source = (request.args.get('source') or '').strip().lower()
+        use_local_flag = DatabaseManager._resolve_use_local(request.args.get('use_local_db'))
+
+        is_local = True
+        if source == 'neon':
+            is_local = False
+        elif source == 'local':
+            is_local = True
+        else:
+            is_local = bool(use_local_flag)
+
+        tables = None
+        if request.method == 'GET':
+            tables_qs = request.args.get('tables')
+            if tables_qs:
+                tables = [t.strip() for t in str(tables_qs).split(',') if t.strip()]
+        else:
+            if not request.is_json:
+                return jsonify({'success': False, 'error': '需要 JSON body'}), 400
+            body = request.get_json() or {}
+            tables = body.get('tables')
+            if not isinstance(tables, list) or not tables:
+                return jsonify({'success': False, 'error': 'tables must be a non-empty list'}), 400
+
+            tables = [str(t).strip() for t in tables if str(t).strip()]
+        if not tables:
+            return jsonify({'success': False, 'error': 'tables must be a non-empty list'}), 400
+
+        if is_local:
+            conn = psycopg2.connect(
+                host=os.environ.get('DB_HOST', 'localhost'),
+                port=os.environ.get('DB_PORT', '5432'),
+                user=os.environ.get('DB_USER', 'postgres'),
+                password=os.environ.get('DB_PASSWORD', ''),
+                database=os.environ.get('DB_NAME', 'postgres'),
+                cursor_factory=RealDictCursor,
+                sslmode=os.environ.get('DB_SSLMODE', 'prefer'),
+            )
+        else:
+            neon_url = (
+                os.environ.get('DATABASE_URL')
+                or os.environ.get('NEON_DATABASE_URL')
+            )
+            if not neon_url:
+                return jsonify({'success': False, 'error': 'NEON_DATABASE_URL not configured'}), 500
+            from urllib.parse import urlparse
+            parsed = urlparse(neon_url)
+            conn = psycopg2.connect(
+                host=parsed.hostname,
+                port=parsed.port or 5432,
+                user=parsed.username,
+                password=parsed.password,
+                database=parsed.path.lstrip('/') if parsed.path else 'postgres',
+                cursor_factory=RealDictCursor,
+                sslmode='require',
+            )
+
+        tmp_path = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT tablename
+                FROM pg_tables
+                WHERE schemaname = 'public'
+                """
+            )
+            existing = {r['tablename'] for r in (cur.fetchall() or []) if isinstance(r, dict) and r.get('tablename')}
+            safe_tables = [t for t in tables if t in existing]
+            missing = [t for t in tables if t not in existing]
+            if not safe_tables:
+                return jsonify({'success': False, 'error': f'No valid tables. Missing: {missing}'}), 400
+
+            with tempfile.NamedTemporaryFile(prefix='sync_export_', suffix='.zip', delete=False) as tmpf:
+                tmp_path = tmpf.name
+
+            with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                for t in safe_tables:
+                    try:
+                        cur.execute(sql.SQL('SELECT * FROM {}').format(sql.Identifier(t)))
+                        cols = [desc[0] for desc in (cur.description or [])]
+                        with zf.open(f'{t}.csv', 'w') as zentry:
+                            wrapper = io.TextIOWrapper(zentry, encoding='utf-8', newline='')
+                            writer = csv.writer(wrapper)
+                            writer.writerow(cols)
+                            while True:
+                                rows = cur.fetchmany(5000)
+                                if not rows:
+                                    break
+                                for r in rows:
+                                    if isinstance(r, dict):
+                                        writer.writerow([r.get(c) for c in cols])
+                                    else:
+                                        writer.writerow(list(r))
+                            wrapper.flush()
+                    except Exception as te:
+                        logger.warning(f"export_csv table failed: {t} err={te}")
+                        with zf.open(f'{t}.error.txt', 'w') as zentry:
+                            zentry.write(str(te).encode('utf-8'))
+
+                if missing:
+                    with zf.open('missing_tables.txt', 'w') as zentry:
+                        zentry.write(('\n'.join(missing)).encode('utf-8'))
+
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"sync_export_{'local' if is_local else 'neon'}_{ts}.zip"
+            resp = send_file(
+                tmp_path,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name=filename,
+            )
+
+            try:
+                @resp.call_on_close
+                def _cleanup_tmp():
+                    try:
+                        if tmp_path and os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            return resp
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.exception('export_database_tables_csv_zip failed')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/database-sync/upload', methods=['POST'])
 def database_sync_upload():
     """將本地資料庫上傳到 Neon"""
@@ -8352,11 +11586,17 @@ def database_sync_upload():
         selected_tables = data.get('tables', [])  # 如果沒有指定，則上傳所有表格
         
         logger.info(f"🚀 開始資料庫同步... 選擇的表格: {selected_tables if selected_tables else '全部'}")
+        push_sse(
+            'db_sync',
+            'start',
+            '開始同步：本機 → Neon',
+            direction='upload',
+            selected_tables=selected_tables,
+        )
         
         neon_url = (
             os.environ.get('DATABASE_URL')
             or os.environ.get('NEON_DATABASE_URL')
-            or 'postgresql://neondb_owner:npg_6vuayEsIl4Qb@ep-wispy-sky-adgltyd1-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require'
         )
         if not neon_url:
             return jsonify({
@@ -8370,23 +11610,27 @@ def database_sync_upload():
             'host': os.environ.get('DB_HOST', 'localhost'),
             'port': os.environ.get('DB_PORT', '5432'),
             'user': os.environ.get('DB_USER', 'postgres'),
-            'password': os.environ.get('DB_PASSWORD', 's8304021'),
+            'password': os.environ.get('DB_PASSWORD', ''),
             'database': os.environ.get('DB_NAME', 'postgres')
         }
         
         try:
             local_conn = psycopg2.connect(**local_config, cursor_factory=RealDictCursor)
             logger.info("✅ 本地資料庫連接成功")
+            push_sse('db_sync', 'local_connected', '本地資料庫連接成功', direction='upload')
         except Exception as e:
             logger.error(f"❌ 本地資料庫連接失敗: {e}")
+            push_sse('db_sync', 'error', f'本地資料庫連接失敗: {e}', direction='upload')
             raise
         
         logger.info("☁️ 連接 Neon 資料庫...")
         try:
             neon_conn = psycopg2.connect(neon_url, cursor_factory=RealDictCursor)
             logger.info("✅ Neon 資料庫連接成功")
+            push_sse('db_sync', 'neon_connected', 'Neon 資料庫連接成功', direction='upload')
         except Exception as e:
             logger.error(f"❌ Neon 資料庫連接失敗: {e}")
+            push_sse('db_sync', 'error', f'Neon 資料庫連接失敗: {e}', direction='upload')
             if local_conn:
                 local_conn.close()
             raise
@@ -8422,6 +11666,7 @@ def database_sync_upload():
         for table_name in tables:
             try:
                 logger.info(f"Processing table: {table_name}")
+                push_sse('db_sync', 'table_start', f'開始上傳表格: {table_name}', direction='upload', table=table_name)
                 
                 # 獲取表格結構
                 local_cursor.execute("""
@@ -8473,12 +11718,21 @@ def database_sync_upload():
                 local_cursor.execute(f'SELECT COUNT(*) as count FROM "{table_name}"')
                 row_count = local_cursor.fetchone()['count']
                 logger.info(f"📊 {table_name} 有 {row_count} 行數據")
+                push_sse(
+                    'db_sync',
+                    'table_info',
+                    f'{table_name} 行數: {row_count}',
+                    direction='upload',
+                    table=table_name,
+                    row_count=row_count,
+                )
                 
                 col_names = [col['column_name'] for col in columns]
                 inserted_count = 0
                 
                 if row_count == 0:
                     logger.info(f"⚠️ {table_name} 是空表格，跳過")
+                    push_sse('db_sync', 'table_skip', f'{table_name} 是空表格，跳過', direction='upload', table=table_name)
                 elif row_count > 10000:
                     # 大表格：使用批次處理 + execute_values（更快）
                     logger.info(f"🚀 使用批次處理上傳大表格 {table_name}...")
@@ -8512,10 +11766,21 @@ def database_sync_upload():
                             # 顯示進度
                             progress = min(100, int((offset + len(batch_rows)) / row_count * 100))
                             logger.info(f"  進度: {progress}% ({inserted_count}/{row_count})")
+                            push_sse(
+                                'db_sync',
+                                'batch_progress',
+                                f'{table_name} 進度 {progress}% ({inserted_count}/{row_count})',
+                                direction='upload',
+                                table=table_name,
+                                progress=progress,
+                                inserted=inserted_count,
+                                row_count=row_count,
+                            )
                             
                         except Exception as e:
                             logger.error(f"Error batch inserting into {table_name}: {e}")
                             neon_conn.rollback()
+                            push_sse('db_sync', 'error', f'{table_name} 批次寫入失敗: {e}', direction='upload', table=table_name)
                         
                         offset += batch_size
                 else:
@@ -8545,6 +11810,7 @@ def database_sync_upload():
                                     inserted_count += 1
                                 except Exception as e:
                                     logger.error(f"Error inserting row into {table_name}: {e}")
+                                    push_sse('db_sync', 'error', f'{table_name} 寫入失敗: {e}', direction='upload', table=table_name)
                             
                             neon_conn.commit()
                 
@@ -8557,9 +11823,19 @@ def database_sync_upload():
                 
                 results['totalRows'] += inserted_count
                 logger.info(f"✓ {table_name}: {inserted_count}/{row_count} rows uploaded")
+                push_sse(
+                    'db_sync',
+                    'table_done',
+                    f'完成上傳表格: {table_name} ({inserted_count}/{row_count})',
+                    direction='upload',
+                    table=table_name,
+                    inserted=inserted_count,
+                    row_count=row_count,
+                )
                 
             except Exception as e:
                 logger.error(f"Error processing table {table_name}: {e}")
+                push_sse('db_sync', 'error', f'表格 {table_name} 處理失敗: {e}', direction='upload', table=table_name)
                 results['errors'].append({
                     'table': table_name,
                     'error': str(e)
@@ -8576,20 +11852,466 @@ def database_sync_upload():
         neon_cursor.close()
         local_conn.close()
         neon_conn.close()
+
+        push_sse(
+            'db_sync',
+            'done',
+            f'同步完成（上傳：本機 → Neon），共 {results["totalTables"]} 表 / {results["totalRows"]} 行',
+            direction='upload',
+            total_tables=results['totalTables'],
+            total_rows=results['totalRows'],
+        )
         
         return jsonify(results)
         
     except Exception as e:
         logger.error(f"Database sync error: {e}")
+        push_sse('db_sync', 'error', f'同步失敗（上傳）：{e}', direction='upload')
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
 
+
+@app.route('/api/database-sync/download', methods=['POST'])
+def database_sync_download():
+    """將 Neon 資料庫下載回本地"""
+    local_conn = None
+    neon_conn = None
+    lock_acquired = False
+    try:
+        data = request.get_json() or {}
+        selected_tables = data.get('tables', [])
+        truncate_local = bool(data.get('truncateLocal', False))
+
+        lock_acquired = db_sync_lock.acquire(blocking=False)
+        if not lock_acquired:
+            push_sse('db_sync', 'error', '已有同步作業正在進行中，請稍後再試', direction='download')
+            return jsonify({
+                'success': False,
+                'error': '已有同步作業正在進行中，請稍後再試'
+            }), 409
+
+        push_sse(
+            'db_sync',
+            'start',
+            '開始同步：Neon → 本機',
+            direction='download',
+            selected_tables=selected_tables,
+            truncate_local=truncate_local,
+        )
+
+        logger.info(
+            "⬇️ 開始從 Neon 同步回本地... 選擇的表格: %s | truncateLocal=%s",
+            selected_tables if selected_tables else '全部',
+            truncate_local,
+        )
+
+        neon_url = (
+            os.environ.get('DATABASE_URL')
+            or os.environ.get('NEON_DATABASE_URL')
+        )
+        if not neon_url:
+            return jsonify({
+                'success': False,
+                'error': 'NEON_DATABASE_URL not configured'
+            }), 400
+
+        local_config = {
+            'host': os.environ.get('DB_HOST', 'localhost'),
+            'port': os.environ.get('DB_PORT', '5432'),
+            'user': os.environ.get('DB_USER', 'postgres'),
+            'password': os.environ.get('DB_PASSWORD', ''),
+            'database': os.environ.get('DB_NAME', 'postgres')
+        }
+
+        logger.info("📡 連接 Neon 資料庫...")
+        neon_conn = psycopg2.connect(neon_url, cursor_factory=RealDictCursor)
+        neon_conn.autocommit = True
+        logger.info("✅ Neon 資料庫連接成功")
+        push_sse('db_sync', 'neon_connected', 'Neon 資料庫連接成功', direction='download')
+
+        logger.info("🗄️ 連接本地資料庫...")
+        local_conn = psycopg2.connect(**local_config, cursor_factory=RealDictCursor)
+        logger.info("✅ 本地資料庫連接成功")
+        push_sse('db_sync', 'local_connected', '本地資料庫連接成功', direction='download')
+
+        neon_cursor = neon_conn.cursor()
+        local_cursor = local_conn.cursor()
+
+        neon_cursor.execute("""
+            SELECT tablename
+            FROM pg_tables
+            WHERE schemaname = 'public'
+            ORDER BY tablename
+        """)
+        all_neon_tables = [row['tablename'] for row in neon_cursor.fetchall()]
+
+        if selected_tables:
+            tables = [t for t in all_neon_tables if t in selected_tables]
+            logger.info(f"📋 將下載 {len(tables)} 個選中的表格（Neon 共 {len(all_neon_tables)} 個表格）")
+        else:
+            tables = all_neon_tables
+            logger.info(f"📋 將下載 Neon 所有 {len(tables)} 個表格")
+
+        results = {
+            'success': True,
+            'direction': 'download',
+            'tables': [],
+            'totalTables': len(tables),
+            'totalRows': 0,
+            'errors': []
+        }
+
+        max_table_retries = 3
+        base_retry_delay = 0.5
+
+        for table_name in tables:
+            attempt = 0
+            while True:
+                try:
+                    logger.info(f"Processing table (download): {table_name}")
+                    push_sse('db_sync', 'table_start', f'開始下載表格: {table_name}', direction='download', table=table_name)
+
+                    neon_cursor.execute("""
+                        SELECT
+                            column_name,
+                            data_type,
+                            character_maximum_length,
+                            is_nullable,
+                            column_default
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = %s
+                        ORDER BY ordinal_position
+                    """, (table_name,))
+                    columns = neon_cursor.fetchall()
+                    if not columns:
+                        logger.info(f"⚠️ Neon 表格 {table_name} 無欄位或不存在，跳過")
+                        results['tables'].append({
+                            'name': table_name,
+                            'rowCount': 0,
+                            'insertedCount': 0,
+                            'success': True
+                        })
+                        continue
+
+                    neon_cursor.execute("""
+                        SELECT kcu.column_name
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                          ON tc.constraint_name = kcu.constraint_name
+                         AND tc.table_schema = kcu.table_schema
+                        WHERE tc.table_schema = 'public'
+                          AND tc.table_name = %s
+                          AND tc.constraint_type = 'PRIMARY KEY'
+                        ORDER BY kcu.ordinal_position
+                    """, (table_name,))
+                    primary_keys = [row['column_name'] for row in neon_cursor.fetchall()]
+
+                    if not primary_keys:
+                        try:
+                            neon_cursor.execute(
+                                """
+                                SELECT a.attname AS column_name
+                                FROM pg_index i
+                                JOIN pg_attribute a
+                                  ON a.attrelid = i.indrelid
+                                 AND a.attnum = ANY(i.indkey)
+                                WHERE i.indrelid = %s::regclass
+                                  AND i.indisprimary
+                                ORDER BY array_position(i.indkey, a.attnum)
+                                """,
+                                (table_name,),
+                            )
+                            primary_keys = [row['column_name'] for row in neon_cursor.fetchall()]
+                        except Exception:
+                            primary_keys = []
+
+                    column_defs = []
+                    seq_to_create: set[tuple[str | None, str]] = set()
+                    for col in columns:
+                        col_def = f'"{col["column_name"]}" {col["data_type"]}'
+                        if col.get('character_maximum_length'):
+                            col_def += f'({col["character_maximum_length"]})'
+                        if col.get('is_nullable') == 'NO':
+                            col_def += ' NOT NULL'
+                        if col.get('column_default'):
+                            default_expr = str(col['column_default'])
+                            m = re.search(r"nextval\('([^']+)'", default_expr)
+                            if m:
+                                seq_full = m.group(1)
+                                if '.' in seq_full:
+                                    seq_schema, seq_name = seq_full.split('.', 1)
+                                    seq_to_create.add((seq_schema, seq_name))
+                                else:
+                                    seq_to_create.add((None, seq_full))
+                            col_def += f' DEFAULT {col["column_default"]}'
+                        column_defs.append(col_def)
+
+                    local_cursor.execute(
+                        """
+                        SELECT c.relkind
+                        FROM pg_class c
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = 'public'
+                          AND c.relname = %s
+                        """,
+                        (table_name,),
+                    )
+                    existing_rel = local_cursor.fetchone()
+                    if existing_rel:
+                        relkind = existing_rel.get('relkind')
+                        if relkind not in ('r', 'p'):
+                            drop_stmt = None
+                            if relkind == 'v':
+                                drop_stmt = f'DROP VIEW IF EXISTS "{table_name}" CASCADE'
+                            elif relkind == 'm':
+                                drop_stmt = f'DROP MATERIALIZED VIEW IF EXISTS "{table_name}" CASCADE'
+                            elif relkind == 'f':
+                                drop_stmt = f'DROP FOREIGN TABLE IF EXISTS "{table_name}" CASCADE'
+                            else:
+                                drop_stmt = f'DROP TABLE IF EXISTS "{table_name}" CASCADE'
+                            local_cursor.execute(drop_stmt)
+                            local_conn.commit()
+
+                    # 若使用 truncateLocal，代表希望本機 schema 完全跟 Neon 對齊：直接 drop/recreate
+                    if truncate_local:
+                        local_cursor.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
+                        local_conn.commit()
+                        push_sse('db_sync', 'table_truncate', f'已清空本機表格: {table_name}', direction='download', table=table_name)
+
+                    # 先建立 CREATE TABLE 會用到的 sequences（避免 nextval(...) 指到不存在的 *_id_seq）
+                    for seq_schema, seq_name in sorted(seq_to_create):
+                        if seq_schema:
+                            local_cursor.execute(
+                                sql.SQL('CREATE SEQUENCE IF NOT EXISTS {}.{}').format(
+                                    sql.Identifier(seq_schema),
+                                    sql.Identifier(seq_name),
+                                )
+                            )
+                        else:
+                            local_cursor.execute(
+                                sql.SQL('CREATE SEQUENCE IF NOT EXISTS {}').format(
+                                    sql.Identifier(seq_name),
+                                )
+                            )
+                    if seq_to_create:
+                        local_conn.commit()
+
+                    create_table_sql = f'CREATE TABLE IF NOT EXISTS "{table_name}" ({", ".join(column_defs)}'
+                    if primary_keys:
+                        pk_cols = ', '.join([f'"{pk}"' for pk in primary_keys])
+                        create_table_sql += f', PRIMARY KEY ({pk_cols})'
+                    create_table_sql += ')'
+
+                    local_cursor.execute(create_table_sql)
+                    local_conn.commit()
+
+                    if truncate_local:
+                        # drop/recreate 後保險再做一次 truncate + reset identity
+                        local_cursor.execute(f'TRUNCATE TABLE "{table_name}" RESTART IDENTITY CASCADE')
+                        local_conn.commit()
+
+                    neon_cursor.execute(f'SELECT COUNT(*) as count FROM "{table_name}"')
+                    row_count = neon_cursor.fetchone()['count']
+                    logger.info(f"📊 Neon {table_name} 有 {row_count} 行數據")
+                    push_sse(
+                        'db_sync',
+                        'table_info',
+                        f'{table_name} 行數: {row_count}',
+                        direction='download',
+                        table=table_name,
+                        row_count=row_count,
+                    )
+
+                    col_names = [col['column_name'] for col in columns]
+                    col_types = {col['column_name']: (col.get('data_type') or '').lower() for col in columns}
+                    inserted_count = 0
+
+                    if row_count == 0:
+                        logger.info(f"⚠️ {table_name} 是空表格，跳過")
+                    else:
+                        batch_size = 5000 if row_count > 10000 else 1000
+                        offset = 0
+
+                        cols_str = ', '.join([f'"{col}"' for col in col_names])
+                        placeholders_sql = f'INSERT INTO "{table_name}" ({cols_str}) VALUES %s'
+                        if primary_keys:
+                            pk_cols = ', '.join([f'"{pk}"' for pk in primary_keys])
+                            placeholders_sql += f' ON CONFLICT ({pk_cols}) DO NOTHING'
+
+                        while offset < row_count:
+                            neon_cursor.execute(
+                                f'SELECT * FROM "{table_name}" LIMIT {batch_size} OFFSET {offset}'
+                            )
+                            batch_rows = neon_cursor.fetchall()
+                            if not batch_rows:
+                                break
+
+                            values_list = []
+                            for r in batch_rows:
+                                row_vals = []
+                                for col in col_names:
+                                    v = r.get(col)
+                                    t = col_types.get(col, '')
+                                    if t in ('json', 'jsonb') and v is not None:
+                                        row_vals.append(Json(v))
+                                    else:
+                                        row_vals.append(v)
+                                values_list.append(tuple(row_vals))
+                            try:
+                                execute_values(local_cursor, placeholders_sql, values_list, page_size=1000)
+                                local_conn.commit()
+                                inserted_count += len(batch_rows)
+
+                                if row_count > 0:
+                                    progress = min(100, int((offset + len(batch_rows)) / row_count * 100))
+                                    logger.info(f"  進度: {progress}% ({inserted_count}/{row_count})")
+                                    push_sse(
+                                        'db_sync',
+                                        'batch_progress',
+                                        f'{table_name} 進度 {progress}% ({inserted_count}/{row_count})',
+                                        direction='download',
+                                        table=table_name,
+                                        progress=progress,
+                                        inserted=inserted_count,
+                                        row_count=row_count,
+                                    )
+                            except Exception as e:
+                                logger.error(f"Error batch inserting into local {table_name}: {e}")
+                                try:
+                                    local_conn.rollback()
+                                except Exception:
+                                    pass
+                                push_sse('db_sync', 'error', f'{table_name} 批次寫入失敗: {e}', direction='download', table=table_name)
+                                raise
+
+                            offset += batch_size
+
+                    results['tables'].append({
+                        'name': table_name,
+                        'rowCount': row_count,
+                        'insertedCount': inserted_count,
+                        'success': True
+                    })
+                    results['totalRows'] += inserted_count
+                    logger.info(f"✓ {table_name}: {inserted_count}/{row_count} rows downloaded")
+                    push_sse(
+                        'db_sync',
+                        'table_done',
+                        f'完成下載表格: {table_name} ({inserted_count}/{row_count})',
+                        direction='download',
+                        table=table_name,
+                        inserted=inserted_count,
+                        row_count=row_count,
+                    )
+                    break
+
+                except Exception as e:
+                    logger.error(f"Error processing table {table_name} (download): {e}")
+                    try:
+                        if local_conn:
+                            local_conn.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        if neon_conn and not getattr(neon_conn, 'autocommit', False):
+                            neon_conn.rollback()
+                    except Exception:
+                        pass
+
+                    msg = str(e)
+                    pgcode = getattr(e, 'pgcode', None)
+                    is_deadlock = (pgcode == '40P01') or ('deadlock detected' in msg.lower())
+                    if is_deadlock and attempt < (max_table_retries - 1):
+                        delay = base_retry_delay * (2 ** attempt)
+                        attempt += 1
+                        push_sse(
+                            'db_sync',
+                            'warning',
+                            f'表格 {table_name} 發生死鎖，{delay:.1f}s 後重試（第 {attempt + 1}/{max_table_retries} 次）',
+                            direction='download',
+                            table=table_name,
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    push_sse('db_sync', 'error', f'表格 {table_name} 處理失敗: {e}', direction='download', table=table_name)
+                    results['errors'].append({
+                        'table': table_name,
+                        'error': str(e)
+                    })
+                    results['tables'].append({
+                        'name': table_name,
+                        'success': False,
+                        'error': str(e)
+                    })
+                    break
+
+        try:
+            local_cursor.close()
+            neon_cursor.close()
+        except Exception:
+            pass
+        try:
+            local_conn.close()
+        except Exception:
+            pass
+        try:
+            neon_conn.close()
+        except Exception:
+            pass
+
+        push_sse(
+            'db_sync',
+            'done',
+            f'同步完成（下載：Neon → 本機），共 {results["totalTables"]} 表 / {results["totalRows"]} 行',
+            direction='download',
+            total_tables=results['totalTables'],
+            total_rows=results['totalRows'],
+        )
+
+        return jsonify(results)
+
+    except Exception as e:
+        logger.error(f"Database download sync error: {e}")
+        push_sse('db_sync', 'error', f'同步失敗（下載）：{e}', direction='download')
+        try:
+            if local_conn:
+                local_conn.close()
+        except Exception:
+            pass
+        try:
+            if neon_conn:
+                neon_conn.close()
+        except Exception:
+            pass
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+    finally:
+        if lock_acquired:
+            try:
+                db_sync_lock.release()
+            except Exception:
+                pass
+
 def run_t86_job(start_date=None, end_date=None, market='both', sleep_seconds=0.6, persist=True, use_local=False):
     today = datetime.now().date().isoformat()
     start_value = start_date or today
     end_value = end_date or start_value
+
+    logger.info(
+        "[t86-job] start=%s end=%s market=%s persist=%s use_local=%s",
+        start_value,
+        end_value,
+        market,
+        persist,
+        use_local,
+    )
 
     records, summary, daily_stats = stock_api.fetch_t86_range(
         start_value,
@@ -8660,6 +12382,29 @@ if __name__ == '__main__':
     except Exception:
         port = 5003
 
+    if port == 3000:
+        port = 5003
+
+    def _is_port_available(p: int) -> bool:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('0.0.0.0', p))
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    original_port = port
+    for _ in range(0, 50):
+        if _is_port_available(port):
+            break
+        port += 1
+
     print("Taiwan Stock Data API Server Starting...")
     print("API Endpoints:")
     print("   GET  /api/symbols - Get all stock symbols")
@@ -8668,9 +12413,19 @@ if __name__ == '__main__':
     print("   POST /api/update - Batch update stock data")
     print("   GET  /api/health - Health check")
     print("   GET  /api/income-statement?year=YYYY&season=S - Income statement wide data for all stocks")
+    if original_port != port:
+        print(f"[Info] Port {original_port} 已被占用，改用 {port}")
     print(f"Server address: http://localhost:{port}")
 
     try:
+        app.run(host='0.0.0.0', port=port, debug=True, threaded=True, use_reloader=False)
+    except OSError as e:
+        # 常見：Errno 48 (Address already in use)
+        print(f"[Error] 無法啟動伺服器：{e}")
+        print("提示：")
+        print(f"  - 可能已有其他進程使用埠號 {port}")
+        print("  - 你可以關閉舊進程，或以不同埠號啟動：例如 'PORT=5004 python3 server.py'")
+        sys.exit(1)
         app.run(host='0.0.0.0', port=port, debug=True, threaded=True, use_reloader=False)
     except OSError as e:
         # 常見：Errno 48 (Address already in use)

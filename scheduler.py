@@ -31,12 +31,11 @@ LOCAL_DB_CONFIG = {
     'host': 'localhost',
     'port': '5432',
     'user': 'postgres',
-    'password': 's8304021',
+    'password': os.environ.get('DB_PASSWORD', ''),
     'database': 'postgres'
 }
 
-NEON_DB_URL = os.environ.get('NEON_DATABASE_URL') or \
-    'postgresql://neondb_owner:npg_6vuayEsIl4Qb@ep-wispy-sky-adgltyd1-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require'
+NEON_DB_URL = os.environ.get('DATABASE_URL') or os.environ.get('NEON_DATABASE_URL')
 
 API_BASE = "http://localhost:5003"
 

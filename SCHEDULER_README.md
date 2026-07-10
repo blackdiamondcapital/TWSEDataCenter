@@ -250,7 +250,7 @@ pip3 install --upgrade apscheduler psycopg2-binary
 psql -h localhost -U postgres -d postgres
 
 # 測試 Neon 資料庫連線
-psql "postgresql://neondb_owner:...@ep-wispy-sky-adgltyd1-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require"
+psql "$NEON_DATABASE_URL"
 
 # 檢查防火牆設定
 sudo ufw status

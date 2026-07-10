@@ -3,6 +3,7 @@
 """逐檔抓取台股歷史股價資料，避免批次更新"""
 
 import argparse
+import os
 import sys
 import time
 from datetime import date, datetime
@@ -19,7 +20,7 @@ DB_CONFIG = {
     "host": "localhost",
     "port": "5432",
     "user": "postgres",
-    "password": "s8304021",
+    "password": os.getenv("DB_PASSWORD", ""),
     "database": "postgres",
 }
 

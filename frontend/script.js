@@ -1,3 +1,88 @@
+(() => {
+    const hardcodedBase = 'http://localhost:5003';
+    const qs = (typeof window !== 'undefined' && window.location && window.location.search)
+        ? new URLSearchParams(window.location.search)
+        : null;
+    const fromQuery = qs ? (qs.get('api_base') || qs.get('apiBase') || qs.get('api')) : null;
+    const fromStorage = (() => {
+        try {
+            return window && window.localStorage ? window.localStorage.getItem('API_BASE_URL') : null;
+        } catch (_) {
+            return null;
+        }
+    })();
+    const fromWindow = (typeof window !== 'undefined') ? (window.API_BASE_URL || window.__API_BASE_URL) : null;
+
+    const origin = (typeof window !== 'undefined' && window.location && window.location.origin)
+        ? window.location.origin
+        : '';
+    const defaultBase = (origin && origin !== 'file://' && origin !== 'null') ? origin : hardcodedBase;
+
+    const configuredBase = String(fromQuery || fromStorage || fromWindow || defaultBase).trim().replace(/\/+$/, '');
+
+    if (typeof window !== 'undefined') {
+        window.__API_BASE_URL = configuredBase;
+    }
+
+    const rewriteUrl = (u) => {
+        try {
+            const s = String(u);
+            if (s.startsWith(hardcodedBase)) {
+                return configuredBase + s.slice(hardcodedBase.length);
+            }
+            return s;
+        } catch (_) {
+            return u;
+        }
+    };
+
+    const apiUrl = (path) => {
+        const p = String(path || '');
+        return `${configuredBase}${p.startsWith('/') ? '' : '/'}${p}`;
+    };
+
+    if (typeof window !== 'undefined') {
+        window.apiUrl = apiUrl;
+        window.rewriteUrl = rewriteUrl;
+    }
+
+    if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
+        const originalFetch = window.fetch.bind(window);
+        window.fetch = (input, init) => {
+            try {
+                if (typeof input === 'string') {
+                    return originalFetch(rewriteUrl(input), init);
+                }
+                if (input && typeof Request !== 'undefined' && input instanceof Request) {
+                    const newUrl = rewriteUrl(input.url);
+                    if (newUrl !== input.url) {
+                        const req = new Request(newUrl, input);
+                        return originalFetch(req, init);
+                    }
+                }
+            } catch (_) {}
+            return originalFetch(input, init);
+        };
+    }
+
+    if (typeof window !== 'undefined' && typeof window.EventSource === 'function') {
+        const OriginalEventSource = window.EventSource;
+        function WrappedEventSource(url, config) {
+            return new OriginalEventSource(rewriteUrl(url), config);
+        }
+        WrappedEventSource.prototype = OriginalEventSource.prototype;
+        window.EventSource = WrappedEventSource;
+    }
+})();
+
+// Global helpers for the rest of this script
+const apiUrl = (typeof window !== 'undefined' && typeof window.apiUrl === 'function')
+    ? window.apiUrl
+    : (p) => p;
+const rewriteUrl = (typeof window !== 'undefined' && typeof window.rewriteUrl === 'function')
+    ? window.rewriteUrl
+    : (u) => u;
+
 // Taiwan Stock Data Update System - JavaScript
 class TaiwanStockApp {
     constructor() {
@@ -5,7 +90,7 @@ class TaiwanStockApp {
             host: 'localhost',
             port: '5432',
             user: 'postgres',
-            password: 's8304021',
+            password: '',
             dbname: 'postgres'
         };
         
@@ -53,6 +138,23 @@ class TaiwanStockApp {
         this.balanceLogAutoScroll = true;
         this._balanceLogInitialized = false;
         this._balanceProgressTimer = null;
+        // Cash-flow statement 狀態
+        this.cashflowData = [];
+        this.cashflowLogPanel = null;
+        this._cashflowProgressTimer = null;
+        // Financial ratios 狀態
+        this.ratiosData = [];
+        this.ratiosLogPanel = null;
+        this.ratiosLogAutoScroll = true;
+        this._ratiosLogInitialized = false;
+        this._ratiosProgressTimer = null;
+        this._ratiosLastProgressPct = null;
+        // Symbols UI state
+        this.symbolsList = [];
+
+        // Database sync UI state
+        this._lastSyncTables = [];
+        this._lastSyncTablesSource = 'local';
         this.init();
     }
 
@@ -67,6 +169,10 @@ class TaiwanStockApp {
                 this.dbTarget = event.target.value === 'local' ? 'local' : 'remote';
                 this.addLogMessage(`🔁 切換資料庫目標為 ${this.dbTarget === 'local' ? '本地 PostgreSQL' : 'Neon（雲端）'}`, 'info');
                 await this.checkDatabaseConnection();
+                try {
+                    await this.loadQueryTables();
+                } catch (e) {
+                }
             });
         });
     }
@@ -124,6 +230,97 @@ class TaiwanStockApp {
             this.addLogMessage(`檢測異常失敗：${err.message}`, 'error');
         }
     }
+    
+    // 透過後端 API 匯入 ^OTC 日K（TPEX OpenAPI）至 tw_stock_prices
+    async importOtcFromTpexApi() {
+        try {
+            let start = null;
+            let end = null;
+            if (typeof this.getUpdateConfig === 'function') {
+                try {
+                    const cfg = this.getUpdateConfig();
+                    if (cfg && cfg.valid && cfg.startDate && cfg.endDate) {
+                        start = cfg.startDate;
+                        end = cfg.endDate;
+                    }
+                } catch (_) {}
+            }
+
+            if (!start || !end) {
+                const today = new Date();
+                const todayStr = this.formatDate(today);
+                start = null;
+                end = todayStr;
+            }
+
+            const payload = { fetch_market_index: true, only_market_index: true };
+            if (start) payload.start_date = start;
+            if (end) payload.end_date = end;
+            payload.symbols = []; // 僅同步指數
+            payload.update_prices = true;
+            payload.use_batch_mode = true;
+            payload.force_full_refresh = false;
+            payload.index_symbols = ['^OTC'];
+            payload.respect_requested_range = true;
+            if (this.useLocalDb) payload.use_local_db = true;
+
+            const targetLabel = this.useLocalDb ? '本地 PostgreSQL' : 'Neon 雲端';
+            const rangeLabel = start && end ? `${start} ~ ${end}` : `預設起始 ~ ${payload.end_date || 'today'}`;
+            this.addLogMessage(`📈 開始匯入櫃買指數 (^OTC)：範圍 ${rangeLabel}，目標：${targetLabel}`, 'info');
+
+            const origin = (typeof window !== 'undefined' && window.location && window.location.origin)
+                ? window.location.origin
+                : '';
+            const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
+
+            // 後端 /api/update 會在 fetch_market_index=true 時同步 ^TWII 與 ^OTC，symbols 留空只跑指數
+            const resp = await fetch(`${base}/api/update`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+
+            // 取出指數同步摘要
+            const indexSummary = (data.index_sync_summary || data.index_sync || []).filter(s => s && s.mode === 'index');
+            const otcs = indexSummary.find(s => s.symbol === '^OTC');
+            if (otcs) {
+                this.addLogMessage(`✅ 櫃買指數匯入完成：寫入 ${otcs.prices_updated ?? 0} 筆`, 'success');
+            } else {
+                this.addLogMessage('ℹ️ 櫃買指數同步完成（無寫入或已最新）', 'info');
+            }
+
+            // 計算報酬率
+            try {
+                const computePayload = { symbol: '^OTC', fill_missing: true };
+                if (start) computePayload.start = start;
+                if (end) computePayload.end = end;
+                if (this.useLocalDb) computePayload.use_local_db = true;
+
+                this.addLogMessage('🧮 開始計算 ^OTC 報酬率並寫入 tw_stock_returns...', 'info');
+
+                const retResp = await fetch(`${base}/api/returns/compute`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(computePayload)
+                });
+                const retData = await retResp.json();
+                if (!retResp.ok || !retData.success) {
+                    throw new Error(retData.error || `HTTP ${retResp.status}`);
+                }
+
+                const totalWritten = retData.total_written ?? 0;
+                this.addLogMessage(`✅ ^OTC 報酬率計算完成：寫入 ${totalWritten} 筆`, 'success');
+            } catch (retErr) {
+                this.addLogMessage(`⚠️ ^OTC 報酬率計算失敗：${retErr.message}`, 'warning');
+            }
+        } catch (err) {
+            this.addLogMessage(`❌ 匯入櫃買指數失敗：${err.message}`, 'error');
+        }
+    }
 
     async fetchBalanceMultiPeriod() {
         try {
@@ -155,12 +352,15 @@ class TaiwanStockApp {
             const batchSizeStr = document.getElementById('balanceBatchSize')?.value || '';
             const restMinutesStr = document.getElementById('balanceBatchRestMinutes')?.value || '';
             const retryMaxStr = document.getElementById('balanceRetryMax')?.value || '';
+            const retryWaitMinutesStr = document.getElementById('balanceRetryWaitMinutes')?.value || '';
             const batchSize = parseInt(batchSizeStr, 10);
             const restMinutes = parseFloat(restMinutesStr);
             const retryMax = parseInt(retryMaxStr, 10);
+            const retryWaitMinutes = parseFloat(retryWaitMinutesStr);
             const hasBatch = Number.isFinite(batchSize) && batchSize > 0;
             const hasRest = Number.isFinite(restMinutes) && restMinutes > 0;
             const hasRetryMax = Number.isFinite(retryMax) && retryMax >= 0;
+            const hasRetryWait = Number.isFinite(retryWaitMinutes) && retryWaitMinutes > 0;
 
             const selectedSeasons = [];
             for (let s = 1; s <= 4; s += 1) {
@@ -205,7 +405,7 @@ class TaiwanStockApp {
             }
             if (hasRetryMax) {
                 this.addBalanceLog(
-                    `封鎖自動續抓設定：最多暫停/重試 ${retryMax} 次（每次 5 分鐘）。`,
+                    `封鎖自動續抓設定：最多暫停/重試 ${retryMax} 次（每次 ${hasRetryWait ? retryWaitMinutes : 5} 分鐘）。`,
                     'info',
                 );
             }
@@ -245,7 +445,7 @@ class TaiwanStockApp {
                 if (hasBatch) params.append('pause_every', String(batchSize));
                 if (hasRest) params.append('pause_minutes', String(restMinutes));
                 params.append('retry_on_block', '1');
-                params.append('retry_wait_minutes', '5');
+                params.append('retry_wait_minutes', String(hasRetryWait ? retryWaitMinutes : 5));
                 if (hasRetryMax) params.append('retry_max', String(retryMax));
                 if (writeToDb) {
                     params.append('write_to_db', '1');
@@ -439,7 +639,7 @@ class TaiwanStockApp {
             qs.set('end', end);
             qs.set('threshold', String(threshold));
             if (this.useLocalDb) qs.set('use_local_db', 'true');
-            const url = `http://localhost:5003/api/anomalies/export?${qs.toString()}`;
+            const url = apiUrl(`/api/anomalies/export?${qs.toString()}`);
             this.addLogMessage(`📤 匯出異常清單: ${url}`, 'info');
             
             // 以 fetch 取得 Blob，避免被瀏覽器阻擋或另開頁問題
@@ -474,15 +674,66 @@ class TaiwanStockApp {
                 this.addLogMessage('請填寫開始與結束日期再執行修復', 'warning');
                 return;
             }
-            const refetchOnly = !!document.getElementById('refetchOnlyToggle')?.checked;
-            const ok = window.confirm(refetchOnly
-                ? `將對 ${symbol || '全部股票'} 在 ${start}~${end} 期間進行：僅重抓（不刪除，不備份），threshold=${threshold}。是否繼續？`
-                : `將對 ${symbol || '全部股票'} 在 ${start}~${end} 期間進行：備份→刪除→重抓，threshold=${threshold}。是否繼續？`
+            const deleteThenRefetch = !!document.getElementById('refetchOnlyToggle')?.checked;
+            const refetchOnly = !deleteThenRefetch;
+            const ok = window.confirm(deleteThenRefetch
+                ? `將對 ${symbol || '全部股票'} 在 ${start}~${end} 期間進行：偵測異常→備份異常日期→刪除異常日期→補抓異常日期，threshold=${threshold}。是否繼續？`
+                : `將對 ${symbol || '全部股票'} 在 ${start}~${end} 期間進行：重抓寫回（不刪除舊資料、不備份；以 upsert 覆蓋同日資料），threshold=${threshold}。是否繼續？`
             );
             if (!ok) return;
 
-            this.addLogMessage(`🧹 開始修復：symbol=${symbol || 'ALL'}, 範圍=${start}~${end}, 閾值=${threshold}${refetchOnly ? '（僅重抓）' : ''}`, 'info');
-            const res = await fetch('http://localhost:5003/api/anomalies/fix', {
+            if (deleteThenRefetch) {
+                if (!symbol) {
+                    this.addLogMessage(`🧹 開始刪除後重抓（異常股票批次）：只處理異常日期（非整段重抓）。範圍=${start}~${end}，threshold=${threshold}`, 'info');
+                    const endpoint = rewriteUrl('http://localhost:5003/api/prices/refetch_range_by_anomalies');
+                    this.addLogMessage(`📡 呼叫：${endpoint}`, 'info');
+                    const res = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ start, end, threshold, use_local_db: this.useLocalDb })
+                    });
+                    const data = await res.json();
+                    if (!res.ok || !data.success) {
+                        throw new Error(data.error || `HTTP ${res.status}`);
+                    }
+                    this.addLogMessage(`✅ 批次完成：處理 ${Array.isArray(data.symbols) ? data.symbols.length : 0} 檔`, 'success');
+                    this.addLogMessage(`🗑️ 總刪除：${data.deleted || 0} 筆`, 'success');
+                    this.addLogMessage(`⬇️ 總補抓：fetched=${data.fetched || 0}`, 'success');
+                    this.addLogMessage(`💾 總寫入：inserted=${data.inserted || 0}`, 'success');
+                    if (Array.isArray(data.details) && data.details.length) {
+                        data.details.slice(0, 10).forEach((d, i) => {
+                            const datesCnt = Array.isArray(d.anomaly_dates) ? d.anomaly_dates.length : 0;
+                            this.addLogMessage(`${i + 1}. ${d.symbol} 異常日=${datesCnt} 刪除=${d.deleted || 0} 補抓=${d.fetched || 0} 寫入=${d.inserted || 0}`, 'info');
+                        });
+                        if (data.details.length > 10) {
+                            this.addLogMessage(`... 其餘 ${data.details.length - 10} 檔省略`, 'info');
+                        }
+                    }
+                    return;
+                }
+
+                this.addLogMessage(`🧹 開始刪除後重抓：symbol=${symbol}, 範圍=${start}~${end}`, 'info');
+                const endpoint = rewriteUrl('http://localhost:5003/api/prices/refetch_range');
+                this.addLogMessage(`📡 呼叫：${endpoint}`, 'info');
+                const res = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ symbol, start, end, use_local_db: this.useLocalDb })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.success) {
+                    throw new Error(data.error || `HTTP ${res.status}`);
+                }
+                this.addLogMessage(`🗑️ 已刪除：${data.deleted || 0} 筆`, 'success');
+                this.addLogMessage(`⬇️ 已重抓：fetched=${data.fetched || 0}`, 'success');
+                this.addLogMessage(`💾 已寫入：inserted=${data.inserted || 0}`, 'success');
+                return;
+            }
+
+            this.addLogMessage(`🧹 開始修復：symbol=${symbol || 'ALL'}, 範圍=${start}~${end}, 閾值=${threshold}${deleteThenRefetch ? '（刪除後重抓）' : '（僅重抓）'}`, 'info');
+            const fixEndpoint = apiUrl('/api/anomalies/fix');
+            this.addLogMessage(`📡 呼叫：${fixEndpoint}`, 'info');
+            const res = await fetch(fixEndpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ symbol, start, end, threshold, ruleVersion: 'rules_v1_pct', refetchPaddingDays: 5, refetchOnly, use_local_db: this.useLocalDb })
@@ -507,9 +758,15 @@ class TaiwanStockApp {
 
     async fixAnomaliesStream() {
         try {
+            const deleteThenRefetch = !!document.getElementById('refetchOnlyToggle')?.checked;
+            if (deleteThenRefetch) {
+                this.addLogMessage('ℹ️ 已勾選「刪除後重抓」：改用非串流模式執行（只刪除異常日期→補抓異常日期）', 'info');
+                return this.fixAnomalies();
+            }
+
             const { symbol, start, end, threshold } = this.getAnomalyParams();
             if (!start || !end) {
-                this.addLogMessage('請填寫開始與結束日期再執行修復', 'warning');
+                this.addLogMessage('請填寫開始與結束日期再執行（串流）修復', 'warning');
                 return;
             }
             // 串流端點僅做重抓（不刪除、不備份）
@@ -526,8 +783,9 @@ class TaiwanStockApp {
             qs.set('refetchPaddingDays', String(pad));
 
             if (this.useLocalDb) qs.set('use_local_db', 'true');
-            const url = `http://localhost:5003/api/anomalies/fix_stream?${qs.toString()}`;
+            const url = apiUrl(`/api/anomalies/fix_stream?${qs.toString()}`);
             this.addLogMessage(`🧹（串流）開始修復：symbol=${symbol || 'ALL'}, ${start}~${end}, threshold=${threshold}`, 'info');
+            this.addLogMessage(`📡 呼叫：${url}`, 'info');
 
             // 進度狀態
             let processed = 0;
@@ -695,6 +953,8 @@ class TaiwanStockApp {
         this.setupRevenueListeners();
         this.setupIncomeListeners();
         this.setupBalanceListeners();
+        this.setupCashflowListeners();
+        this.setupRatiosListeners();
         this.setupWarrantsListeners();
         this.initializeDates();
         this.initializeDisplayAreas();
@@ -712,6 +972,274 @@ class TaiwanStockApp {
         this.initSummaryBar();
         this.initLogControls();
         this.startApiHealthPolling();
+
+        // Symbols list UI
+        this.setupSymbolsListUI();
+    }
+
+    setupSymbolsListUI() {
+        const table = document.getElementById('symbolsTable');
+        if (!table) return;
+        const reloadBtn = document.getElementById('symbolsReloadBtn');
+        const refreshBtn = document.getElementById('symbolsRefreshFromExchangesBtn');
+        const etfRefreshBtn = document.getElementById('etfRefreshBtn');
+        const searchInput = document.getElementById('symbolsSearchInput');
+
+        if (reloadBtn) {
+            reloadBtn.addEventListener('click', () => this.loadSymbolsList(true));
+        }
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', () => this.refreshSymbolsFromExchangesBoth());
+        }
+        if (etfRefreshBtn) {
+            etfRefreshBtn.addEventListener('click', () => this.refreshEtfNamesBoth());
+        }
+        if (searchInput) {
+            searchInput.addEventListener('input', () => this.renderSymbolsTable());
+        }
+
+        // Initial load
+        this.loadSymbolsList(false);
+    }
+
+    setEtfRefreshStatus(text, visible) {
+        const el = document.getElementById('etfRefreshStatus');
+        if (!el) return;
+        el.textContent = text || '';
+        el.style.display = visible ? '' : 'none';
+    }
+
+    async refreshEtfNamesBoth() {
+        const btn = document.getElementById('etfRefreshBtn');
+        if (btn) btn.disabled = true;
+        try {
+            this.setEtfRefreshStatus('更新中：正在更新本機與雲端的 ETF 名稱，請稍候...', true);
+
+            const resp = await fetch('http://localhost:5003/api/symbols/refresh_etf_names', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target: 'both', table: 'tw_stock_symbols' })
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+            if (!data.success) {
+                const results = Array.isArray(data.results) ? data.results : [];
+                const msg = results.map(r => `${r.mode}: ${r.ok ? 'OK' : 'FAIL'}${r.stderr ? ` (${String(r.stderr).trim().slice(0, 200)})` : ''}`).join(' | ') || (data.error || '更新失敗');
+                throw new Error(msg);
+            }
+
+            const results = Array.isArray(data.results) ? data.results : [];
+            const summary = results.map(r => `${r.mode}: ${r.ok ? 'OK' : 'FAIL'}`).join(' | ');
+            const details = results
+                .map(r => {
+                    const detail = (r && (r.stderr || r.stdout)) ? String(r.stderr || r.stdout).trim() : '';
+                    const short = detail.length > 240 ? detail.slice(0, 240) + '...' : detail;
+                    return `${r.mode}: ${r.ok ? 'OK' : 'FAIL'}${short ? ` (${short})` : ''}`;
+                })
+                .join(' | ');
+            this.setEtfRefreshStatus(`更新完成：${details || summary}`, true);
+
+            await this.loadSymbolsList(true);
+        } catch (err) {
+            this.setEtfRefreshStatus(`更新失敗：${err.message}`, true);
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    setSymbolsRefreshStatus(text, visible) {
+        const el = document.getElementById('symbolsRefreshStatus');
+        if (!el) return;
+        el.textContent = text || '';
+        el.style.display = visible ? '' : 'none';
+    }
+
+    async refreshSymbolsFromExchangesBoth() {
+        const btn = document.getElementById('symbolsRefreshFromExchangesBtn');
+        if (btn) btn.disabled = true;
+
+        try {
+            this.setSymbolsRefreshStatus('更新中：正在更新本機與雲端的股票名稱，請稍候...', true);
+
+            const resp = await fetch('http://localhost:5003/api/symbols/refresh_from_exchanges', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target: 'both', table: 'tw_stock_symbols' })
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+            if (!data.success) {
+                const msg = data.error || (Array.isArray(data.results)
+                    ? data.results.map(r => {
+                        const detail = (r && (r.stderr || r.stdout)) ? String(r.stderr || r.stdout).trim() : 'failed';
+                        const short = detail.length > 240 ? detail.slice(0, 240) + '...' : detail;
+                        return `${r.mode}: ${short}`;
+                    }).join(' | ')
+                    : '更新失敗');
+                throw new Error(msg);
+            }
+
+            const results = Array.isArray(data.results) ? data.results : [];
+            const summary = results.map(r => `${r.mode}: ${r.ok ? 'OK' : 'FAIL'}`).join(' | ');
+            const details = results
+                .map(r => {
+                    const detail = (r && (r.stderr || r.stdout)) ? String(r.stderr || r.stdout).trim() : '';
+                    const short = detail.length > 240 ? detail.slice(0, 240) + '...' : detail;
+                    return `${r.mode}: ${r.ok ? 'OK' : 'FAIL'}${short ? ` (${short})` : ''}`;
+                })
+                .join(' | ');
+            this.setSymbolsRefreshStatus(`更新完成：${details || summary}`, true);
+
+            // Reload current target list (depends on db toggle)
+            await this.loadSymbolsList(true);
+        } catch (err) {
+            this.setSymbolsRefreshStatus(`更新失敗：${err.message}`, true);
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    async loadSymbolsList(forceRefresh) {
+        const emptyRow = document.getElementById('symbolsTableEmptyRow');
+        if (emptyRow) {
+            emptyRow.style.display = '';
+            emptyRow.querySelector('h4') && (emptyRow.querySelector('h4').textContent = '載入中...');
+            emptyRow.querySelector('p') && (emptyRow.querySelector('p').textContent = '正在抓取股票清單');
+        }
+
+        try {
+            const qs = new URLSearchParams();
+            if (this.useLocalDb) qs.set('use_local_db', 'true');
+            if (forceRefresh) qs.set('refresh', 'true');
+
+            const url = `http://localhost:5003/api/symbols${qs.toString() ? `?${qs.toString()}` : ''}`;
+            const resp = await fetch(url);
+            const data = await resp.json();
+            if (!resp.ok || !data.success) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+
+            this.symbolsList = Array.isArray(data.data) ? data.data : [];
+            this.renderSymbolsTable();
+        } catch (err) {
+            this.symbolsList = [];
+            this.renderSymbolsTable(err);
+        }
+    }
+
+    renderSymbolsTable(error) {
+        const table = document.getElementById('symbolsTable');
+        const badge = document.getElementById('symbolsCountBadge');
+        const searchInput = document.getElementById('symbolsSearchInput');
+
+        if (!table) return;
+        const tbody = table.querySelector('tbody');
+        if (!tbody) return;
+
+        const q = (searchInput && searchInput.value ? searchInput.value : '').trim().toLowerCase();
+
+        let list = Array.isArray(this.symbolsList) ? this.symbolsList : [];
+        if (q) {
+            list = list.filter((it) => {
+                const symbol = String(it.symbol || '').toLowerCase();
+                const name = String(it.name || '').toLowerCase();
+                const market = String(it.market || '').toLowerCase();
+                const shortName = String(it.short_name || it.shortName || '').toLowerCase();
+                const industry = String(it.industry || '').toLowerCase();
+                return (
+                    symbol.includes(q) ||
+                    name.includes(q) ||
+                    market.includes(q) ||
+                    shortName.includes(q) ||
+                    industry.includes(q)
+                );
+            });
+        }
+
+        if (badge) badge.textContent = `${list.length} 筆`;
+
+        // Clear tbody
+        tbody.innerHTML = '';
+
+        if (error) {
+            const tr = document.createElement('tr');
+            tr.className = 'no-data-row';
+            tr.innerHTML = `
+                <td colspan="5" class="no-data-cell">
+                    <div class="no-data-content">
+                        <div class="no-data-icon"><i class="fas fa-triangle-exclamation"></i></div>
+                        <div class="no-data-text">
+                            <h4>載入失敗</h4>
+                            <p>${this.escapeHtml(String(error.message || error))}</p>
+                        </div>
+                    </div>
+                </td>
+            `;
+            tbody.appendChild(tr);
+            return;
+        }
+
+        if (!list.length) {
+            const tr = document.createElement('tr');
+            tr.className = 'no-data-row';
+            tr.innerHTML = `
+                <td colspan="5" class="no-data-cell">
+                    <div class="no-data-content">
+                        <div class="no-data-icon"><i class="fas fa-search"></i></div>
+                        <div class="no-data-text">
+                            <h4>沒有符合的資料</h4>
+                            <p>請調整搜尋條件或點擊重新載入</p>
+                        </div>
+                    </div>
+                </td>
+            `;
+            tbody.appendChild(tr);
+            return;
+        }
+
+        const frag = document.createDocumentFragment();
+        list.slice(0, 2000).forEach((it) => {
+            const symbol = it.symbol || '';
+            const name = it.name || '';
+            const market = it.market || '';
+            const shortName = it.short_name || it.shortName || '';
+            const industry = it.industry || '';
+
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td><button type="button" class="btn btn-outline" data-symbol="${this.escapeHtml(symbol)}" style="padding:0.25rem 0.6rem; font-size:0.85rem;">${this.escapeHtml(symbol)}</button></td>
+                <td>${this.escapeHtml(name)}</td>
+                <td>${this.escapeHtml(market)}</td>
+                <td>${this.escapeHtml(shortName)}</td>
+                <td>${this.escapeHtml(industry)}</td>
+            `;
+
+            const btn = tr.querySelector('button[data-symbol]');
+            if (btn) {
+                btn.addEventListener('click', () => {
+                    const input = document.getElementById('tickerInput');
+                    if (!input) return;
+                    input.value = String(symbol || '').trim();
+                    input.focus();
+                });
+            }
+
+            frag.appendChild(tr);
+        });
+        tbody.appendChild(frag);
+    }
+
+    escapeHtml(s) {
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     setupEventListeners() {
@@ -795,6 +1323,8 @@ class TaiwanStockApp {
         // Database Sync functionality
         this.safeAddEventListener('btnCheckNeon', () => this.checkNeonConnection());
         this.safeAddEventListener('btnStartSync', () => this.startDatabaseSync());
+        this.safeAddEventListener('btnDownloadFromNeon', () => this.startDatabaseDownload());
+        this.safeAddEventListener('btnClearSyncLog', () => this.clearSyncLog());
 
         // Auto experiments
         this.safeAddEventListener('startAutoExperiments', () => this.runAutoExperiments());
@@ -802,12 +1332,18 @@ class TaiwanStockApp {
         // Anomaly detection & fix
         this.safeAddEventListener('detectAnomaliesBtn', () => this.detectAnomalies());
         this.safeAddEventListener('exportAnomaliesBtn', () => this.exportAnomalies());
-        // 使用串流版本，於修復過程中即時顯示抓到的股價數據
-        this.safeAddEventListener('fixAnomaliesBtn', () => this.fixAnomaliesStream());
+        // 勾選「刪除後重抓」時走非串流（整段刪除→重抓）；未勾選才走串流版本（僅重抓 upsert）
+        this.safeAddEventListener('fixAnomaliesBtn', () => {
+            const deleteThenRefetch = !!document.getElementById('refetchOnlyToggle')?.checked;
+            if (deleteThenRefetch) return this.fixAnomalies();
+            return this.fixAnomaliesStream();
+        });
         // Returns compute
         this.safeAddEventListener('computeReturnsBtn', () => this.computeReturnsFromUI());
         // 匯入加權指數 (^TWII) 日K（yfinance）
         this.safeAddEventListener('importTwiiBtn', () => this.importTwiiFromYFinance());
+        // 匯入櫃買指數 (^OTC) 日K（TPEX OpenAPI）
+        this.safeAddEventListener('importOtcBtn', () => this.importOtcFromTpexApi());
         
         console.log('✅ 事件監聽器設置完成');
     }
@@ -820,6 +1356,9 @@ class TaiwanStockApp {
         const dateSelect = document.getElementById('warrantsDateSelect');
         const keywordInput = document.getElementById('warrantsKeyword');
         const importBtn = document.getElementById('warrantsImportBtn');
+        const marketSelect = document.getElementById('warrantsMarketSelect');
+        const tpexMasterImportBtn = document.getElementById('warrantsTpexMasterImportBtn');
+        const tpexDailyImportBtn = document.getElementById('warrantsTpexDailyImportBtn');
 
         if (searchBtn) {
             searchBtn.addEventListener('click', () => {
@@ -840,6 +1379,25 @@ class TaiwanStockApp {
             });
         }
 
+        if (marketSelect) {
+            marketSelect.addEventListener('change', async () => {
+                await this.loadWarrantsDates();
+                await this.fetchWarrants();
+            });
+        }
+
+        if (tpexMasterImportBtn) {
+            tpexMasterImportBtn.addEventListener('click', () => {
+                this.importTpexWarrantMaster();
+            });
+        }
+
+        if (tpexDailyImportBtn) {
+            tpexDailyImportBtn.addEventListener('click', () => {
+                this.importTpexWarrantDaily();
+            });
+        }
+
         // 當首次切換到權證模式時載入日期
         this._warrantsInitialized = false;
     }
@@ -853,12 +1411,15 @@ class TaiwanStockApp {
     async loadWarrantsDates() {
         const statusEl = document.getElementById('warrantsStatus');
         const selectEl = document.getElementById('warrantsDateSelect');
+        const marketEl = document.getElementById('warrantsMarketSelect');
         if (!selectEl) return;
         try {
             if (statusEl) statusEl.textContent = '載入可用日期中...';
             const params = new URLSearchParams();
             if (this.useLocalDb) params.set('use_local_db', 'true');
             params.set('limit', '120');
+            const market = marketEl && marketEl.value ? marketEl.value : 'twse';
+            params.set('market', market);
             const resp = await fetch(`http://localhost:5003/api/warrants/dates?${params.toString()}`);
             const data = await resp.json();
             if (!resp.ok || !data.success) {
@@ -871,7 +1432,7 @@ class TaiwanStockApp {
                 opt.value = '';
                 opt.textContent = '（尚無資料）';
                 selectEl.appendChild(opt);
-                if (statusEl) statusEl.textContent = '尚無權證資料，請先於其他服務匯入。';
+                if (statusEl) statusEl.textContent = `尚無 ${market.toUpperCase()} 權證資料，請先匯入。`;
                 return;
             }
             dates.forEach(d => {
@@ -881,7 +1442,7 @@ class TaiwanStockApp {
                 selectEl.appendChild(opt);
             });
             selectEl.value = dates[0];
-            if (statusEl) statusEl.textContent = `已載入 ${dates.length} 個日期，可選擇後查詢。`;
+            if (statusEl) statusEl.textContent = `已載入 ${market.toUpperCase()} ${dates.length} 個日期，可選擇後查詢。`;
         } catch (err) {
             console.error('loadWarrantsDates error', err);
             if (statusEl) statusEl.textContent = `載入日期失敗：${err.message}`;
@@ -893,18 +1454,21 @@ class TaiwanStockApp {
         const selectEl = document.getElementById('warrantsDateSelect');
         const keywordEl = document.getElementById('warrantsKeyword');
         const tbody = document.getElementById('warrantsTableBody');
+        const marketEl = document.getElementById('warrantsMarketSelect');
         if (!selectEl || !tbody) return;
 
         const date = selectEl.value;
         const keyword = (keywordEl && keywordEl.value ? keywordEl.value.trim() : '');
+        const market = marketEl && marketEl.value ? marketEl.value : 'twse';
 
         try {
             if (statusEl) statusEl.textContent = '查詢中...';
-            tbody.innerHTML = '<tr><td colspan="5" class="no-data-cell">查詢中...</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="no-data-cell">查詢中...</td></tr>';
 
             const params = new URLSearchParams();
             if (date) params.set('date', date);
             if (keyword) params.set('keyword', keyword);
+            params.set('market', market);
             params.set('page', '1');
             params.set('pageSize', '200');
             if (this.useLocalDb) params.set('use_local_db', 'true');
@@ -917,7 +1481,7 @@ class TaiwanStockApp {
 
             const rows = Array.isArray(data.data) ? data.data : [];
             if (!rows.length) {
-                tbody.innerHTML = `<tr class="no-data-row"><td colspan="5" class="no-data-cell">所選日期無資料</td></tr>`;
+                tbody.innerHTML = `<tr class="no-data-row"><td colspan="8" class="no-data-cell">所選日期無資料</td></tr>`;
                 if (statusEl) statusEl.textContent = '查無資料';
                 return;
             }
@@ -930,52 +1494,76 @@ class TaiwanStockApp {
 
             tbody.innerHTML = rows.map(r => `
                 <tr>
+                    <td>${r.market || market.toUpperCase()}</td>
                     <td>${r.trade_date || ''}</td>
                     <td>${r.warrant_code || ''}</td>
                     <td>${r.warrant_name || ''}</td>
-                    <td class="text-right">${fmtNum(r.turnover)}</td>
-                    <td class="text-right">${fmtNum(r.volume)}</td>
+                    <td>${r.underlying_code || ''}</td>
+                    <td>${r.underlying_name || ''}</td>
+                    <td class="text-right">${fmtNum(r.trade_value ?? r.turnover)}</td>
+                    <td class="text-right">${fmtNum(r.trade_volume ?? r.volume)}</td>
                 </tr>
             `).join('');
 
             if (statusEl) {
-                statusEl.textContent = `日期 ${data.date || date || ''}，共 ${data.total || rows.length} 筆（前 ${rows.length} 筆已顯示）`;
+                const marketLabel = market === 'both' ? '全市場' : market.toUpperCase();
+                statusEl.textContent = `${marketLabel} 日期 ${data.date || date || ''}，共 ${data.total || rows.length} 筆（前 ${rows.length} 筆已顯示）`;
             }
         } catch (err) {
             console.error('fetchWarrants error', err);
-            tbody.innerHTML = `<tr class="no-data-row"><td colspan="5" class="no-data-cell">查詢失敗：${err.message}</td></tr>`;
+            tbody.innerHTML = `<tr class="no-data-row"><td colspan="8" class="no-data-cell">查詢失敗：${err.message}</td></tr>`;
             if (statusEl) statusEl.textContent = `查詢失敗：${err.message}`;
         }
+    }
+
+    async pollWarrantImportStatus(type) {
+        const statusEl = document.getElementById('warrantsStatus');
+        try {
+            if (type === 'twse') {
+                const respStatus = await fetch('http://localhost:5003/api/warrants/import-status');
+                const statusJson = await respStatus.json();
+                if (!respStatus.ok || !statusJson.success) return;
+                const s = statusJson.status || {};
+                if (!s.running || !statusEl) return;
+                statusEl.textContent = s.total
+                    ? `TWSE 匯入中... 已處理 ${s.processed}/${s.total} 筆`
+                    : `TWSE 匯入中... 已處理 ${s.processed} 筆`;
+                return;
+            }
+
+            const respStatus = await fetch('http://localhost:5003/api/warrants/tpex/import-status');
+            const statusJson = await respStatus.json();
+            if (!respStatus.ok || !statusJson.success || !statusEl) return;
+            const s = type === 'tpex-master' ? (statusJson.master || {}) : (statusJson.daily || {});
+            if (!s.running) return;
+            const label = type === 'tpex-master' ? 'TPEX 主檔' : 'TPEX 日行情';
+            statusEl.textContent = s.total
+                ? `${label}匯入中... 已處理 ${s.processed}/${s.total} 筆`
+                : `${label}匯入中... 已處理 ${s.processed} 筆`;
+        } catch (pollErr) {
+            console.error('warrants import-status poll error', pollErr);
+        }
+    }
+
+    clearWarrantsImportTimer() {
+        if (this._warrantsImportTimer) {
+            clearInterval(this._warrantsImportTimer);
+            this._warrantsImportTimer = null;
+        }
+    }
+
+    startWarrantsImportPolling(type) {
+        this.clearWarrantsImportTimer();
+        this._warrantsImportTimer = setInterval(() => {
+            this.pollWarrantImportStatus(type);
+        }, 1000);
     }
 
     async importLatestWarrants() {
         const statusEl = document.getElementById('warrantsStatus');
         try {
             if (statusEl) statusEl.textContent = '正在從 TWSE 抓取最新權證資料並匯入，請稍候...';
-
-            // 啟動輪詢匯入進度
-            if (this._warrantsImportTimer) {
-                clearInterval(this._warrantsImportTimer);
-                this._warrantsImportTimer = null;
-            }
-            this._warrantsImportTimer = setInterval(async () => {
-                try {
-                    const respStatus = await fetch('http://localhost:5003/api/warrants/import-status');
-                    const statusJson = await respStatus.json();
-                    if (!respStatus.ok || !statusJson.success) return;
-                    const s = statusJson.status || {};
-                    if (!s.running) return;  // 只在執行中時更新進度文字
-                    if (!statusEl) return;
-
-                    if (s.total) {
-                        statusEl.textContent = `匯入中... 已處理 ${s.processed}/${s.total} 筆`;
-                    } else {
-                        statusEl.textContent = `匯入中... 已處理 ${s.processed} 筆`;
-                    }
-                } catch (pollErr) {
-                    console.error('warrants import-status poll error', pollErr);
-                }
-            }, 1000);
+            this.startWarrantsImportPolling('twse');
 
             const params = new URLSearchParams();
             if (this.useLocalDb) params.set('use_local_db', 'true');
@@ -998,10 +1586,62 @@ class TaiwanStockApp {
             console.error('importLatestWarrants error', err);
             if (statusEl) statusEl.textContent = `匯入失敗：${err.message}`;
         } finally {
-            if (this._warrantsImportTimer) {
-                clearInterval(this._warrantsImportTimer);
-                this._warrantsImportTimer = null;
+            this.clearWarrantsImportTimer();
+        }
+    }
+
+    async importTpexWarrantMaster() {
+        const statusEl = document.getElementById('warrantsStatus');
+        try {
+            if (statusEl) statusEl.textContent = '正在匯入 TPEX 權證主檔，請稍候...';
+            this.startWarrantsImportPolling('tpex-master');
+
+            const params = new URLSearchParams();
+            if (this.useLocalDb) params.set('use_local_db', 'true');
+
+            const resp = await fetch(`http://localhost:5003/api/warrants/tpex/import-master?${params.toString()}`, {
+                method: 'POST',
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
             }
+            if (statusEl) statusEl.textContent = `${data.message || 'TPEX 主檔匯入完成'}（${data.importedCount || 0} 筆）`;
+        } catch (err) {
+            console.error('importTpexWarrantMaster error', err);
+            if (statusEl) statusEl.textContent = `TPEX 主檔匯入失敗：${err.message}`;
+        } finally {
+            this.clearWarrantsImportTimer();
+        }
+    }
+
+    async importTpexWarrantDaily() {
+        const statusEl = document.getElementById('warrantsStatus');
+        const marketEl = document.getElementById('warrantsMarketSelect');
+        try {
+            if (statusEl) statusEl.textContent = '正在匯入 TPEX 權證日行情，請稍候...';
+            this.startWarrantsImportPolling('tpex-daily');
+
+            const params = new URLSearchParams();
+            if (this.useLocalDb) params.set('use_local_db', 'true');
+
+            const resp = await fetch(`http://localhost:5003/api/warrants/tpex/import-daily?${params.toString()}`, {
+                method: 'POST',
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            if (statusEl) {
+                statusEl.textContent = `${data.message || 'TPEX 日行情匯入完成'}${data.tradeDate ? `（交易日期：${data.tradeDate}）` : ''}`;
+            }
+            if (marketEl) marketEl.value = 'tpex';
+            await this.loadWarrantsDates();
+        } catch (err) {
+            console.error('importTpexWarrantDaily error', err);
+            if (statusEl) statusEl.textContent = `TPEX 日行情匯入失敗：${err.message}`;
+        } finally {
+            this.clearWarrantsImportTimer();
         }
     }
 
@@ -2142,19 +2782,21 @@ class TaiwanStockApp {
         try {
             const market = document.getElementById('revenueMarketSelect')?.value || 'both';
 
-            // 先用 UI 的西元年/月來推民國範圍（若沒填則用最近一年做預設）
-            const yearStr = document.getElementById('revenueYear')?.value;
+            // 先用 UI 的開始/結束年月來推民國範圍（若沒填則用最近一年做預設）
+            const startYm = document.getElementById('revenueStartYm')?.value;
+            const endYm = document.getElementById('revenueEndYm')?.value;
+
             let startYearTw;
             let endYearTw;
-            if (yearStr) {
-                const yearAd = parseInt(yearStr, 10);
-                if (!Number.isFinite(yearAd) || yearAd < 2000) {
-                    this.addRevenueLog('西元年份格式不正確，無法推算民國年區間', 'warning');
+            if (startYm && endYm) {
+                const startAdYear = parseInt(String(startYm).split('-')[0] || '', 10);
+                const endAdYear = parseInt(String(endYm).split('-')[0] || '', 10);
+                if (!Number.isFinite(startAdYear) || !Number.isFinite(endAdYear) || startAdYear < 2000 || endAdYear < 2000) {
+                    this.addRevenueLog('開始/結束年月格式不正確，無法推算民國年區間', 'warning');
                     return;
                 }
-                const rocYear = yearAd - 1911;
-                startYearTw = rocYear;
-                endYearTw = rocYear;
+                startYearTw = startAdYear - 1911;
+                endYearTw = endAdYear - 1911;
             } else {
                 const now = new Date();
                 const adEnd = now.getFullYear();
@@ -2232,47 +2874,47 @@ class TaiwanStockApp {
 
     async fetchRevenueData() {
         try {
-            const yearStr = document.getElementById('revenueYear')?.value;
-            const monthStr = document.getElementById('revenueMonth')?.value;
+            const startYm = document.getElementById('revenueStartYm')?.value;
+            const endYm = document.getElementById('revenueEndYm')?.value;
             const market = document.getElementById('revenueMarketSelect')?.value || 'both';
 
-            let year = null;
-            let month = null;
-            if (yearStr && monthStr) {
-                year = parseInt(yearStr, 10);
-                month = parseInt(monthStr, 10);
-                if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) {
-                    this.addRevenueLog('年份或月份格式不正確，請輸入例如 2025 / 10', 'warning');
-                    return;
-                }
-            } else if (yearStr || monthStr) {
-                this.addRevenueLog('年份與月份需同時填寫或同時留空', 'warning');
+            const hasStart = Boolean(startYm);
+            const hasEnd = Boolean(endYm);
+            const isRangeMode = hasStart || hasEnd;
+            if (isRangeMode && !(hasStart && hasEnd)) {
+                this.addRevenueLog('開始年月與結束年月需同時填寫或同時留空', 'warning');
                 return;
             }
 
-            const ymLabel = (year && month)
-                ? `${year}-${String(month).padStart(2, '0')}`
+            const periodLabel = (hasStart && hasEnd)
+                ? `${startYm} ~ ${endYm}`
                 : '最新一個月';
 
-            console.log('[Revenue] fetchRevenueData start', { year, month, market });
-            this.addLogMessage(`📥 抓取月營收：${ymLabel} 市場=${market.toUpperCase()}`, 'info');
+            console.log('[Revenue] fetchRevenueData start', { startYm, endYm, market });
+            this.addLogMessage(`📥 抓取月營收：${periodLabel} 市場=${market.toUpperCase()}`, 'info');
             this.clearRevenueLog(true);
-            this.addRevenueLog(`開始抓取：${ymLabel}，市場=${market.toUpperCase()}`, 'info');
+            this.addRevenueLog(`開始抓取：${periodLabel}，市場=${market.toUpperCase()}`, 'info');
 
             const marketLabel = this.getRevenueMarketLabel(market);
             this.addRevenueLog(`目標市場：${marketLabel}，若未指定年月則抓取最新一期`, 'info');
 
-            const params = new URLSearchParams({ market });
-            if (year && month) {
-                params.set('year', String(year));
-                params.set('month', String(month));
+            const origin = (window && window.location && window.location.origin) ? window.location.origin : '';
+            const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
+
+            let requestUrl;
+            let params;
+            if (hasStart && hasEnd) {
+                requestUrl = `${base}/api/revenue/fetch_range`;
+                params = new URLSearchParams({ start: startYm, end: endYm, market, include_data: 'true' });
+            } else {
+                requestUrl = `${base}/api/revenue/fetch`;
+                params = new URLSearchParams({ market });
             }
+
             if (this.useLocalDb) {
                 params.set('use_local_db', 'true');
             }
-            const origin = (window && window.location && window.location.origin) ? window.location.origin : '';
-            const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
-            const requestUrl = `${base}/api/revenue/fetch`;
+
             this.addRevenueLog(`向伺服器發送請求：${requestUrl}`, 'info');
             const startedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 
@@ -2336,6 +2978,15 @@ class TaiwanStockApp {
                 'info'
             );
 
+            if (Array.isArray(data.monthly_stats) && data.monthly_stats.length > 0) {
+                const ok = data.monthly_stats.filter(s => !s.error);
+                const failed = data.monthly_stats.filter(s => s.error);
+                this.addRevenueLog(
+                    `月份統計：成功 ${this.formatInteger(ok.length)} 期、失敗 ${this.formatInteger(failed.length)} 期`,
+                    failed.length > 0 ? 'warning' : 'info'
+                );
+            }
+
             if (data.persist_enabled) {
                 const inserted = Number(data.persisted || 0);
                 const targetLabel = this.useLocalDb ? '本地資料庫' : 'Neon 雲端';
@@ -2357,39 +3008,72 @@ class TaiwanStockApp {
     }
 
     async exportRevenueCsv() {
-        const yearStr = document.getElementById('revenueYear')?.value;
-        const monthStr = document.getElementById('revenueMonth')?.value;
-        const market = document.getElementById('revenueMarketSelect')?.value || 'both';
-
-        let year = null;
-        let month = null;
-        if (yearStr && monthStr) {
-            year = parseInt(yearStr, 10);
-            month = parseInt(monthStr, 10);
-            if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) {
-                this.addRevenueLog('年份或月份格式不正確，請輸入例如 2025 / 10', 'warning');
+        try {
+            if (!Array.isArray(this.revenueData) || this.revenueData.length === 0) {
+                this.addRevenueLog('目前沒有資料可匯出，請先執行抓取', 'warning');
                 return;
             }
-        } else if (yearStr || monthStr) {
-            this.addRevenueLog('年份與月份需同時填寫或同時留空', 'warning');
-            return;
-        }
 
-        const ymLabel = (year && month)
-            ? `${year}-${String(month).padStart(2, '0')}`
-            : '最新一個月';
+            const rows = this.revenueData;
+            const header = [
+                'revenue_month', 'market', 'stock_no', 'stock_name', 'industry', 'report_date',
+                'month_revenue', 'last_month_revenue', 'last_year_month_revenue',
+                'mom_change_pct', 'yoy_change_pct',
+                'acc_revenue', 'last_year_acc_revenue', 'acc_change_pct', 'note',
+            ];
 
-        const origin = (window && window.location && window.location.origin) ? window.location.origin : '';
-        const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
-        const params = new URLSearchParams({ market });
-        if (year && month) {
-            params.set('year', String(year));
-            params.set('month', String(month));
+            const escapeCsv = (v) => {
+                const s = (v === null || v === undefined) ? '' : String(v);
+                if (s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r')) {
+                    return `"${s.replace(/"/g, '""')}"`;
+                }
+                return s;
+            };
+
+            const lines = [];
+            lines.push(header.join(','));
+            for (const r of rows) {
+                const rec = {
+                    revenue_month: r.revenue_month || r.revenueMonth || r.revenue_date || r.revenueMonthDate || r.revenue_month_date || '',
+                    market: r.market || '',
+                    stock_no: r.stock_no || '',
+                    stock_name: r.stock_name || '',
+                    industry: r.industry || '',
+                    report_date: r.report_date || '',
+                    month_revenue: r.month_revenue ?? '',
+                    last_month_revenue: r.last_month_revenue ?? '',
+                    last_year_month_revenue: r.last_year_month_revenue ?? '',
+                    mom_change_pct: r.mom_change_pct ?? '',
+                    yoy_change_pct: r.yoy_change_pct ?? '',
+                    acc_revenue: r.acc_revenue ?? '',
+                    last_year_acc_revenue: r.last_year_acc_revenue ?? '',
+                    acc_change_pct: r.acc_change_pct ?? '',
+                    note: r.note || '',
+                };
+                lines.push(header.map((k) => escapeCsv(rec[k])).join(','));
+            }
+
+            const startYm = document.getElementById('revenueStartYm')?.value;
+            const endYm = document.getElementById('revenueEndYm')?.value;
+            const nameLabel = (startYm && endYm) ? `${startYm}_to_${endYm}` : 'latest';
+            const filename = `monthly_revenue_${nameLabel}.csv`;
+
+            const csvText = lines.join('\n');
+            const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+
+            this.addRevenueLog(`CSV 匯出完成：${filename}（${this.formatInteger(rows.length)} 筆）`, 'success');
+        } catch (err) {
+            console.error('[Revenue] export csv error', err);
+            this.addRevenueLog(`CSV 匯出失敗：${err.message}`, 'error');
         }
-        const url = `${base}/api/revenue/export?${params.toString()}`;
-        this.addLogMessage(`📤 匯出月營收 CSV: ${url}`, 'info');
-        this.addRevenueLog(`執行 CSV 匯出：${url}（${ymLabel}）`, 'info');
-        window.open(url, '_blank');
     }
 
     updateRevenueSummary(summary) {
@@ -2399,7 +3083,8 @@ class TaiwanStockApp {
         this.setTextContent('revenueStatTotal', this.formatInteger(summary.total_records || 0));
         const year = summary.year;
         const month = summary.month;
-        const period = (year && month) ? `${year}-${String(month).padStart(2, '0')}` : (summary.roc_yyyymm || '--');
+        const period = summary.period
+            || ((year && month) ? `${year}-${String(month).padStart(2, '0')}` : (summary.roc_yyyymm || '--'));
         this.setTextContent('revenueStatPeriod', period || '--');
         const badge = document.getElementById('revenueSummaryBadge');
         if (badge) badge.textContent = period || '尚未執行';
@@ -2416,7 +3101,7 @@ class TaiwanStockApp {
                             <div class="no-data-icon"><i class="fas fa-search"></i></div>
                             <div class="no-data-text">
                                 <h4>尚無資料</h4>
-                                <p>請先設定年份、月份與市場後執行抓取</p>
+                                <p>請先設定開始/結束年月與市場後執行抓取</p>
                             </div>
                         </div>
                     </td>
@@ -2625,15 +3310,25 @@ class TaiwanStockApp {
 
             const batchSizeStr = document.getElementById('incomeBatchSize')?.value || '';
             const restMinutesStr = document.getElementById('incomeBatchRestMinutes')?.value || '';
+            const retryMaxStr = document.getElementById('incomeRetryMax')?.value || '';
+            const retryWaitMinutesStr = document.getElementById('incomeRetryWaitMinutes')?.value || '';
             const batchSize = parseInt(batchSizeStr, 10);
             const restMinutes = parseFloat(restMinutesStr);
+            const retryMax = parseInt(retryMaxStr, 10);
+            const retryWaitMinutes = parseFloat(retryWaitMinutesStr);
             const hasBatch = Number.isFinite(batchSize) && batchSize > 0;
             const hasRest = Number.isFinite(restMinutes) && restMinutes > 0;
+            const hasRetryMax = Number.isFinite(retryMax) && retryMax >= 0;
+            const hasRetryWait = Number.isFinite(retryWaitMinutes) && retryWaitMinutes > 0;
             if (hasBatch && hasRest) {
                 this.addIncomeLog(
                     `節流設定：每抓取 ${batchSize} 檔休息 ${restMinutes} 分鐘後繼續。`,
                     'info',
                 );
+            }
+            if (hasRetryMax) {
+                const waitLabel = hasRetryWait ? retryWaitMinutes : 5;
+                this.addIncomeLog(`封鎖自動續抓設定：最多暫停/重試 ${retryMax} 次（每次 ${waitLabel} 分鐘）。`, 'info');
             }
 
             console.log('[Income] fetchIncomeData start', { year, season });
@@ -2660,6 +3355,9 @@ class TaiwanStockApp {
             if (codeTo) params.append('code_to', codeTo);
             if (hasBatch) params.append('pause_every', String(batchSize));
             if (hasRest) params.append('pause_minutes', String(restMinutes));
+            params.append('retry_on_block', '1');
+            params.append('retry_wait_minutes', String(hasRetryWait ? retryWaitMinutes : 5));
+            if (hasRetryMax) params.append('retry_max', String(retryMax));
             if (writeToDb) {
                 params.append('write_to_db', '1');
                 params.append('use_local_db', this.useLocalDb ? 'true' : 'false');
@@ -2786,10 +3484,16 @@ class TaiwanStockApp {
 
             const batchSizeStr = document.getElementById('incomeBatchSize')?.value || '';
             const restMinutesStr = document.getElementById('incomeBatchRestMinutes')?.value || '';
+            const retryMaxStr = document.getElementById('incomeRetryMax')?.value || '';
+            const retryWaitMinutesStr = document.getElementById('incomeRetryWaitMinutes')?.value || '';
             const batchSize = parseInt(batchSizeStr, 10);
             const restMinutes = parseFloat(restMinutesStr);
+            const retryMax = parseInt(retryMaxStr, 10);
+            const retryWaitMinutes = parseFloat(retryWaitMinutesStr);
             const hasBatch = Number.isFinite(batchSize) && batchSize > 0;
             const hasRest = Number.isFinite(restMinutes) && restMinutes > 0;
+            const hasRetryMax = Number.isFinite(retryMax) && retryMax >= 0;
+            const hasRetryWait = Number.isFinite(retryWaitMinutes) && retryWaitMinutes > 0;
 
             const selectedSeasons = [];
             for (let s = 1; s <= 4; s += 1) {
@@ -2832,6 +3536,10 @@ class TaiwanStockApp {
                     'info',
                 );
             }
+            if (hasRetryMax) {
+                const waitLabel = hasRetryWait ? retryWaitMinutes : 5;
+                this.addIncomeLog(`多期別封鎖自動續抓：最多暫停/重試 ${retryMax} 次（每次 ${waitLabel} 分鐘）。`, 'info');
+            }
             if (writeToDb) {
                 this.addIncomeLog(
                     `多期別損益表將在伺服器端同步寫入資料庫（目標：${this.useLocalDb ? '本地 PostgreSQL' : 'Neon 雲端'}）。`,
@@ -2867,6 +3575,9 @@ class TaiwanStockApp {
                 if (codeTo) params.append('code_to', codeTo);
                 if (hasBatch) params.append('pause_every', String(batchSize));
                 if (hasRest) params.append('pause_minutes', String(restMinutes));
+                params.append('retry_on_block', '1');
+                params.append('retry_wait_minutes', String(hasRetryWait ? retryWaitMinutes : 5));
+                if (hasRetryMax) params.append('retry_max', String(retryMax));
                 if (writeToDb) {
                     params.append('write_to_db', '1');
                     params.append('use_local_db', this.useLocalDb ? 'true' : 'false');
@@ -3244,6 +3955,374 @@ class TaiwanStockApp {
         this.safeAddEventListener('balanceLogClearBtn', () => this.clearBalanceLog());
     }
 
+    /** =========================
+     *  財務比率 (Financial Ratios)
+     *  ========================= */
+
+    setupRatiosListeners() {
+        this.initializeRatiosLogPanel();
+        this.safeAddEventListener('ratiosLogClearBtn', () => this.clearRatiosLog());
+        this.safeAddEventListener('ratiosFetchBtn', () => this.fetchRatiosData(false));
+        this.safeAddEventListener('ratiosWriteDbBtn', () => this.fetchRatiosData(true));
+    }
+
+    initializeRatiosLogPanel() {
+        const panel = document.getElementById('ratiosLogPanel');
+        if (panel) {
+            this.ratiosLogPanel = panel;
+            if (!this._ratiosLogInitialized) {
+                this._ratiosLogInitialized = true;
+                this.setRatiosLogEmptyState();
+            }
+        }
+
+        const clearBtn = document.getElementById('ratiosLogClearBtn');
+        if (clearBtn && !clearBtn.dataset.bound) {
+            clearBtn.addEventListener('click', (ev) => {
+                ev.preventDefault();
+                this.clearRatiosLog();
+            });
+            clearBtn.dataset.bound = 'true';
+        }
+    }
+
+    setRatiosLogEmptyState() {
+        if (!this.ratiosLogPanel) return;
+        this.ratiosLogPanel.innerHTML = '';
+        const empty = document.createElement('div');
+        empty.className = 'ratios-log-empty';
+        empty.style.color = '#94a3b8';
+        empty.textContent = '尚未開始計算';
+        this.ratiosLogPanel.appendChild(empty);
+    }
+
+    clearRatiosLog(silent = false) {
+        this.initializeRatiosLogPanel();
+        if (!this.ratiosLogPanel) return;
+        this.setRatiosLogEmptyState();
+        if (!silent) {
+            this.addRatiosLog('日誌已清空', 'info');
+        }
+    }
+
+    addRatiosLog(message, level = 'info') {
+        this.initializeRatiosLogPanel();
+        if (!this.ratiosLogPanel) return;
+
+        const panel = this.ratiosLogPanel;
+        const empty = panel.querySelector('.ratios-log-empty');
+        if (empty) empty.remove();
+
+        const colors = {
+            info: '#60a5fa',
+            success: '#4ade80',
+            warning: '#fbbf24',
+            error: '#f87171',
+        };
+        const icons = {
+            info: 'ℹ️',
+            success: '✅',
+            warning: '⚠️',
+            error: '❌',
+        };
+
+        const entry = document.createElement('div');
+        entry.className = `ratios-log-entry ratios-log-${level}`;
+        entry.style.display = 'flex';
+        entry.style.alignItems = 'flex-start';
+        entry.style.gap = '0.5rem';
+        entry.style.padding = '0.4rem 0.6rem';
+        entry.style.marginBottom = '0.35rem';
+        entry.style.borderLeft = `3px solid ${colors[level] || '#94a3b8'}`;
+        entry.style.background = 'rgba(15,23,42,0.55)';
+        entry.style.borderRadius = '6px';
+        entry.style.boxShadow = 'inset 0 0 0 1px rgba(148,163,184,0.08)';
+
+        const timeSpan = document.createElement('span');
+        timeSpan.className = 'ratios-log-time';
+        timeSpan.style.fontFamily = "'Roboto Mono','Courier New',monospace";
+        timeSpan.style.fontSize = '0.75rem';
+        timeSpan.style.color = '#cbd5f5';
+        timeSpan.style.minWidth = '3.6rem';
+        timeSpan.textContent = this.getCurrentTimeString();
+
+        const iconSpan = document.createElement('span');
+        iconSpan.className = 'ratios-log-icon';
+        iconSpan.style.minWidth = '1.2rem';
+        iconSpan.textContent = icons[level] || '•';
+
+        const textSpan = document.createElement('span');
+        textSpan.className = 'ratios-log-text';
+        textSpan.style.flex = '1';
+        textSpan.style.color = colors[level] || '#e2e8f0';
+        textSpan.style.whiteSpace = 'pre-wrap';
+        textSpan.textContent = message;
+
+        entry.appendChild(timeSpan);
+        entry.appendChild(iconSpan);
+        entry.appendChild(textSpan);
+        panel.appendChild(entry);
+
+        if (this.ratiosLogAutoScroll) {
+            panel.scrollTop = panel.scrollHeight;
+        }
+    }
+
+    updateRatiosProgress(percentage, message) {
+        const fill = document.getElementById('ratiosProgressFill');
+        const text = document.getElementById('ratiosProgressText');
+        const status = document.getElementById('ratiosProgressStatus');
+        const pct = Math.max(0, Math.min(100, Math.round(Number(percentage) || 0)));
+        if (fill) fill.style.width = `${pct}%`;
+        if (text) text.textContent = `${pct}%`;
+        if (status && typeof message === 'string' && message) status.textContent = message;
+    }
+
+    stopRatiosProgressTimer() {
+        if (this._ratiosProgressTimer) {
+            clearInterval(this._ratiosProgressTimer);
+            this._ratiosProgressTimer = null;
+        }
+        this._ratiosLastProgressPct = null;
+    }
+
+    startRatiosProgressPolling(base) {
+        this.stopRatiosProgressTimer();
+        this.updateRatiosProgress(10, '已送出請求至伺服器，等待進度回報…');
+        this._ratiosProgressTimer = window.setInterval(async () => {
+            try {
+                const res = await fetch(`${base}/api/financial-ratios/status${this.useLocalDb ? '?use_local_db=true' : ''}`);
+                if (!res.ok) return;
+                const json = await res.json();
+                const st = json && json.status ? json.status : null;
+                if (!st) return;
+                const phase = st.phase || '';
+                const totalRaw = st.total;
+                const processedRaw = st.processed;
+                const total = Number.isFinite(Number(totalRaw)) ? Number(totalRaw) : 0;
+                const processed = Number.isFinite(Number(processedRaw)) ? Number(processedRaw) : 0;
+                const running = !!st.running;
+                const currentCode = st.current_code || st.currentCode || '';
+                const inserted = st.db_inserted_rows ?? st.dbInsertedRows;
+                const pct = total > 0 ? (processed / total) * 100 : 0;
+                const pctRounded = Math.max(0, Math.min(100, Math.round(pct)));
+                let statusText = '';
+                if (phase === 'querying') {
+                    statusText = '查詢中：正在從資料庫讀取損益表/資產負債表並進行 JOIN…';
+                } else if (phase === 'computing') {
+                    statusText =
+                        total > 0
+                            ? `計算中：${processed}/${total}（${pctRounded}%）${currentCode ? ` 目前：${currentCode}` : ''}`
+                            : `計算中…${currentCode ? ` 目前：${currentCode}` : ''}`;
+                } else if (phase === 'done') {
+                    statusText = '完成';
+                } else if (phase === 'error') {
+                    statusText = `失敗${st.error ? `：${st.error}` : ''}`;
+                } else {
+                    statusText = total > 0
+                        ? `處理中：${processed}/${total}（${pctRounded}%）${currentCode ? ` 目前：${currentCode}` : ''}`
+                        : `處理中…${currentCode ? ` 目前：${currentCode}` : ''}`;
+                }
+                this.updateRatiosProgress(pctRounded, statusText);
+
+                // 避免日誌刷太快：每 5% 記一次
+                if (this._ratiosLastProgressPct === null || pctRounded - this._ratiosLastProgressPct >= 5) {
+                    this._ratiosLastProgressPct = pctRounded;
+                    this.addRatiosLog(statusText, 'info');
+                    if (Number.isFinite(Number(inserted))) {
+                        this.addRatiosLog(`DB 寫入：已寫入 ${this.formatInteger(Number(inserted))} 筆`, 'info');
+                    }
+                }
+
+                if (!running) {
+                    this.stopRatiosProgressTimer();
+                }
+            } catch (_) {
+                // ignore polling errors
+            }
+        }, 1500);
+    }
+
+    async fetchRatiosData(writeToDb = false) {
+        try {
+            this.clearRatiosLog(true);
+            const yearStr = document.getElementById('ratiosYear')?.value;
+            const seasonStr = document.getElementById('ratiosSeason')?.value || '1';
+            const year = parseInt(yearStr || '', 10);
+            const season = parseInt(seasonStr || '1', 10);
+            if (!Number.isFinite(year) || year < 2000) {
+                this.addRatiosLog('請輸入正確的西元年度（例如 2025）', 'warning');
+                this.showToast?.('請輸入正確的西元年度（例如 2025）', 'warning');
+                return;
+            }
+            if (![1, 2, 3, 4].includes(season)) {
+                this.addRatiosLog('請選擇 1-4 季之一', 'warning');
+                this.showToast?.('請選擇 1-4 季之一', 'warning');
+                return;
+            }
+
+            const codeFrom = String(document.getElementById('ratiosCodeFrom')?.value || '').trim();
+            const codeTo = String(document.getElementById('ratiosCodeTo')?.value || '').trim();
+
+            const origin = (window && window.location && window.location.origin) ? window.location.origin : '';
+            const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
+
+            const params = new URLSearchParams();
+            params.set('year', String(year));
+            params.set('season', String(season));
+            if (codeFrom) params.set('code_from', codeFrom);
+            if (codeTo) params.set('code_to', codeTo);
+            if (writeToDb) params.set('write_to_db', 'true');
+            if (this.useLocalDb) params.set('use_local_db', 'true');
+
+            const url = `${base}/api/financial-ratios?${params.toString()}`;
+
+            this.addRatiosLog(`開始計算財務比率：年度 ${year} / 第 ${season} 季`, 'info');
+            if (codeFrom || codeTo) {
+                this.addRatiosLog(`股票代號範圍：${codeFrom || '最小'} ~ ${codeTo || '最大'}`, 'info');
+            }
+            if (writeToDb) {
+                this.addRatiosLog(
+                    `將在伺服器端同步寫入資料庫（目標：${this.useLocalDb ? '本地 PostgreSQL' : 'Neon 雲端'}）`,
+                    'info',
+                );
+            }
+            this.addRatiosLog(`GET ${url}`, 'info');
+
+            // 進度輪詢（需要後端提供 /api/financial-ratios/status）
+            this.startRatiosProgressPolling(base);
+
+            const badge = document.getElementById('ratiosSummaryBadge');
+            if (badge) badge.textContent = '計算中…';
+
+            const res = await fetch(url);
+            if (!res.ok) {
+                const txt = await res.text();
+                throw new Error(txt || `HTTP ${res.status}`);
+            }
+            const json = await res.json();
+            const data = Array.isArray(json) ? json : (json.data || []);
+            const meta = (json && json.meta) ? json.meta : {};
+
+            this.ratiosData = data;
+            this.renderRatiosResultsTable();
+            this.updateRatiosSummary(meta);
+
+            const rows = meta.rows ?? (Array.isArray(data) ? data.length : 0);
+            const inserted = meta.inserted;
+            if (writeToDb) {
+                this.addRatiosLog(
+                    `✅ 計算完成：共 ${this.formatInteger(rows)} 筆；寫入 ${Number.isFinite(Number(inserted)) ? this.formatInteger(inserted) : inserted ?? '--'} 筆`,
+                    'success',
+                );
+            } else {
+                this.addRatiosLog(`✅ 計算完成：共 ${this.formatInteger(rows)} 筆`, 'success');
+            }
+
+            if (writeToDb) {
+                this.showToast?.('✅ 已計算並寫入資料庫', 'success');
+            } else {
+                this.showToast?.('✅ 財務比率計算完成', 'success');
+            }
+
+            this.stopRatiosProgressTimer();
+            this.updateRatiosProgress(100, '完成');
+        } catch (err) {
+            console.error('[Ratios] fetch error', err);
+            const badge = document.getElementById('ratiosSummaryBadge');
+            if (badge) badge.textContent = '失敗';
+            this.addRatiosLog(`財務比率計算失敗：${err.message}`, 'error');
+            this.showToast?.(`財務比率計算失敗：${err.message}`, 'error');
+
+            this.stopRatiosProgressTimer();
+            this.updateRatiosProgress(0, '失敗');
+        }
+    }
+
+    updateRatiosSummary(meta = {}) {
+        const total = meta.rows ?? (Array.isArray(this.ratiosData) ? this.ratiosData.length : 0);
+        const period = meta.period || '--';
+        const inserted = meta.inserted ?? '--';
+        const badge = document.getElementById('ratiosSummaryBadge');
+        if (badge) badge.textContent = period || '尚未執行';
+        this.setTextContent('ratiosStatTotal', total);
+        this.setTextContent('ratiosStatPeriod', period);
+        this.setTextContent('ratiosStatInserted', inserted);
+    }
+
+    renderRatiosResultsTable() {
+        const tbody = document.querySelector('#ratiosResultsTable tbody');
+        if (!tbody) return;
+        const rows = Array.isArray(this.ratiosData) ? this.ratiosData : [];
+        if (!rows.length) {
+            tbody.innerHTML = `
+                <tr class="no-data-row">
+                    <td colspan="16" class="no-data-cell">
+                        <div class="no-data-content">
+                            <div class="no-data-icon"><i class="fas fa-search"></i></div>
+                            <div class="no-data-text">
+                                <h4>尚無資料</h4>
+                                <p>請先輸入年度與季別後執行計算</p>
+                            </div>
+                        </div>
+                    </td>
+                </tr>`;
+            return;
+        }
+
+        const fmtPct = (v) => {
+            if (v === null || v === undefined || v === '') return '';
+            const n = Number(v);
+            if (!Number.isFinite(n)) return String(v);
+            return (n * 100).toFixed(2) + '%';
+        };
+        const fmtInt = (v) => {
+            if (v === null || v === undefined || v === '') return '';
+            const n = Number(v);
+            if (!Number.isFinite(n)) return String(v);
+            try {
+                return n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+            } catch (_) {
+                return String(Math.round(n));
+            }
+        };
+        const fmtNum = (v) => {
+            if (v === null || v === undefined || v === '') return '';
+            const n = Number(v);
+            if (!Number.isFinite(n)) return String(v);
+            return n.toFixed(4);
+        };
+
+        const sample = rows.slice(0, 200);
+        const bodyHtml = sample
+            .map((r) => `
+                <tr>
+                    <td>${r.symbol || ''}</td>
+                    <td>${r.period || ''}</td>
+                    <td class="number">${fmtInt(r.revenue)}</td>
+                    <td class="number">${fmtInt(r.gross_profit)}</td>
+                    <td class="number">${fmtInt(r.op_profit)}</td>
+                    <td class="number">${fmtInt(r.net_profit)}</td>
+                    <td class="number">${fmtInt(r.assets)}</td>
+                    <td class="number">${fmtInt(r.equity)}</td>
+                    <td class="number">${fmtPct(r.gross_margin)}</td>
+                    <td class="number">${fmtPct(r.op_margin)}</td>
+                    <td class="number">${fmtPct(r.net_margin)}</td>
+                    <td class="number">${fmtPct(r.roa)}</td>
+                    <td class="number">${fmtPct(r.roe)}</td>
+                    <td class="number">${fmtPct(r.debt_ratio)}</td>
+                    <td class="number">${fmtNum(r.current_ratio)}</td>
+                    <td class="number">${fmtNum(r.quick_ratio)}</td>
+                </tr>`)
+            .join('');
+
+        const extraRow =
+            rows.length > sample.length
+                ? `<tr><td colspan="16" class="text-muted">僅顯示前 ${sample.length} 筆（共 ${this.formatInteger(rows.length)} 筆）</td></tr>`
+                : '';
+        tbody.innerHTML = bodyHtml + extraRow;
+    }
+
     initializeBalanceLogPanel() {
         const panel = document.getElementById('balanceLogPanel');
         if (panel) {
@@ -3387,17 +4466,20 @@ class TaiwanStockApp {
             const batchSizeStr = document.getElementById('balanceBatchSize')?.value || '';
             const restMinutesStr = document.getElementById('balanceBatchRestMinutes')?.value || '';
             const retryMaxStr = document.getElementById('balanceRetryMax')?.value || '';
+            const retryWaitMinutesStr = document.getElementById('balanceRetryWaitMinutes')?.value || '';
             const batchSize = parseInt(batchSizeStr, 10);
             const restMinutes = parseFloat(restMinutesStr);
             const retryMax = parseInt(retryMaxStr, 10);
+            const retryWaitMinutes = parseFloat(retryWaitMinutesStr);
             const hasBatch = Number.isFinite(batchSize) && batchSize > 0;
             const hasRest = Number.isFinite(restMinutes) && restMinutes > 0;
             const hasRetryMax = Number.isFinite(retryMax) && retryMax >= 0;
+            const hasRetryWait = Number.isFinite(retryWaitMinutes) && retryWaitMinutes > 0;
             if (hasBatch && hasRest) {
                 this.addBalanceLog(`節流設定：每抓取 ${batchSize} 檔休息 ${restMinutes} 分鐘後繼續。`, 'info');
             }
             if (hasRetryMax) {
-                this.addBalanceLog(`封鎖自動續抓設定：最多暫停/重試 ${retryMax} 次（每次 5 分鐘）。`, 'info');
+                this.addBalanceLog(`封鎖自動續抓設定：最多暫停/重試 ${retryMax} 次（每次 ${hasRetryWait ? retryWaitMinutes : 5} 分鐘）。`, 'info');
             }
 
             const autoImportEl = document.getElementById('balanceAutoImportCheckbox');
@@ -3423,7 +4505,7 @@ class TaiwanStockApp {
             if (hasBatch) params.append('pause_every', String(batchSize));
             if (hasRest) params.append('pause_minutes', String(restMinutes));
             params.append('retry_on_block', '1');
-            params.append('retry_wait_minutes', '5');
+            params.append('retry_wait_minutes', String(hasRetryWait ? retryWaitMinutes : 5));
             if (hasRetryMax) params.append('retry_max', String(retryMax));
             if (writeToDb) {
                 params.append('write_to_db', '1');
@@ -3666,6 +4748,282 @@ class TaiwanStockApp {
         tbody.innerHTML = bodyHtml + extraRow;
     }
 
+    /** =========================
+     *  現金流量表 (Cash Flow)
+     *  ========================= */
+    setupCashflowListeners() {
+        this.safeAddEventListener('cashflowFetchBtn', () => this.fetchCashflowData());
+        this.safeAddEventListener('cashflowMultiFetchBtn', () => this.fetchCashflowMultiPeriod());
+        this.safeAddEventListener('cashflowImportDbBtn', () => this.importCashflowToDb());
+        this.safeAddEventListener('cashflowExportBtn', () => this.exportCashflowCsv());
+        this.safeAddEventListener('cashflowLogClearBtn', () => this.clearCashflowLog());
+        this.cashflowLogPanel = document.getElementById('cashflowLogPanel');
+    }
+
+    clearCashflowLog() {
+        this.cashflowLogPanel = document.getElementById('cashflowLogPanel');
+        if (this.cashflowLogPanel) this.cashflowLogPanel.textContent = '';
+    }
+
+    addCashflowLog(message, level = 'info') {
+        this.cashflowLogPanel = document.getElementById('cashflowLogPanel');
+        if (!this.cashflowLogPanel) return;
+        if (this.cashflowLogPanel.textContent === '尚未開始抓取') {
+            this.cashflowLogPanel.textContent = '';
+        }
+        const colors = {
+            info: '#60a5fa', success: '#4ade80', warning: '#fbbf24', error: '#f87171',
+        };
+        const row = document.createElement('div');
+        row.style.padding = '.35rem .5rem';
+        row.style.marginBottom = '.25rem';
+        row.style.borderLeft = `3px solid ${colors[level] || '#94a3b8'}`;
+        row.style.background = 'rgba(15,23,42,.55)';
+        row.style.borderRadius = '5px';
+        row.textContent = `[${this.getCurrentTimeString()}] ${message}`;
+        this.cashflowLogPanel.appendChild(row);
+        this.cashflowLogPanel.scrollTop = this.cashflowLogPanel.scrollHeight;
+    }
+
+    updateCashflowProgress(percentage, message) {
+        const pct = Math.max(0, Math.min(100, Math.round(Number(percentage) || 0)));
+        const fill = document.getElementById('cashflowProgressFill');
+        const text = document.getElementById('cashflowProgressText');
+        const status = document.getElementById('cashflowProgressStatus');
+        if (fill) fill.style.width = `${pct}%`;
+        if (text) text.textContent = `${pct}%`;
+        if (status && message) status.textContent = message;
+    }
+
+    stopCashflowProgressTimer() {
+        if (this._cashflowProgressTimer) {
+            clearInterval(this._cashflowProgressTimer);
+            this._cashflowProgressTimer = null;
+        }
+    }
+
+    cashflowBaseUrl() {
+        const origin = window?.location?.origin || '';
+        return origin && origin !== 'file://' ? origin : 'http://localhost:5003';
+    }
+
+    cashflowRequestParams(year, season) {
+        const params = new URLSearchParams({ year: String(year), season: String(season) });
+        const code = String(document.getElementById('cashflowSingleCode')?.value || '').trim();
+        const codeFrom = String(document.getElementById('cashflowCodeFrom')?.value || '').trim();
+        const codeTo = String(document.getElementById('cashflowCodeTo')?.value || '').trim();
+        const batch = parseInt(document.getElementById('cashflowBatchSize')?.value || '', 10);
+        const rest = parseFloat(document.getElementById('cashflowBatchRestMinutes')?.value || '');
+        const retryMax = parseInt(document.getElementById('cashflowRetryMax')?.value || '1', 10);
+        const retryWait = parseFloat(document.getElementById('cashflowRetryWaitMinutes')?.value || '5');
+        if (code) params.set('code', code);
+        if (!code && codeFrom) params.set('code_from', codeFrom);
+        if (!code && codeTo) params.set('code_to', codeTo);
+        if (!code && Number.isFinite(batch) && batch > 0) params.set('pause_every', String(batch));
+        if (!code && Number.isFinite(rest) && rest > 0) params.set('pause_minutes', String(rest));
+        if (!code) {
+            params.set('retry_on_block', '1');
+            params.set('retry_max', String(Number.isFinite(retryMax) ? Math.max(0, retryMax) : 1));
+            params.set('retry_wait_minutes', String(Number.isFinite(retryWait) && retryWait > 0 ? retryWait : 5));
+        }
+        if (document.getElementById('cashflowAutoImportCheckbox')?.checked) {
+            params.set('write_to_db', '1');
+            params.set('use_local_db', this.useLocalDb ? 'true' : 'false');
+        }
+        return { params, isSingle: !!code };
+    }
+
+    startCashflowProgressPolling(base) {
+        this.stopCashflowProgressTimer();
+        this._cashflowProgressTimer = window.setInterval(async () => {
+            try {
+                const response = await fetch(`${base}/api/cash-flow-statement/status`);
+                if (!response.ok) return;
+                const payload = await response.json();
+                const state = payload?.status;
+                if (!state) return;
+                const total = Number(state.total || 0);
+                const processed = Number(state.processed || 0);
+                const pct = total > 0 ? Math.max(5, Math.min(99, (processed / total) * 100)) : 5;
+                let message = state.paused
+                    ? `MOPS 暫停中，預計 ${state.resumeAt || '稍後'} 續抓`
+                    : `處理中 ${processed}/${total || '?'} ${state.current_code || ''}`;
+                if (state.db_write_enabled) {
+                    message += `｜DB 已寫入 ${this.formatInteger(state.db_inserted_rows || 0)} 筆`;
+                }
+                this.updateCashflowProgress(pct, message);
+                if (!state.running) this.stopCashflowProgressTimer();
+            } catch (_) {}
+        }, 3000);
+    }
+
+    async requestCashflowPeriod(year, season) {
+        const { params, isSingle } = this.cashflowRequestParams(year, season);
+        const base = this.cashflowBaseUrl();
+        const url = `${base}/api/cash-flow-statement?${params.toString()}`;
+        if (!isSingle) this.startCashflowProgressPolling(base);
+        this.addCashflowLog(`抓取 ${year} 年第 ${season} 季${isSingle ? '單一股票' : ''}`, 'info');
+        const response = await fetch(url);
+        if (!response.ok) {
+            let message = `HTTP ${response.status}`;
+            try {
+                const payload = await response.json();
+                message = payload.error || message;
+            } catch (_) {}
+            throw new Error(message);
+        }
+        const data = await response.json();
+        if (!Array.isArray(data)) throw new Error('伺服器回傳格式錯誤');
+        return data;
+    }
+
+    async fetchCashflowData() {
+        this.clearCashflowLog();
+        const year = parseInt(document.getElementById('cashflowYear')?.value || '', 10);
+        const season = parseInt(document.getElementById('cashflowSeason')?.value || '1', 10);
+        if (!Number.isFinite(year) || year < 2000 || ![1, 2, 3, 4].includes(season)) {
+            this.addCashflowLog('請輸入正確年度並選擇第 1 至第 4 季', 'warning');
+            return;
+        }
+        try {
+            this.updateCashflowProgress(5, '準備抓取…');
+            const data = await this.requestCashflowPeriod(year, season);
+            this.cashflowData = data;
+            this.updateCashflowSummary(data, year, season);
+            this.renderCashflowResultsTable();
+            this.updateCashflowProgress(100, `完成：${this.formatInteger(data.length)} 筆`);
+            this.addCashflowLog(`抓取完成，共 ${this.formatInteger(data.length)} 筆`, 'success');
+        } catch (error) {
+            this.updateCashflowProgress(0, '抓取失敗');
+            this.addCashflowLog(`抓取失敗：${error.message}`, 'error');
+        } finally {
+            this.stopCashflowProgressTimer();
+        }
+    }
+
+    async fetchCashflowMultiPeriod() {
+        this.clearCashflowLog();
+        const from = parseInt(document.getElementById('cashflowYearFrom')?.value || '', 10);
+        const to = parseInt(document.getElementById('cashflowYearTo')?.value || '', 10);
+        const seasons = [1, 2, 3, 4].filter(
+            (season) => document.getElementById(`cashflowMultiSeason${season}`)?.checked,
+        );
+        if (!Number.isFinite(from) || !Number.isFinite(to) || from > to || !seasons.length) {
+            this.addCashflowLog('請設定有效的多期起訖年度及至少一個季別', 'warning');
+            return;
+        }
+        const tasks = [];
+        for (let year = from; year <= to; year += 1) {
+            seasons.forEach((season) => tasks.push({ year, season }));
+        }
+        const originalCode = document.getElementById('cashflowSingleCode');
+        const savedCode = originalCode?.value || '';
+        if (originalCode) originalCode.value = '';
+        const merged = [];
+        try {
+            for (let index = 0; index < tasks.length; index += 1) {
+                const task = tasks[index];
+                this.updateCashflowProgress((index / tasks.length) * 100, `多期 ${index + 1}/${tasks.length}`);
+                const rows = await this.requestCashflowPeriod(task.year, task.season);
+                merged.push(...rows);
+                this.addCashflowLog(`${task.year} Q${task.season}：${rows.length} 筆`, 'success');
+            }
+            this.cashflowData = merged;
+            this.updateCashflowSummary(merged);
+            this.renderCashflowResultsTable();
+            this.updateCashflowProgress(100, `多期完成：${merged.length} 筆`);
+        } catch (error) {
+            this.addCashflowLog(`多期抓取中止：${error.message}`, 'error');
+            this.updateCashflowProgress(0, '多期抓取失敗');
+        } finally {
+            if (originalCode) originalCode.value = savedCode;
+            this.stopCashflowProgressTimer();
+        }
+    }
+
+    async importCashflowToDb() {
+        if (!Array.isArray(this.cashflowData) || !this.cashflowData.length) {
+            this.addCashflowLog('目前沒有可寫入的資料', 'warning');
+            return;
+        }
+        try {
+            const response = await fetch(`${this.cashflowBaseUrl()}/api/cash-flow-statement/import`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rows: this.cashflowData, use_local_db: this.useLocalDb }),
+            });
+            const payload = await response.json();
+            if (!response.ok || !payload.success) throw new Error(payload.error || `HTTP ${response.status}`);
+            this.addCashflowLog(`已寫入資料庫 ${this.formatInteger(payload.inserted || 0)} 筆`, 'success');
+        } catch (error) {
+            this.addCashflowLog(`資料庫寫入失敗：${error.message}`, 'error');
+        }
+    }
+
+    exportCashflowCsv() {
+        const rows = Array.isArray(this.cashflowData) ? this.cashflowData : [];
+        if (!rows.length) {
+            this.addCashflowLog('目前沒有可匯出的資料', 'warning');
+            return;
+        }
+        const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+        const escape = (value) => {
+            if (value === null || value === undefined) return '';
+            const text = String(value).replace(/"/g, '""');
+            return /[",\r\n]/.test(text) ? `"${text}"` : text;
+        };
+        const csv = '\ufeff' + [
+            columns.map(escape).join(','),
+            ...rows.map((row) => columns.map((column) => escape(row[column])).join(',')),
+        ].join('\r\n');
+        const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `cash_flow_statement_${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        this.addCashflowLog('CSV 匯出完成', 'success');
+    }
+
+    updateCashflowSummary(data, year, season) {
+        const rows = Array.isArray(data) ? data : [];
+        const codes = new Set(rows.map((row) => row?.['股票代號']).filter(Boolean));
+        const periods = [...new Set(rows.map((row) => row?.period).filter(Boolean))];
+        const fallback = Number.isFinite(year) && season
+            ? `${year}${String(season).padStart(2, '0')}` : '--';
+        const periodText = periods.length > 1 ? `${periods[0]} ~ ${periods[periods.length - 1]}` : (periods[0] || fallback);
+        this.setTextContent('cashflowStatUnique', codes.size || '--');
+        this.setTextContent('cashflowStatTotal', rows.length || '--');
+        this.setTextContent('cashflowStatPeriod', periodText);
+        const badge = document.getElementById('cashflowSummaryBadge');
+        if (badge) badge.textContent = periodText;
+    }
+
+    renderCashflowResultsTable() {
+        const body = document.querySelector('#cashflowResultsTable tbody');
+        if (!body) return;
+        const rows = Array.isArray(this.cashflowData) ? this.cashflowData : [];
+        if (!rows.length) {
+            body.innerHTML = '<tr class="no-data-row"><td colspan="6" class="no-data-cell">尚無資料</td></tr>';
+            return;
+        }
+        const fmt = (value) => {
+            const number = Number(value);
+            return value === null || value === undefined || value === ''
+                ? '' : (Number.isFinite(number) ? number.toLocaleString() : String(value));
+        };
+        body.innerHTML = rows.slice(0, 200).map((row) => `
+            <tr>
+                <td>${row['股票代號'] || ''}</td><td>${row.period || ''}</td>
+                <td class="number">${fmt(row.NetCashFlowsFromUsedInOperatingActivities)}</td>
+                <td class="number">${fmt(row.NetCashFlowsFromUsedInInvestingActivities)}</td>
+                <td class="number">${fmt(row.NetCashFlowsFromUsedInFinancingActivities)}</td>
+                <td class="number">${fmt(row.NetIncreaseDecreaseInCashAndCashEquivalents)}</td>
+            </tr>`).join('');
+    }
+
     // 觸發後端計算報酬率
     async computeReturnsFromUI() {
         try {
@@ -3677,16 +5035,38 @@ class TaiwanStockApp {
             }
 
             const symbolInput = document.getElementById('returnsSymbol')?.value?.trim();
+            const customStart = document.getElementById('returnsStartDate')?.value;
+            const customEnd = document.getElementById('returnsEndDate')?.value;
             const fillMissing = !!document.getElementById('returnsFillMissing')?.checked;
+            const maxWorkersInput = document.getElementById('returnsMaxWorkers')?.value;
+            const batchSizeInput = document.getElementById('returnsBatchSize')?.value;
             
             // 獲取資料庫選擇
             const dbTarget = document.querySelector('input[name="returnsDbTarget"]:checked')?.value || 'local';
 
+            const rangeStart = customStart || cfg.startDate;
+            const rangeEnd = customEnd || cfg.endDate;
+
+            if (rangeStart && rangeEnd && rangeStart > rangeEnd) {
+                this.addLogMessage('⚠️ 計算報酬率日期範圍錯誤：開始日期不可晚於結束日期', 'warning');
+                return;
+            }
+
             const payload = {
-                start: cfg.startDate,
-                end: cfg.endDate,
+                start: rangeStart,
+                end: rangeEnd,
                 fillMissing: fillMissing,
             };
+
+            // 并行/批次參數（可空，留給後端使用默認）
+            const maxWorkersVal = parseInt(maxWorkersInput, 10);
+            if (!Number.isNaN(maxWorkersVal) && maxWorkersVal > 0) {
+                payload.max_workers = Math.min(32, Math.max(1, maxWorkersVal));
+            }
+            const batchSizeVal = parseInt(batchSizeInput, 10);
+            if (!Number.isNaN(batchSizeVal) && batchSizeVal > 0) {
+                payload.batch_size = Math.min(200, Math.max(1, batchSizeVal));
+            }
             
             // 根據選擇設定資料庫參數
             if (dbTarget === 'local') {
@@ -3720,7 +5100,7 @@ class TaiwanStockApp {
                 dbDesc = '🔄 同時兩邊';
             }
 
-            this.addLogMessage(`🧮 開始計算報酬：${payload.symbol || `ALL${payload.limit ? ` (limit=${payload.limit})` : ''}`}，範圍 ${payload.start}~${payload.end}，fillMissing=${fillMissing}，資料庫: ${dbDesc}`, 'info');
+            this.addLogMessage(`🧮 開始計算報酬：${payload.symbol || `ALL${payload.limit ? ` (limit=${payload.limit})` : ''}`}，範圍 ${payload.start || '(未指定)'}~${payload.end || '(未指定)'}，fillMissing=${fillMissing}，資料庫: ${dbDesc}`, 'info');
 
             if (this.returnsEventSource) {
                 try { this.returnsEventSource.close(); } catch (_) {}
@@ -4071,12 +5451,70 @@ class TaiwanStockApp {
                 this.setupSyncEventListeners();
             }, 100);
         }
+
+        if (tabName === 'query') {
+            setTimeout(() => {
+                this.loadQueryTables();
+            }, 100);
+        }
+    }
+
+    getSelectedQueryTable() {
+        try {
+            const el = document.getElementById('queryTableSelect');
+            if (!el) return '';
+            return String(el.value || '').trim();
+        } catch (e) {
+            return '';
+        }
+    }
+
+    async loadQueryTables() {
+        const selectEl = document.getElementById('queryTableSelect');
+        if (!selectEl) return;
+
+        try {
+            const origin = (window && window.location && window.location.origin) ? window.location.origin : '';
+            const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
+            const params = new URLSearchParams();
+            if (this.useLocalDb) params.set('use_local_db', 'true');
+            const resp = await fetch(`${base}/api/tables${params.toString() ? `?${params.toString()}` : ''}`);
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok || !data.success) {
+                return;
+            }
+
+            const current = this.getSelectedQueryTable();
+            const tables = Array.isArray(data.tables) ? data.tables : [];
+            const options = [{ label: '自動（依查詢類型）', value: '' }];
+            tables.forEach(t => {
+                const name = t && (t.name || t.tablename || t.table);
+                if (name) options.push({ label: String(name), value: String(name) });
+            });
+
+            selectEl.innerHTML = '';
+            options.forEach(opt => {
+                const o = document.createElement('option');
+                o.value = opt.value;
+                o.textContent = opt.label;
+                selectEl.appendChild(o);
+            });
+
+            if (current && options.some(o => o.value === current)) {
+                selectEl.value = current;
+            } else {
+                selectEl.value = '';
+            }
+        } catch (e) {
+        }
     }
     
     setupSyncEventListeners() {
         const btnLoadTables = document.getElementById('btnLoadTables');
         const btnSelectAll = document.getElementById('btnSelectAll');
         const btnDeselectAll = document.getElementById('btnDeselectAll');
+        const btnClearSyncLog = document.getElementById('btnClearSyncLog');
+        const btnExportTablesExcel = document.getElementById('btnExportTablesExcel');
         
         if (btnLoadTables && !btnLoadTables.dataset.listenerAdded) {
             btnLoadTables.addEventListener('click', () => this.loadTableList());
@@ -4092,16 +5530,185 @@ class TaiwanStockApp {
             btnDeselectAll.addEventListener('click', () => this.selectAllTables(false));
             btnDeselectAll.dataset.listenerAdded = 'true';
         }
+
+        if (btnClearSyncLog && !btnClearSyncLog.dataset.listenerAdded) {
+            btnClearSyncLog.addEventListener('click', () => this.clearSyncLog());
+            btnClearSyncLog.dataset.listenerAdded = 'true';
+        }
+
+        if (btnExportTablesExcel && !btnExportTablesExcel.dataset.listenerAdded) {
+            btnExportTablesExcel.addEventListener('click', () => this.exportSyncTablesToExcel());
+            btnExportTablesExcel.dataset.listenerAdded = 'true';
+        }
+
+        this.ensureDbSyncSse();
+    }
+
+    ensureDbSyncSse() {
+        if (this._dbSyncSse) return;
+        try {
+            const origin = (typeof window !== 'undefined' && window.location && window.location.origin)
+                ? window.location.origin
+                : '';
+            const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
+            const es = new EventSource(`${base}/api/stream/logs`);
+            this._dbSyncSse = es;
+
+            es.onopen = () => {
+                this.showSyncLogPanel();
+                this.addSyncLogLine('✅ 同步日誌已連線（SSE）', 'success');
+            };
+
+            es.onmessage = (evt) => {
+                let payload;
+                try {
+                    payload = JSON.parse(evt.data);
+                } catch (_) {
+                    return;
+                }
+                if (!payload || payload.channel !== 'db_sync') return;
+                this.handleDbSyncEvent(payload);
+            };
+
+            es.onerror = () => {
+                this.addSyncLogLine('⚠️ 同步日誌連線中斷，將在下次進入頁面時重試', 'warning');
+            };
+        } catch (_) {
+        }
+    }
+
+    handleDbSyncEvent(payload) {
+        const msg = payload.message || '';
+        const event = payload.event;
+        const direction = payload.direction;
+        const table = payload.table;
+
+        const progressInfo = document.getElementById('syncProgressInfo');
+        const logLabel = direction === 'download' ? '下載' : (direction === 'upload' ? '上傳' : '同步');
+
+        if (event === 'start') {
+            this.clearSyncLog(true);
+            this.showSyncLogPanel();
+            this.addSyncLogLine(`🚀 ${msg || `開始${logLabel}同步`}`, 'info');
+            return;
+        }
+
+        if (event === 'local_connected' || event === 'neon_connected') {
+            this.addSyncLogLine(`✅ ${msg}`, 'success');
+            return;
+        }
+
+        if (event === 'table_start') {
+            this.addSyncLogLine(`📦 ${msg}`, 'info');
+            if (progressInfo) {
+                progressInfo.textContent = `${logLabel}中：${table || ''}`;
+                progressInfo.style.color = '';
+            }
+            return;
+        }
+
+        if (event === 'table_truncate') {
+            this.addSyncLogLine(`🧹 ${msg}`, 'warning');
+            return;
+        }
+
+        if (event === 'table_info') {
+            this.addSyncLogLine(`📊 ${msg}`, 'info');
+            return;
+        }
+
+        if (event === 'batch_progress') {
+            this.addSyncLogLine(`⏳ ${msg}`, 'info');
+            if (progressInfo) {
+                progressInfo.textContent = msg;
+                progressInfo.style.color = '';
+            }
+            return;
+        }
+
+        if (event === 'table_skip') {
+            this.addSyncLogLine(`⚠️ ${msg}`, 'warning');
+            return;
+        }
+
+        if (event === 'table_done') {
+            this.addSyncLogLine(`✅ ${msg}`, 'success');
+            return;
+        }
+
+        if (event === 'done') {
+            this.addSyncLogLine(`🎉 ${msg}`, 'success');
+            return;
+        }
+
+        if (event === 'error') {
+            this.addSyncLogLine(`❌ ${msg}`, 'error');
+            if (progressInfo) {
+                progressInfo.textContent = msg || '同步發生錯誤';
+                progressInfo.style.color = '#ef4444';
+            }
+            return;
+        }
+
+        if (msg) {
+            this.addSyncLogLine(msg, 'info');
+        }
+    }
+
+    showSyncLogPanel() {
+        const section = document.getElementById('syncLogSection');
+        if (section) section.style.display = 'block';
+    }
+
+    clearSyncLog(silent = false) {
+        const panel = document.getElementById('syncLogPanel');
+        if (!panel) return;
+        panel.innerHTML = '<div class="sync-log-empty" style="color:#94a3b8;">尚未開始同步</div>';
+        if (!silent) {
+            this.addSyncLogLine('已清空日誌', 'info');
+        }
+    }
+
+    addSyncLogLine(text, level = 'info') {
+        const panel = document.getElementById('syncLogPanel');
+        if (!panel) return;
+        const empty = panel.querySelector('.sync-log-empty');
+        if (empty) empty.remove();
+
+        const line = document.createElement('div');
+        const ts = new Date().toLocaleTimeString();
+
+        let color = '#e2e8f0';
+        if (level === 'success') color = '#22c55e';
+        if (level === 'warning') color = '#f59e0b';
+        if (level === 'error') color = '#ef4444';
+
+        line.style.color = color;
+        line.textContent = `[${ts}] ${text}`;
+        panel.appendChild(line);
+        panel.scrollTop = panel.scrollHeight;
     }
     
     async loadTableList() {
         try {
             this.addLogMessage('📋 載入表格列表...', 'info');
-            
-            const response = await fetch('/api/database-sync/tables');
+
+            const sourceSel = document.getElementById('syncTablesSource');
+            const source = sourceSel && sourceSel.value ? sourceSel.value : 'local';
+            this.addLogMessage(`📋 表格列表來源：${source === 'neon' ? 'Neon 雲端' : '本機資料庫'}`, 'info');
+
+            this._lastSyncTablesSource = source;
+            this._lastSyncTables = [];
+            const btnExportTablesExcel = document.getElementById('btnExportTablesExcel');
+            if (btnExportTablesExcel) btnExportTablesExcel.disabled = true;
+
+            const qs = new URLSearchParams();
+            qs.set('source', source);
+            const response = await fetch(`/api/database-sync/tables?${qs.toString()}`);
             const data = await response.json();
             
             if (data.success && data.tables) {
+                this._lastSyncTables = Array.isArray(data.tables) ? data.tables : [];
                 this.displayTableList(data.tables);
                 this.addLogMessage(`✅ 成功載入 ${data.tables.length} 個表格`, 'success');
             } else {
@@ -4115,10 +5722,13 @@ class TaiwanStockApp {
     displayTableList(tables) {
         const tableListContainer = document.getElementById('tableListContainer');
         const tableList = document.getElementById('tableList');
+        const btnExportTablesExcel = document.getElementById('btnExportTablesExcel');
         
         if (!tableList) return;
         
         tableList.innerHTML = '';
+
+        this._syncTableCheckboxEls = [];
         
         tables.forEach(table => {
             const item = document.createElement('div');
@@ -4132,6 +5742,9 @@ class TaiwanStockApp {
             `;
             
             const checkbox = item.querySelector('input[type="checkbox"]');
+            if (checkbox) {
+                this._syncTableCheckboxEls.push(checkbox);
+            }
             checkbox.addEventListener('change', () => {
                 item.classList.toggle('selected', checkbox.checked);
                 this.updateTableSelectionCount();
@@ -4150,16 +5763,95 @@ class TaiwanStockApp {
         
         tableListContainer.style.display = 'block';
         this.updateTableSelectionCount();
+
+        if (btnExportTablesExcel) {
+            btnExportTablesExcel.disabled = !(Array.isArray(tables) && tables.length > 0);
+        }
         
         // 啟用上傳按鈕
         const btnStartSync = document.getElementById('btnStartSync');
         if (btnStartSync) {
             btnStartSync.disabled = false;
         }
+
+        const btnDownloadFromNeon = document.getElementById('btnDownloadFromNeon');
+        if (btnDownloadFromNeon) {
+            btnDownloadFromNeon.disabled = false;
+        }
+    }
+
+    exportSyncTablesToExcel() {
+        try {
+            const tables = Array.isArray(this._lastSyncTables) ? this._lastSyncTables : [];
+            if (!tables.length) {
+                this.addLogMessage('⚠️ 尚未載入表格列表，請先點「載入表格列表」', 'warning');
+                return;
+            }
+
+            const sel = this.getTableSelectionDebug ? this.getTableSelectionDebug() : { selectedTables: [] };
+            const selectedTables = Array.isArray(sel.selectedTables) ? sel.selectedTables : [];
+            if (selectedTables.length === 0) {
+                this.addLogMessage('⚠️ 請至少勾選一個表格再匯出', 'warning');
+                return;
+            }
+
+            const sourceSel = document.getElementById('syncTablesSource');
+            const source = (sourceSel && sourceSel.value) ? sourceSel.value : (this._lastSyncTablesSource || 'local');
+
+            const origin = (typeof window !== 'undefined' && window.location && window.location.origin)
+                ? window.location.origin
+                : '';
+            const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
+
+            const qs = new URLSearchParams();
+            qs.set('source', source);
+            const url = `${base}/api/database-sync/export_csv?${qs.toString()}`;
+
+            this.addLogMessage(`📤 產生 CSV(zip) 中（${source === 'neon' ? 'Neon' : '本機'}，${selectedTables.length} 表）...`, 'info');
+
+            fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tables: selectedTables })
+            }).then(async (resp) => {
+                if (!resp.ok) {
+                    let errMsg = `HTTP ${resp.status}`;
+                    try {
+                        const j = await resp.json();
+                        if (j && j.error) errMsg = j.error;
+                    } catch (_) {}
+                    throw new Error(errMsg);
+                }
+                const blob = await resp.blob();
+
+                const ts = new Date();
+                const yyyy = ts.getFullYear();
+                const mm = String(ts.getMonth() + 1).padStart(2, '0');
+                const dd = String(ts.getDate()).padStart(2, '0');
+                const filename = `sync_export_${source}_${yyyy}${mm}${dd}.zip`;
+
+                const a = document.createElement('a');
+                const objectUrl = URL.createObjectURL(blob);
+                a.href = objectUrl;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(objectUrl);
+
+                this.addLogMessage(`✅ 已匯出 CSV(zip)：${filename}`, 'success');
+            }).catch((e) => {
+                this.addLogMessage(`❌ 匯出 CSV(zip) 失敗: ${e.message}`, 'error');
+            });
+        } catch (e) {
+            this.addLogMessage(`❌ 匯出 CSV(zip) 失敗: ${e.message}`, 'error');
+        }
     }
     
     selectAllTables(select) {
-        const checkboxes = document.querySelectorAll('#tableList input[type="checkbox"]');
+        const checkboxes = (this._syncTableCheckboxEls && this._syncTableCheckboxEls.length > 0)
+            ? this._syncTableCheckboxEls
+            : Array.from(document.querySelectorAll('#tableList input[type="checkbox"]'));
         checkboxes.forEach(checkbox => {
             checkbox.checked = select;
             checkbox.closest('.table-selection-item').classList.toggle('selected', select);
@@ -4168,7 +5860,9 @@ class TaiwanStockApp {
     }
     
     updateTableSelectionCount() {
-        const checkboxes = document.querySelectorAll('#tableList input[type="checkbox"]');
+        const checkboxes = (this._syncTableCheckboxEls && this._syncTableCheckboxEls.length > 0)
+            ? this._syncTableCheckboxEls
+            : Array.from(document.querySelectorAll('#tableList input[type="checkbox"]'));
         const checked = Array.from(checkboxes).filter(cb => cb.checked).length;
         const total = checkboxes.length;
         
@@ -4182,11 +5876,94 @@ class TaiwanStockApp {
         if (btnStartSync) {
             btnStartSync.disabled = checked === 0;
         }
+
+        const btnDownloadFromNeon = document.getElementById('btnDownloadFromNeon');
+        if (btnDownloadFromNeon) {
+            btnDownloadFromNeon.disabled = checked === 0;
+        }
     }
     
     getSelectedTables() {
-        const checkboxes = document.querySelectorAll('#tableList input[type="checkbox"]:checked');
-        return Array.from(checkboxes).map(cb => cb.value);
+        const sel = this.getTableSelectionDebug();
+        return sel.selectedTables;
+    }
+
+    getTableSelectionDebug() {
+        const cached = (this._syncTableCheckboxEls && this._syncTableCheckboxEls.length > 0)
+            ? this._syncTableCheckboxEls
+            : null;
+        if (cached) {
+            const checked = cached.filter(cb => cb && cb.checked);
+            return {
+                source: 'cached',
+                selector: 'this._syncTableCheckboxEls',
+                syncTabExists: !!document.getElementById('syncTab'),
+                tableListExists: !!document.getElementById('tableList'),
+                tableListChildCount: document.getElementById('tableList') ? document.getElementById('tableList').children.length : 0,
+                inputsInTableList: document.getElementById('tableList') ? document.getElementById('tableList').querySelectorAll('input').length : 0,
+                checkboxInSyncTab: document.getElementById('syncTab') ? document.getElementById('syncTab').querySelectorAll('input[type="checkbox"]').length : 0,
+                idTableNodesInSyncTab: document.getElementById('syncTab') ? document.getElementById('syncTab').querySelectorAll('[id^="table_"]').length : 0,
+                idTableNodesInTableList: document.getElementById('tableList') ? document.getElementById('tableList').querySelectorAll('[id^="table_"]').length : 0,
+                total: cached.length,
+                checked: checked.length,
+                selectedTables: checked.map(cb => cb.value || cb.getAttribute('value'))
+            };
+        }
+
+        const selectors = [
+            '#syncTab #tableList input[type="checkbox"]',
+            '#tableList input[type="checkbox"]',
+            '#syncTab input[type="checkbox"][id^="table_"]',
+            'input[type="checkbox"][id^="table_"]',
+        ];
+
+        let usedSelector = selectors[0];
+        let nodes = [];
+        for (const s of selectors) {
+            const found = document.querySelectorAll(s);
+            if (found && found.length > 0) {
+                usedSelector = s;
+                nodes = Array.from(found);
+                break;
+            }
+        }
+
+        const syncTabEl = document.getElementById('syncTab');
+        const tableListEl = document.getElementById('tableList');
+        const tableListChildCount = tableListEl ? tableListEl.children.length : 0;
+        const inputsInTableList = tableListEl ? tableListEl.querySelectorAll('input').length : 0;
+        const checkboxInSyncTab = syncTabEl ? syncTabEl.querySelectorAll('input[type="checkbox"]').length : 0;
+        const idTableNodesInSyncTab = syncTabEl ? syncTabEl.querySelectorAll('[id^="table_"]').length : 0;
+        const idTableNodesInTableList = tableListEl ? tableListEl.querySelectorAll('[id^="table_"]').length : 0;
+
+        if (nodes.length === 0 && tableListEl) {
+            const found = tableListEl.querySelectorAll('input[type="checkbox"]');
+            if (found && found.length > 0) {
+                usedSelector = 'tableListEl.querySelectorAll(input[type="checkbox"])';
+                nodes = Array.from(found);
+            }
+        }
+
+        // 若 DOM 有找到 checkbox，將其回填至快取，避免後續抓不到
+        if ((!this._syncTableCheckboxEls || this._syncTableCheckboxEls.length === 0) && nodes.length > 0) {
+            this._syncTableCheckboxEls = nodes;
+        }
+
+        const checked = nodes.filter(cb => cb && cb.checked);
+        return {
+            source: 'dom',
+            selector: usedSelector,
+            syncTabExists: !!syncTabEl,
+            tableListExists: !!tableListEl,
+            tableListChildCount,
+            inputsInTableList,
+            checkboxInSyncTab,
+            idTableNodesInSyncTab,
+            idTableNodesInTableList,
+            total: nodes.length,
+            checked: checked.length,
+            selectedTables: checked.map(cb => cb.value || cb.getAttribute('value'))
+        };
     }
 
     toggleRangeInputs() {
@@ -4606,6 +6383,93 @@ class TaiwanStockApp {
             if (updatePrices || updateReturns) {
                 this.updateProgress(20, '開始批量更新股票數據...');
                 this.addLogMessage(`準備更新 ${symbols.length} 檔股票`, 'info');
+
+                // 🌐 方案A：更新所有股票時只送一次請求，避免重複抓取「全市場按日資料」
+                if (updateAllStocks) {
+                    this.addLogMessage('🌐 全市場模式：改為單次請求（避免每批重複批量抓取）', 'info');
+                    const batchStartTime = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+
+                    try {
+                        this.addLogMessage(`🚀 批量抓取模式：一次處理 ${symbols.length} 檔股票`, 'info');
+                        const fetchStartTime = new Date();
+                        this.addLogMessage(`⏱️ 開始批量抓取: ${fetchStartTime.toLocaleString('zh-TW')}`, 'info');
+
+                        const batchUpdateData = {
+                            symbols: symbols.map(s => s.symbol),
+                            update_prices: updatePrices,
+                            update_returns: updateReturns,
+                            start_date: startDate,
+                            end_date: endDate,
+                            respect_requested_range: true,
+                            use_batch_mode: true,
+                            use_local_db: this.useLocalDb
+                        };
+
+                        const resp = await fetch('http://localhost:5003/api/update', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(batchUpdateData)
+                        });
+
+                        if (!resp.ok) {
+                            let bodyText = '';
+                            try { bodyText = await resp.text(); } catch (_) { /* ignore */ }
+                            throw new Error(`HTTP ${resp.status} ${resp.statusText || ''} ${bodyText ? '- ' + bodyText.slice(0, 300) : ''}`.trim());
+                        }
+
+                        let batchResult;
+                        try {
+                            batchResult = await resp.json();
+                        } catch (e) {
+                            throw new Error(`回應不是有效的 JSON：${e.message}`);
+                        }
+
+                        const fetchEndTime = new Date();
+                        const fetchDuration = (fetchEndTime - fetchStartTime) / 1000;
+                        this.addLogMessage(`⏱️ 批量抓取完成: ${fetchEndTime.toLocaleString('zh-TW')} (耗時 ${fetchDuration.toFixed(2)} 秒)`, 'info');
+
+                        if (batchResult.success && batchResult.results) {
+                            for (const result of batchResult.results) {
+                                const stock = symbols.find(s => s.symbol === result.symbol);
+                                const stockName = stock ? stock.name : result.symbol;
+
+                                let storageInfo = [];
+                                if (result.prices_updated !== undefined) storageInfo.push(`股價: ${result.prices_updated} 筆`);
+                                if (result.mode) storageInfo.push(`模式: ${result.mode}`);
+
+                                const statusText = storageInfo.length > 0 ? ` (${storageInfo.join(', ')})` : '';
+                                this.addLogMessage(`✅ ${result.symbol} (${stockName}) 完成${statusText}`, 'success');
+                            }
+                        }
+
+                        if (batchResult.errors && batchResult.errors.length > 0) {
+                            for (const error of batchResult.errors) {
+                                const stock = symbols.find(s => s.symbol === error.symbol);
+                                const stockName = stock ? stock.name : error.symbol;
+                                this.addLogMessage(`❌ ${error.symbol} (${stockName}) 失敗: ${error.error}`, 'error');
+                            }
+                        }
+
+                        this.updateProgress(90, `已處理 ${symbols.length}/${symbols.length} 檔股票`);
+
+                        const batchEndTime = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                        const batchElapsed = batchEndTime - batchStartTime;
+                        const batchHuman = this.formatDuration(batchElapsed);
+                        this.addLogMessage(`📦 全市場單次請求完成，耗時 ${batchHuman}`, 'info');
+                    } catch (error) {
+                        const batchEndTime = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                        const batchElapsed = batchEndTime - batchStartTime;
+                        const batchHuman = this.formatDuration(batchElapsed);
+                        this.addLogMessage(`全市場單次請求失敗: ${error.message}（耗時 ${batchHuman}）`, 'error');
+                    }
+
+                    // 跳過以下分批/並發流程
+                    this.updateProgress(100, '更新完成');
+
+                    this.addLogMessage('', 'info');
+                    await this.computeReturnsAfterUpdate(symbols, startDate, endDate);
+                    return;
+                }
                 
                 // 分批處理避免超時
                 const batchSize = updateBatchSize;
@@ -5362,6 +7226,9 @@ class TaiwanStockApp {
         const params = new URLSearchParams();
         if (startDate) params.append('start', startDate);
         if (endDate) params.append('end', endDate);
+
+        const table = this.getSelectedQueryTable();
+        if (table) params.append('table', table);
         
         if (this.useLocalDb) params.append('use_local_db', 'true');
         const response = await fetch(`http://localhost:5003/api/stock/${symbol}/prices?${params}`);
@@ -5436,6 +7303,95 @@ class TaiwanStockApp {
                 return a.symbol.localeCompare(b.symbol);
             });
             
+    }
+}
+
+async queryGenericTableData(tableName) {
+    try {
+        const symbolInput = document.getElementById('tickerInput')?.value?.trim() || '';
+        const startDate = document.getElementById('queryStartDate')?.value || '';
+        const endDate = document.getElementById('queryEndDate')?.value || '';
+
+        this.lastQueryParams = {
+            table: tableName,
+            startDate,
+            endDate,
+            symbols: symbolInput,
+        };
+
+        const origin = (window && window.location && window.location.origin) ? window.location.origin : '';
+        const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
+
+        const qs = new URLSearchParams();
+        qs.set('table', tableName);
+        if (symbolInput) qs.set('symbol', symbolInput);
+        if (startDate) qs.set('start', startDate);
+        if (endDate) qs.set('end', endDate);
+        qs.set('limit', '200');
+        qs.set('offset', '0');
+        if (this.useLocalDb) qs.set('use_local_db', 'true');
+
+        const url = `${base}/api/query/table?${qs.toString()}`;
+        this.addLogMessage(`📡 通用查詢：${url}`, 'info');
+
+        const resp = await fetch(url);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data.success) {
+            throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+
+        const columns = Array.isArray(data.columns) ? data.columns : [];
+        const rows = Array.isArray(data.rows) ? data.rows : [];
+        this.displayGenericQueryResults(tableName, columns, rows);
+    } catch (e) {
+        this.addLogMessage(`通用查詢失敗: ${e.message}`, 'error');
+        this.resetQueryResults();
+    }
+}
+
+displayGenericQueryResults(tableName, columns, rows) {
+    try {
+        const resultsTable = document.getElementById('queryTable');
+        if (!resultsTable) {
+            this.addLogMessage('查詢結果表格未找到', 'error');
+            return;
+        }
+
+        const resultsSubtitle = document.getElementById('resultsSubtitle');
+        const recordCount = document.getElementById('recordCount');
+        const dateRangeInfo = document.getElementById('dateRangeInfo');
+        if (resultsSubtitle) {
+            resultsSubtitle.textContent = `資料表 ${tableName}（動態查詢）`;
+        }
+        if (recordCount) {
+            recordCount.textContent = (rows || []).length.toLocaleString();
+        }
+        if (dateRangeInfo) {
+            dateRangeInfo.style.display = 'none';
+        }
+
+        const safeColumns = (columns || []).filter(c => typeof c === 'string' && c.trim());
+        const headerCells = safeColumns.map(c => `<th><div class="th-content">${c}</div></th>`).join('');
+        const bodyRows = (rows || []).map(r => {
+            const cells = safeColumns.map(c => {
+                let v = r ? r[c] : null;
+                if (v === null || v === undefined) v = '';
+                return `<td>${String(v)}</td>`;
+            }).join('');
+            return `<tr>${cells}</tr>`;
+        }).join('');
+
+        resultsTable.innerHTML = `
+            <thead><tr>${headerCells}</tr></thead>
+            <tbody>${bodyRows}</tbody>
+        `;
+
+        // 通用表格先不套用原本的排序/圖表（避免依賴固定欄位）
+        this.initResultsViewToggle();
+
+        this.addLogMessage(`✅ 已顯示 ${tableName}：${(rows || []).length} 筆`, 'success');
+    } catch (e) {
+        this.addLogMessage(`顯示通用查詢結果失敗: ${e.message}`, 'error');
     }
 }
 
@@ -5662,6 +7618,9 @@ async querySingleStockReturn(symbol, startDate, endDate, frequency = 'daily') {
     if (startDate) params.append('start', startDate);
     if (endDate) params.append('end', endDate);
     params.append('frequency', frequency);
+
+    const table = this.getSelectedQueryTable();
+    if (table) params.append('table', table);
     
     const response = await fetch(`http://localhost:5003/api/stock/${symbol}/returns?${params}`);
     
@@ -5701,6 +7660,9 @@ async queryMultiStockReturn(symbols, startDate, endDate, frequency = 'daily') {
             if (startDate) params.append('start', startDate);
             if (endDate) params.append('end', endDate);
             params.append('frequency', frequency);
+
+            const table = this.getSelectedQueryTable();
+            if (table) params.append('table', table);
             
             if (this.useLocalDb) params.append('use_local_db', 'true');
         const response = await fetch(`http://localhost:5003/api/stock/${symbol}/returns?${params}`);
@@ -5762,6 +7724,11 @@ async querySingleStockPrice(symbol, startDate, endDate) {
     if (startDate) params.append('start', startDate);
     if (endDate) params.append('end', endDate);
 
+    const table = this.getSelectedQueryTable();
+    if (table) params.append('table', table);
+
+    if (this.useLocalDb) params.append('use_local_db', 'true');
+
     const response = await fetch(`http://localhost:5003/api/stock/${symbol}/prices?${params}`);
 
     if (!response.ok) {
@@ -5792,6 +7759,11 @@ async queryMultiStockPrice(symbols, startDate, endDate) {
             const params = new URLSearchParams();
             if (startDate) params.append('start', startDate);
             if (endDate) params.append('end', endDate);
+
+            const table = this.getSelectedQueryTable();
+            if (table) params.append('table', table);
+
+            if (this.useLocalDb) params.append('use_local_db', 'true');
             
             const response = await fetch(`http://localhost:5003/api/stock/${symbol}/prices?${params}`);
             
@@ -5840,6 +7812,8 @@ async queryMultiStockPrice(symbols, startDate, endDate) {
 // 新的統一查詢方法 - 適配新的 UI 設計
 async executeQueryData() {
     try {
+        const selectedTable = this.getSelectedQueryTable ? this.getSelectedQueryTable() : '';
+
         // 獲取查詢類型
         const queryTypeRadios = document.querySelectorAll('input[name="queryType"]');
         let queryType = 'price'; // 默認為股價
@@ -5851,6 +7825,12 @@ async executeQueryData() {
         }
 
         console.log('執行查詢，類型:', queryType);
+
+        // 若使用者有指定資料表，且不是股價/報酬率兩張預設表，改用通用查詢
+        if (selectedTable && !['tw_stock_prices', 'tw_stock_returns'].includes(selectedTable)) {
+            await this.queryGenericTableData(selectedTable);
+            return;
+        }
 
         // 根據查詢類型調用對應方法
         if (queryType === 'price') {
@@ -7612,9 +9592,36 @@ initQueryTypeOptions() {
 
             // 獲取日期範圍
             const dateRange = this.getSelectedDateRange();
-            
-            // 批量更新 - 使用現有的進度條系統
-            await this.batchUpdateStocksSimple(listedStocks, dateRange, '上市');
+
+            // 全市場單次請求（避免逐檔請求造成 429 與重複抓取）
+            this.addLogMessage('🚀 上市全量模式：改為單次請求', 'info');
+            const batchUpdateData = {
+                symbols: listedStocks.map(s => s.symbol),
+                start_date: dateRange.start,
+                end_date: dateRange.end,
+                update_prices: true,
+                update_returns: false,
+                respect_requested_range: true,
+                use_batch_mode: true,
+                use_local_db: this.useLocalDb
+            };
+
+            const resp = await fetch('http://localhost:5003/api/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(batchUpdateData)
+            });
+
+            if (!resp.ok) {
+                let bodyText = '';
+                try { bodyText = await resp.text(); } catch (_) { /* ignore */ }
+                throw new Error(`HTTP ${resp.status} ${resp.statusText || ''} ${bodyText ? '- ' + bodyText.slice(0, 300) : ''}`.trim());
+            }
+
+            const batchResult = await resp.json();
+            if (!batchResult.success) {
+                throw new Error(batchResult.error || '批量更新失敗');
+            }
 
             this.addLogMessage(`所有上市股票更新完成！共處理 ${listedStocks.length} 支股票`, 'success');
             this.updateActionStatus('ready', '上市股票更新完成');
@@ -7664,9 +9671,36 @@ initQueryTypeOptions() {
 
             // 獲取日期範圍
             const dateRange = this.getSelectedDateRange();
-            
-            // 批量更新 - 使用現有的進度條系統
-            await this.batchUpdateStocksSimple(otcStocks, dateRange, '上櫃');
+
+            // 全市場單次請求（避免逐檔請求造成 429 與重複抓取）
+            this.addLogMessage('🚀 上櫃全量模式：改為單次請求', 'info');
+            const batchUpdateData = {
+                symbols: otcStocks.map(s => s.symbol),
+                start_date: dateRange.start,
+                end_date: dateRange.end,
+                update_prices: true,
+                update_returns: false,
+                respect_requested_range: true,
+                use_batch_mode: true,
+                use_local_db: this.useLocalDb
+            };
+
+            const resp = await fetch('http://localhost:5003/api/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(batchUpdateData)
+            });
+
+            if (!resp.ok) {
+                let bodyText = '';
+                try { bodyText = await resp.text(); } catch (_) { /* ignore */ }
+                throw new Error(`HTTP ${resp.status} ${resp.statusText || ''} ${bodyText ? '- ' + bodyText.slice(0, 300) : ''}`.trim());
+            }
+
+            const batchResult = await resp.json();
+            if (!batchResult.success) {
+                throw new Error(batchResult.error || '批量更新失敗');
+            }
 
             this.addLogMessage(`所有上櫃股票更新完成！共處理 ${otcStocks.length} 支股票`, 'success');
             this.updateActionStatus('ready', '上櫃股票更新完成');
@@ -7905,6 +9939,7 @@ initQueryTypeOptions() {
     async checkNeonConnection() {
         const statusBadge = document.getElementById('neonStatusBadge');
         const btnStartSync = document.getElementById('btnStartSync');
+        const btnDownloadFromNeon = document.getElementById('btnDownloadFromNeon');
         
         if (statusBadge) {
             statusBadge.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 檢查中...';
@@ -7923,6 +9958,9 @@ initQueryTypeOptions() {
                 if (btnStartSync) {
                     btnStartSync.disabled = false;
                 }
+                if (btnDownloadFromNeon) {
+                    btnDownloadFromNeon.disabled = false;
+                }
                 this.addLogMessage('✅ Neon 資料庫連接成功', 'success');
             } else {
                 if (statusBadge) {
@@ -7931,6 +9969,9 @@ initQueryTypeOptions() {
                 }
                 if (btnStartSync) {
                     btnStartSync.disabled = true;
+                }
+                if (btnDownloadFromNeon) {
+                    btnDownloadFromNeon.disabled = true;
                 }
                 this.addLogMessage(`❌ Neon 資料庫連接失敗: ${data.error}`, 'error');
             }
@@ -7942,7 +9983,159 @@ initQueryTypeOptions() {
             if (btnStartSync) {
                 btnStartSync.disabled = true;
             }
+            if (btnDownloadFromNeon) {
+                btnDownloadFromNeon.disabled = true;
+            }
             this.addLogMessage(`❌ 檢查連接時發生錯誤: ${error.message}`, 'error');
+        }
+    }
+
+    async startDatabaseDownload() {
+        const doTruncate = confirm('下載模式選擇：\n\n按「確定」：先清空本機選中表格，再從 Neon 重新下載（覆寫式）\n按「取消」：保留本機既有資料，只嘗試寫入 Neon 尚未存在於本機的資料');
+        if (!confirm('確定要開始「Neon → 本機」下載同步嗎？此操作可能需要較長時間。')) {
+            return;
+        }
+
+        const btnDownload = document.getElementById('btnDownloadFromNeon');
+        const progressSection = document.getElementById('syncProgressSection');
+        const resultsSection = document.getElementById('syncResultsSection');
+        const progressBar = document.getElementById('syncProgressBar');
+        const progressText = document.getElementById('syncProgressText');
+        const progressInfo = document.getElementById('syncProgressInfo');
+
+        if (btnDownload) {
+            btnDownload.disabled = true;
+            btnDownload.innerHTML = '<i class="fas fa-spinner fa-spin"></i> <span>下載中...</span>';
+        }
+
+        if (progressSection) {
+            progressSection.style.display = 'block';
+        }
+        if (resultsSection) {
+            resultsSection.style.display = 'none';
+        }
+
+        this.showSyncLogPanel();
+        this.ensureDbSyncSse();
+
+        const origin = (typeof window !== 'undefined' && window.location && window.location.origin)
+            ? window.location.origin
+            : '';
+        const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
+
+        if (progressBar) {
+            progressBar.style.width = '10%';
+        }
+        if (progressText) {
+            progressText.textContent = '10%';
+        }
+        if (progressInfo) {
+            progressInfo.textContent = '正在連接資料庫...';
+            progressInfo.style.color = '';
+        }
+
+        this.addLogMessage('⬇️ 開始同步：Neon → 本機...', 'info');
+        this.addLogMessage('☁️ 連接 Neon 資料庫...', 'info');
+
+        try {
+            let progress = 10;
+            const progressInterval = setInterval(() => {
+                if (progress < 90) {
+                    progress += 5;
+                    if (progressBar) {
+                        progressBar.style.width = progress + '%';
+                    }
+                    if (progressText) {
+                        progressText.textContent = progress + '%';
+                    }
+                    if (progressInfo) {
+                        progressInfo.textContent = `正在下載數據... ${progress}%`;
+                    }
+                }
+            }, 1000);
+
+            const sel = this.getTableSelectionDebug();
+            const countTextEl = document.getElementById('tableSelectionCount');
+            const countText = countTextEl ? countTextEl.textContent : '';
+            const cacheLen = (this._syncTableCheckboxEls && this._syncTableCheckboxEls.length) ? this._syncTableCheckboxEls.length : 0;
+            this.addSyncLogLine(`📋 表格選擇：已勾選 ${sel.checked}/${sel.total}`, 'info');
+            this.addSyncLogLine(`🔎 選取來源=${sel.source || ''} selector=${sel.selector || ''} cache=${cacheLen} UI=${countText}`, 'info');
+            this.addSyncLogLine(`🔎 DOM: syncTab=${sel.syncTabExists} tableList=${sel.tableListExists} children=${sel.tableListChildCount} inputs=${sel.inputsInTableList} syncTabCheckbox=${sel.checkboxInSyncTab} id^table_(syncTab)=${sel.idTableNodesInSyncTab} id^table_(tableList)=${sel.idTableNodesInTableList}`, 'info');
+
+            const selectedTables = sel.selectedTables;
+            if (selectedTables.length === 0) {
+                this.addSyncLogLine('⚠️ 未取得任何勾選表格（請確認表格列表是否在本頁面渲染且 checkbox 狀態正確）', 'warning');
+                throw new Error('請至少選擇一個表格');
+            }
+
+            this.addSyncLogLine('📨 已送出同步請求（下載：Neon → 本機）', 'info');
+
+            this.addLogMessage(`📋 準備下載 ${selectedTables.length} 個表格`, 'info');
+
+            const response = await fetch(`${base}/api/database-sync/download`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    tables: selectedTables,
+                    truncateLocal: doTruncate
+                })
+            });
+
+            clearInterval(progressInterval);
+
+            const contentType = response.headers.get('content-type');
+            if (!contentType || !contentType.includes('application/json')) {
+                const text = await response.text();
+                console.error('收到非 JSON 響應:', text);
+                throw new Error('伺服器返回了非 JSON 響應，可能發生錯誤');
+            }
+
+            const data = await response.json();
+
+            if (data.success) {
+                if (progressBar) {
+                    progressBar.style.width = '100%';
+                }
+                if (progressText) {
+                    progressText.textContent = '100%';
+                }
+                if (progressInfo) {
+                    progressInfo.textContent = `完成！共下載 ${data.totalRows} 行數據`;
+                }
+
+                this.addLogMessage('☁️ Neon 資料庫連接成功', 'success');
+                this.addLogMessage('✅ 本地資料庫連接成功', 'success');
+
+                if (data.tables) {
+                    data.tables.forEach(table => {
+                        if (table.success) {
+                            this.addLogMessage(`✓ ${table.name}: ${table.insertedCount}/${table.rowCount} 行下載成功`, 'success');
+                        } else {
+                            this.addLogMessage(`✗ ${table.name}: ${table.error}`, 'error');
+                        }
+                    });
+                }
+
+                this.displaySyncResults(data);
+                this.addLogMessage(`✅ 同步完成（下載：Neon → 本機）！總表格數: ${data.totalTables}, 總行數: ${data.totalRows}`, 'success');
+            } else {
+                throw new Error(data.error || '下載失敗');
+            }
+
+        } catch (error) {
+            this.addLogMessage(`❌ 同步失敗（下載）：${error.message}`, 'error');
+            this.addSyncLogLine(`❌ 同步請求失敗（下載）：${error.message}`, 'error');
+            if (progressInfo) {
+                progressInfo.textContent = `錯誤: ${error.message}`;
+                progressInfo.style.color = '#ef4444';
+            }
+        } finally {
+            if (btnDownload) {
+                btnDownload.disabled = false;
+                btnDownload.innerHTML = '<i class="fas fa-cloud-download-alt"></i> <span>從 Neon 下載到本機</span>';
+            }
         }
     }
 
@@ -7971,6 +10164,8 @@ initQueryTypeOptions() {
         if (resultsSection) {
             resultsSection.style.display = 'none';
         }
+
+        this.showSyncLogPanel();
 
         // 重置進度
         if (progressBar) {
@@ -8004,16 +10199,25 @@ initQueryTypeOptions() {
                 }
             }, 1000);
 
-            // 獲取選中的表格
-            const selectedTables = this.getSelectedTables();
-            
+            const sel = this.getTableSelectionDebug();
+            const countTextEl = document.getElementById('tableSelectionCount');
+            const countText = countTextEl ? countTextEl.textContent : '';
+            const cacheLen = (this._syncTableCheckboxEls && this._syncTableCheckboxEls.length) ? this._syncTableCheckboxEls.length : 0;
+            this.addSyncLogLine(`📋 表格選擇：已勾選 ${sel.checked}/${sel.total}`, 'info');
+            this.addSyncLogLine(`🔎 選取來源=${sel.source || ''} selector=${sel.selector || ''} cache=${cacheLen} UI=${countText}`, 'info');
+            this.addSyncLogLine(`🔎 DOM: syncTab=${sel.syncTabExists} tableList=${sel.tableListExists} children=${sel.tableListChildCount} inputs=${sel.inputsInTableList} syncTabCheckbox=${sel.checkboxInSyncTab} id^table_(syncTab)=${sel.idTableNodesInSyncTab} id^table_(tableList)=${sel.idTableNodesInTableList}`, 'info');
+
+            const selectedTables = sel.selectedTables;
             if (selectedTables.length === 0) {
+                this.addSyncLogLine('⚠️ 未取得任何勾選表格（請確認表格列表是否在本頁面渲染且 checkbox 狀態正確）', 'warning');
                 throw new Error('請至少選擇一個表格');
             }
+
+            this.addSyncLogLine('📨 已送出同步請求（上傳：本機 → Neon）', 'info');
             
             this.addLogMessage(`📋 準備上傳 ${selectedTables.length} 個表格`, 'info');
             
-            const response = await fetch('/api/database-sync/upload', {
+            const response = await fetch(`${base}/api/database-sync/upload`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -8070,6 +10274,7 @@ initQueryTypeOptions() {
             }
         } catch (error) {
             this.addLogMessage(`❌ 資料庫同步失敗: ${error.message}`, 'error');
+            this.addSyncLogLine(`❌ 同步請求失敗（上傳）：${error.message}`, 'error');
             
             if (progressInfo) {
                 progressInfo.textContent = `錯誤: ${error.message}`;
@@ -8098,6 +10303,9 @@ initQueryTypeOptions() {
         const errorCount = data.errors ? data.errors.length : 0;
         const totalTables = data.totalTables || 0;
         const totalRows = data.totalRows || 0;
+
+        const isDownload = data.direction === 'download';
+        const rowLabel = isDownload ? '總下載行數' : '總上傳行數';
         
         summaryDiv.innerHTML = `
             <div class="stats-grid">
@@ -8116,7 +10324,7 @@ initQueryTypeOptions() {
                     </div>
                     <div class="stat-info">
                         <div class="stat-value">${totalRows}</div>
-                        <div class="stat-label">總上傳行數</div>
+                        <div class="stat-label">${rowLabel}</div>
                     </div>
                 </div>
                 <div class="stat-card">
@@ -8138,7 +10346,7 @@ initQueryTypeOptions() {
             data.tables.forEach(table => {
                 const iconClass = table.success ? 'fa-check-circle success' : 'fa-times-circle error';
                 const statusText = table.success 
-                    ? `上傳 ${table.insertedCount} / ${table.rowCount} 行`
+                    ? `${isDownload ? '下載' : '上傳'} ${table.insertedCount} / ${table.rowCount} 行`
                     : table.error;
                 
                 detailsHTML += `
@@ -8191,19 +10399,24 @@ if (document.readyState === 'loading') {
             const revenueTabEl = document.getElementById('revenueTab');
             const incomeTabEl = document.getElementById('incomeTab');
             const balanceTabEl = document.getElementById('balanceTab');
+            const cashflowTabEl = document.getElementById('cashflowTab');
+            const ratiosTabEl = document.getElementById('ratiosTab');
             const warrantsTabEl = document.getElementById('warrantsTab');
+            const queryTabEl = document.getElementById('queryTab');
             const bwibbuNavBtn = document.querySelector('[data-tab="bwibbu"]');
             const marginNavBtn = document.querySelector('[data-tab="margin"]');
             const t86NavBtn = document.querySelector('[data-tab="t86"]');
             const revenueNavBtn = document.querySelector('[data-tab="revenue"]');
             const incomeNavBtn = document.querySelector('[data-tab="income"]');
             const balanceNavBtn = document.querySelector('[data-tab="balance"]');
+            const ratiosNavBtn = document.querySelector('[data-tab="ratios"]');
             if (bwibbuNavBtn) bwibbuNavBtn.style.display = 'none';
             if (marginNavBtn) marginNavBtn.style.display = 'none';
             if (t86NavBtn) t86NavBtn.style.display = 'none';
             if (revenueNavBtn) revenueNavBtn.style.display = 'none';
             if (incomeNavBtn) incomeNavBtn.style.display = 'none';
             if (balanceNavBtn) balanceNavBtn.style.display = 'none';
+            if (ratiosNavBtn) ratiosNavBtn.style.display = 'none';
 
             const hideAllTabs = () => {
                 if (updateTabEl) { updateTabEl.classList.remove('active'); updateTabEl.style.display = 'none'; }
@@ -8213,6 +10426,8 @@ if (document.readyState === 'loading') {
                 if (revenueTabEl) { revenueTabEl.classList.remove('active'); revenueTabEl.style.display = 'none'; }
                 if (incomeTabEl) { incomeTabEl.classList.remove('active'); incomeTabEl.style.display = 'none'; }
                 if (balanceTabEl) { balanceTabEl.classList.remove('active'); balanceTabEl.style.display = 'none'; }
+                if (cashflowTabEl) { cashflowTabEl.classList.remove('active'); cashflowTabEl.style.display = 'none'; }
+                if (ratiosTabEl) { ratiosTabEl.classList.remove('active'); ratiosTabEl.style.display = 'none'; }
                 if (warrantsTabEl) { warrantsTabEl.classList.remove('active'); warrantsTabEl.style.display = 'none'; }
             };
 
@@ -8223,7 +10438,19 @@ if (document.readyState === 'loading') {
 
                 hideAllTabs();
 
-                if (mode === 'bwibbu') {
+                if (mode === 'symbols') {
+                    if (queryTabEl) { queryTabEl.style.display = ''; queryTabEl.classList.add('active'); }
+                    try {
+                        const block = document.getElementById('symbolsTable');
+                        if (block) block.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    } catch (_) {}
+                } else if (mode === 'etf') {
+                    if (queryTabEl) { queryTabEl.style.display = ''; queryTabEl.classList.add('active'); }
+                    try {
+                        const block = document.getElementById('etfRefreshBtn') || document.getElementById('etfRefreshStatus');
+                        if (block) block.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    } catch (_) {}
+                } else if (mode === 'bwibbu') {
                     if (bwibbuTabEl) { bwibbuTabEl.style.display = ''; bwibbuTabEl.classList.add('active'); }
                     if (headerTitle) headerTitle.innerHTML = '<i class="fas fa-play-circle"></i> 執行 BWIBBU 回朔\n                                    執行操作';
                     if (execBtnText) execBtnText.textContent = '執行 BWIBBU 回朔';
@@ -8241,6 +10468,10 @@ if (document.readyState === 'loading') {
                     // 損益表模式使用獨立面板，不修改主執行區標題
                 } else if (mode === 'balance') {
                     if (balanceTabEl) { balanceTabEl.style.display = ''; balanceTabEl.classList.add('active'); }
+                } else if (mode === 'cashflow') {
+                    if (cashflowTabEl) { cashflowTabEl.style.display = ''; cashflowTabEl.classList.add('active'); }
+                } else if (mode === 'ratios') {
+                    if (ratiosTabEl) { ratiosTabEl.style.display = ''; ratiosTabEl.classList.add('active'); }
                 } else if (mode === 'warrants') {
                     if (warrantsTabEl) { warrantsTabEl.style.display = ''; warrantsTabEl.classList.add('active'); }
                     app.ensureWarrantsInitialized?.();
@@ -8274,19 +10505,24 @@ if (document.readyState === 'loading') {
         const revenueTabEl = document.getElementById('revenueTab');
         const incomeTabEl = document.getElementById('incomeTab');
         const balanceTabEl = document.getElementById('balanceTab');
+        const cashflowTabEl = document.getElementById('cashflowTab');
+        const ratiosTabEl = document.getElementById('ratiosTab');
         const warrantsTabEl = document.getElementById('warrantsTab');
+        const queryTabEl = document.getElementById('queryTab');
         const bwibbuNavBtn = document.querySelector('[data-tab="bwibbu"]');
         const marginNavBtn = document.querySelector('[data-tab="margin"]');
         const t86NavBtn = document.querySelector('[data-tab="t86"]');
         const revenueNavBtn = document.querySelector('[data-tab="revenue"]');
         const incomeNavBtn = document.querySelector('[data-tab="income"]');
         const balanceNavBtn = document.querySelector('[data-tab="balance"]');
+        const ratiosNavBtn = document.querySelector('[data-tab="ratios"]');
         if (bwibbuNavBtn) bwibbuNavBtn.style.display = 'none';
         if (marginNavBtn) marginNavBtn.style.display = 'none';
         if (t86NavBtn) t86NavBtn.style.display = 'none';
         if (revenueNavBtn) revenueNavBtn.style.display = 'none';
         if (incomeNavBtn) incomeNavBtn.style.display = 'none';
         if (balanceNavBtn) balanceNavBtn.style.display = 'none';
+        if (ratiosNavBtn) ratiosNavBtn.style.display = 'none';
 
         const hideAllTabs = () => {
             if (updateTabEl) { updateTabEl.classList.remove('active'); updateTabEl.style.display = 'none'; }
@@ -8296,6 +10532,8 @@ if (document.readyState === 'loading') {
             if (revenueTabEl) { revenueTabEl.classList.remove('active'); revenueTabEl.style.display = 'none'; }
             if (incomeTabEl) { incomeTabEl.classList.remove('active'); incomeTabEl.style.display = 'none'; }
             if (balanceTabEl) { balanceTabEl.classList.remove('active'); balanceTabEl.style.display = 'none'; }
+            if (cashflowTabEl) { cashflowTabEl.classList.remove('active'); cashflowTabEl.style.display = 'none'; }
+            if (ratiosTabEl) { ratiosTabEl.classList.remove('active'); ratiosTabEl.style.display = 'none'; }
             if (warrantsTabEl) { warrantsTabEl.classList.remove('active'); warrantsTabEl.style.display = 'none'; }
         };
 
@@ -8306,7 +10544,19 @@ if (document.readyState === 'loading') {
 
             hideAllTabs();
 
-            if (mode === 'bwibbu') {
+            if (mode === 'symbols') {
+                if (queryTabEl) { queryTabEl.style.display = ''; queryTabEl.classList.add('active'); }
+                try {
+                    const block = document.getElementById('symbolsTable');
+                    if (block) block.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                } catch (_) {}
+            } else if (mode === 'etf') {
+                if (queryTabEl) { queryTabEl.style.display = ''; queryTabEl.classList.add('active'); }
+                try {
+                    const block = document.getElementById('etfRefreshBtn') || document.getElementById('etfRefreshStatus');
+                    if (block) block.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                } catch (_) {}
+            } else if (mode === 'bwibbu') {
                 if (bwibbuTabEl) { bwibbuTabEl.style.display = ''; bwibbuTabEl.classList.add('active'); }
                 if (headerTitle) headerTitle.innerHTML = '<i class="fas fa-play-circle"></i> 執行 BWIBBU 回朔\n                                    執行操作';
                 if (execBtnText) execBtnText.textContent = '執行 BWIBBU 回朔';
@@ -8323,6 +10573,10 @@ if (document.readyState === 'loading') {
                 // 損益表模式使用獨立面板，不修改主執行區標題
             } else if (mode === 'balance') {
                 if (balanceTabEl) { balanceTabEl.style.display = ''; balanceTabEl.classList.add('active'); }
+            } else if (mode === 'cashflow') {
+                if (cashflowTabEl) { cashflowTabEl.style.display = ''; cashflowTabEl.classList.add('active'); }
+            } else if (mode === 'ratios') {
+                if (ratiosTabEl) { ratiosTabEl.style.display = ''; ratiosTabEl.classList.add('active'); }
             } else if (mode === 'warrants') {
                 if (warrantsTabEl) { warrantsTabEl.style.display = ''; warrantsTabEl.classList.add('active'); }
                 app.ensureWarrantsInitialized?.();

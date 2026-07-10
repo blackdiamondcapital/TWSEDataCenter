@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: twse-data-center-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/cloud/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_API_TOKEN
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: CLOUD_DEPLOYMENT
+        value: "1"
+      - key: PYTHON_VERSION
+        value: "3.11"
+
+  - type: worker
+    name: twse-data-center-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python cloud_worker.py
+    autoDeployTrigger: commit
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_API_TOKEN
+        sync: false
+      - key: CLOUD_DEPLOYMENT
+        value: "1"
+      - key: WORKER_POLL_SECONDS
+        value: "5"
