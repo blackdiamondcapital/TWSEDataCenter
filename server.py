@@ -1982,158 +1982,197 @@ class StockAPI:
                 time.sleep(sleep_between)
 
     def fetch_twse_t86_by_date(self, target_date):
-        dt = self._ensure_date(target_date)
-        params = {
-            'response': 'json',
-            'date': dt.strftime('%Y%m%d'),
-            'selectType': 'ALLBUT0999'
-        }
-
-        resp = self.twse_session.get(self.TWSE_T86_URL, params=params, timeout=20)
-        resp.raise_for_status()
-        payload = resp.json()
-
-        if payload.get('stat') != 'OK':
-            logger.info(f"TWSE T86 {dt} stat={payload.get('stat')}, 無資料")
+    dt = self._ensure_date(target_date)
+    urls = [
+        "https://www.twse.com.tw/rwd/zh/fund/T86",
+        "https://www.twse.com.tw/fund/T86",
+    ]
+    params = {
+        "response": "json",
+        "date": dt.strftime("%Y%m%d"),
+        "selectType": "ALLBUT0999",
+        "_": str(int(time.time() * 1000)),
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "Referer": "https://www.twse.com.tw/zh/trading/foreign/t86.html",
+        "X-Requested-With": "XMLHttpRequest",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        # 移除 __init__ 中 BWIBBU session 設定的 Origin
+        "Origin": None,
+    }
+    payload = None
+    last_error = None
+    used_url = None
+    for url in urls:
+        for attempt in range(1, 4):
+            try:
+                resp = self.twse_session.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=30,
+                    allow_redirects=True,
+                )
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    raise requests.HTTPError(
+                        f"HTTP {resp.status_code}",
+                        response=resp,
+                    )
+                resp.raise_for_status()
+                response_text = resp.text or ""
+                content_type = (
+                    resp.headers.get("Content-Type") or ""
+                ).lower()
+                text_head = response_text.lstrip()[:1]
+                if not response_text.strip():
+                    raise ValueError("TWSE 回傳空內容")
+                if (
+                    "json" not in content_type
+                    and text_head not in ("{", "[")
+                ):
+                    snippet = (
+                        response_text[:300]
+                        .replace("\r", " ")
+                        .replace("\n", " ")
+                    )
+                    raise ValueError(
+                        f"TWSE 回傳非 JSON：{snippet}"
+                    )
+                try:
+                    payload = resp.json()
+                except (ValueError, json.JSONDecodeError) as exc:
+                    snippet = (
+                        response_text[:300]
+                        .replace("\r", " ")
+                        .replace("\n", " ")
+                    )
+                    raise ValueError(
+                        f"TWSE JSON 解析失敗：{exc}；內容：{snippet}"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise ValueError(
+                        f"TWSE 回傳格式錯誤：{type(payload).__name__}"
+                    )
+                used_url = url
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "TWSE T86 %s 抓取失敗：url=%s attempt=%s/3 error=%s",
+                    dt.isoformat(),
+                    url,
+                    attempt,
+                    exc,
+                )
+                if attempt < 3:
+                    time.sleep(1.5 * attempt)
+        if payload is not None:
+            break
+    if payload is None:
+        raise RuntimeError(
+            f"TWSE T86 {dt.isoformat()} 抓取失敗：{last_error}"
+        )
+    stat = str(payload.get("stat") or "").strip()
+    data_rows = payload.get("data") or []
+    if stat.upper() != "OK":
+        no_data_messages = (
+            "沒有符合條件的資料",
+            "查無資料",
+            "無資料",
+            "很抱歉",
+        )
+        if any(message in stat for message in no_data_messages):
+            logger.info(
+                "TWSE T86 %s 無交易資料：%s",
+                dt.isoformat(),
+                stat,
+            )
             return []
-
-        data_rows = payload.get('data') or []
-        results = []
-        for row in data_rows:
-            if len(row) < 19:
-                continue
-            stock_no = (row[0] or '').strip()
-            stock_name = (row[1] or '').strip()
-            fb = self._t86_parse_int(row[2])
-            fs = self._t86_parse_int(row[3])
-            fn = self._t86_parse_int(row[4])
-            fdb = self._t86_parse_int(row[5])
-            fds = self._t86_parse_int(row[6])
-            fdn = self._t86_parse_int(row[7])
-            itb = self._t86_parse_int(row[8])
-            its = self._t86_parse_int(row[9])
-            itn = self._t86_parse_int(row[10])
-            dealer_total_net = self._t86_parse_int(row[11])
-            dsb = self._t86_parse_int(row[12])
-            dss = self._t86_parse_int(row[13])
-            dsn = self._t86_parse_int(row[14])
-            dhb = self._t86_parse_int(row[15])
-            dhs = self._t86_parse_int(row[16])
-            dhn = self._t86_parse_int(row[17])
-            overall = self._t86_parse_int(row[18])
-
-            results.append({
-                'date': dt.isoformat(),
-                'market': 'TWSE',
-                'stock_no': stock_no,
-                'stock_name': stock_name,
-                'foreign_buy': fb,
-                'foreign_sell': fs,
-                'foreign_net': fn,
-                'foreign_dealer_buy': fdb,
-                'foreign_dealer_sell': fds,
-                'foreign_dealer_net': fdn,
-                'foreign_total_buy': fb + fdb,
-                'foreign_total_sell': fs + fds,
-                'foreign_total_net': fn + fdn,
-                'investment_trust_buy': itb,
-                'investment_trust_sell': its,
-                'investment_trust_net': itn,
-                'dealer_self_buy': dsb,
-                'dealer_self_sell': dss,
-                'dealer_self_net': dsn,
-                'dealer_hedge_buy': dhb,
-                'dealer_hedge_sell': dhs,
-                'dealer_hedge_net': dhn,
-                'dealer_total_buy': dsb + dhb,
-                'dealer_total_sell': dss + dhs,
-                'dealer_total_net': dealer_total_net if dealer_total_net else dsn + dhn,
-                'overall_net': overall,
-            })
-        logger.info(f"TWSE T86 {dt} 抓取 {len(results)} 筆")
-        return results
-
-    def fetch_tpex_t86_by_date(self, target_date):
-        dt = self._ensure_date(target_date)
-        roc_date = f"{dt.year - 1911:03d}/{dt.month:02d}/{dt.day:02d}"
-        params = {
-            'l': 'zh-tw',
-            'date': roc_date,
-            'json': '1'
-        }
-
-        resp = self.tpex_session.get(self.TPEX_T86_URL, params=params, timeout=20)
-        resp.raise_for_status()
-        payload = resp.json()
-
-        if payload.get('stat', '').lower() != 'ok':
-            logger.info(f"TPEX T86 {dt} stat={payload.get('stat')}, 無資料")
-            return []
-
-        tables = payload.get('tables') or []
-        if not tables:
-            return []
-
-        data_rows = tables[0].get('data') or []
-        results = []
-        for row in data_rows:
-            if len(row) < 24:
-                continue
-            stock_no = (row[0] or '').strip()
-            stock_name = (row[1] or '').strip()
-            fb = self._t86_parse_int(row[2])
-            fs = self._t86_parse_int(row[3])
-            fn = self._t86_parse_int(row[4])
-            fdb = self._t86_parse_int(row[5])
-            fds = self._t86_parse_int(row[6])
-            fdn = self._t86_parse_int(row[7])
-            ftb = self._t86_parse_int(row[8])
-            fts = self._t86_parse_int(row[9])
-            ftn = self._t86_parse_int(row[10])
-            itb = self._t86_parse_int(row[11])
-            its = self._t86_parse_int(row[12])
-            itn = self._t86_parse_int(row[13])
-            dsb = self._t86_parse_int(row[14])
-            dss = self._t86_parse_int(row[15])
-            dsn = self._t86_parse_int(row[16])
-            dhb = self._t86_parse_int(row[17])
-            dhs = self._t86_parse_int(row[18])
-            dhn = self._t86_parse_int(row[19])
-            dtb = self._t86_parse_int(row[20])
-            dts = self._t86_parse_int(row[21])
-            dtn = self._t86_parse_int(row[22])
-            overall = self._t86_parse_int(row[23])
-
-            results.append({
-                'date': dt.isoformat(),
-                'market': 'TPEX',
-                'stock_no': stock_no,
-                'stock_name': stock_name,
-                'foreign_buy': fb,
-                'foreign_sell': fs,
-                'foreign_net': fn,
-                'foreign_dealer_buy': fdb,
-                'foreign_dealer_sell': fds,
-                'foreign_dealer_net': fdn,
-                'foreign_total_buy': ftb,
-                'foreign_total_sell': fts,
-                'foreign_total_net': ftn,
-                'investment_trust_buy': itb,
-                'investment_trust_sell': its,
-                'investment_trust_net': itn,
-                'dealer_self_buy': dsb,
-                'dealer_self_sell': dss,
-                'dealer_self_net': dsn,
-                'dealer_hedge_buy': dhb,
-                'dealer_hedge_sell': dhs,
-                'dealer_hedge_net': dhn,
-                'dealer_total_buy': dtb,
-                'dealer_total_sell': dts,
-                'dealer_total_net': dtn,
-                'overall_net': overall,
-            })
-        logger.info(f"TPEX T86 {dt} 抓取 {len(results)} 筆")
-        return results
+        raise RuntimeError(
+            f"TWSE T86 {dt.isoformat()} 回傳異常：stat={stat}"
+        )
+    if not isinstance(data_rows, list):
+        raise RuntimeError(
+            f"TWSE T86 {dt.isoformat()} data 欄位不是陣列"
+        )
+    results = []
+    for row in data_rows:
+        if not isinstance(row, list) or len(row) < 19:
+            continue
+        stock_no = str(row[0] or "").strip()
+        stock_name = str(row[1] or "").strip()
+        if not stock_no:
+            continue
+        foreign_buy = self._t86_parse_int(row[2])
+        foreign_sell = self._t86_parse_int(row[3])
+        foreign_net = self._t86_parse_int(row[4])
+        foreign_dealer_buy = self._t86_parse_int(row[5])
+        foreign_dealer_sell = self._t86_parse_int(row[6])
+        foreign_dealer_net = self._t86_parse_int(row[7])
+        investment_trust_buy = self._t86_parse_int(row[8])
+        investment_trust_sell = self._t86_parse_int(row[9])
+        investment_trust_net = self._t86_parse_int(row[10])
+        dealer_total_net = self._t86_parse_int(row[11])
+        dealer_self_buy = self._t86_parse_int(row[12])
+        dealer_self_sell = self._t86_parse_int(row[13])
+        dealer_self_net = self._t86_parse_int(row[14])
+        dealer_hedge_buy = self._t86_parse_int(row[15])
+        dealer_hedge_sell = self._t86_parse_int(row[16])
+        dealer_hedge_net = self._t86_parse_int(row[17])
+        overall_net = self._t86_parse_int(row[18])
+        results.append({
+            "date": dt.isoformat(),
+            "market": "TWSE",
+            "stock_no": stock_no,
+            "stock_name": stock_name,
+            "foreign_buy": foreign_buy,
+            "foreign_sell": foreign_sell,
+            "foreign_net": foreign_net,
+            "foreign_dealer_buy": foreign_dealer_buy,
+            "foreign_dealer_sell": foreign_dealer_sell,
+            "foreign_dealer_net": foreign_dealer_net,
+            "foreign_total_buy": (
+                foreign_buy + foreign_dealer_buy
+            ),
+            "foreign_total_sell": (
+                foreign_sell + foreign_dealer_sell
+            ),
+            "foreign_total_net": (
+                foreign_net + foreign_dealer_net
+            ),
+            "investment_trust_buy": investment_trust_buy,
+            "investment_trust_sell": investment_trust_sell,
+            "investment_trust_net": investment_trust_net,
+            "dealer_self_buy": dealer_self_buy,
+            "dealer_self_sell": dealer_self_sell,
+            "dealer_self_net": dealer_self_net,
+            "dealer_hedge_buy": dealer_hedge_buy,
+            "dealer_hedge_sell": dealer_hedge_sell,
+            "dealer_hedge_net": dealer_hedge_net,
+            "dealer_total_buy": (
+                dealer_self_buy + dealer_hedge_buy
+            ),
+            "dealer_total_sell": (
+                dealer_self_sell + dealer_hedge_sell
+            ),
+            "dealer_total_net": dealer_total_net,
+            "overall_net": overall_net,
+        })
+    logger.info(
+        "TWSE T86 %s 抓取 %s 筆，來源=%s",
+        dt.isoformat(),
+        len(results),
+        used_url,
+    )
+    return results
 
     def fetch_t86_range(self, start_date, end_date, market: str = 'both', sleep_seconds: float = 0.6):
         start_dt = self._ensure_date(start_date)
