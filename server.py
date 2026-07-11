@@ -1,3 +1,6 @@
+1#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import sys
 import time
 import json
@@ -1977,6 +1980,215 @@ class StockAPI:
                 if attempt == retries:
                     return []
                 time.sleep(sleep_between)
+
+    def fetch_tpex_t86_by_date(self, target_date):
+        """抓取指定日期的櫃買中心三大法人買賣超資料。"""
+        dt = self._ensure_date(target_date)
+        roc_date = f"{dt.year - 1911:03d}/{dt.month:02d}/{dt.day:02d}"
+        url = self.TPEX_T86_URL
+        params = {
+            "l": "zh-tw",
+            "o": "json",
+            "d": roc_date,
+            "se": "AL",
+        }
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+            "Referer": "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge.php",
+            "X-Requested-With": "XMLHttpRequest",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
+        payload = None
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                resp = self.tpex_session.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=30,
+                    allow_redirects=True,
+                )
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    raise requests.HTTPError(
+                        f"HTTP {resp.status_code}", response=resp
+                    )
+                resp.raise_for_status()
+                response_text = resp.text or ""
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                if not response_text.strip():
+                    raise ValueError("TPEX 回傳空內容")
+                if "json" not in content_type and response_text.lstrip()[:1] not in ("{", "["):
+                    snippet = response_text[:300].replace("\r", " ").replace("\n", " ")
+                    raise ValueError(f"TPEX 回傳非 JSON：{snippet}")
+                payload = resp.json()
+                if not isinstance(payload, dict):
+                    raise ValueError(f"TPEX 回傳格式錯誤：{type(payload).__name__}")
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "TPEX T86 %s 抓取失敗：attempt=%s/3 error=%s",
+                    dt.isoformat(),
+                    attempt,
+                    exc,
+                )
+                if attempt < 3:
+                    time.sleep(1.5 * attempt)
+
+        if payload is None:
+            raise RuntimeError(
+                f"TPEX T86 {dt.isoformat()} 抓取失敗：{last_error}"
+            )
+
+        stat = str(payload.get("stat") or payload.get("status") or "").strip()
+        if stat and stat.lower() not in {"ok", "success"}:
+            no_data_messages = ("沒有符合條件的資料", "查無資料", "無資料", "很抱歉")
+            if any(msg in stat for msg in no_data_messages):
+                logger.info("TPEX T86 %s 無交易資料：%s", dt.isoformat(), stat)
+                return []
+
+        tables = payload.get("tables") or []
+        if not isinstance(tables, list) or not tables:
+            logger.info("TPEX T86 %s 無資料表", dt.isoformat())
+            return []
+
+        table = next(
+            (
+                item for item in tables
+                if isinstance(item, dict) and isinstance(item.get("data"), list)
+            ),
+            None,
+        )
+        if not table:
+            return []
+
+        rows = table.get("data") or []
+        fields = table.get("fields") or table.get("columns") or []
+
+        def normalize_label(value):
+            return re.sub(r"[\s\n\r（）()－\-_/]", "", str(value or ""))
+
+        normalized_fields = [normalize_label(x) for x in fields]
+
+        def find_index(*keywords):
+            for idx, label in enumerate(normalized_fields):
+                if all(keyword in label for keyword in keywords):
+                    return idx
+            return None
+
+        # 欄位名稱優先；若 API 未提供 fields，使用櫃買中心既有欄位順序。
+        index_map = {
+            "stock_no": find_index("代號"),
+            "stock_name": find_index("名稱"),
+            "foreign_buy": find_index("外資", "買進"),
+            "foreign_sell": find_index("外資", "賣出"),
+            "foreign_net": find_index("外資", "買賣超"),
+            "foreign_dealer_buy": find_index("外資自營商", "買進"),
+            "foreign_dealer_sell": find_index("外資自營商", "賣出"),
+            "foreign_dealer_net": find_index("外資自營商", "買賣超"),
+            "foreign_total_buy": find_index("外資及陸資", "買進"),
+            "foreign_total_sell": find_index("外資及陸資", "賣出"),
+            "foreign_total_net": find_index("外資及陸資", "買賣超"),
+            "investment_trust_buy": find_index("投信", "買進"),
+            "investment_trust_sell": find_index("投信", "賣出"),
+            "investment_trust_net": find_index("投信", "買賣超"),
+            "dealer_self_buy": find_index("自營商自行買賣", "買進"),
+            "dealer_self_sell": find_index("自營商自行買賣", "賣出"),
+            "dealer_self_net": find_index("自營商自行買賣", "買賣超"),
+            "dealer_hedge_buy": find_index("自營商避險", "買進"),
+            "dealer_hedge_sell": find_index("自營商避險", "賣出"),
+            "dealer_hedge_net": find_index("自營商避險", "買賣超"),
+            "dealer_total_buy": find_index("自營商", "買進"),
+            "dealer_total_sell": find_index("自營商", "賣出"),
+            "dealer_total_net": find_index("自營商", "買賣超"),
+            "overall_net": find_index("三大法人", "買賣超"),
+        }
+
+        fallback_indexes = {
+            "stock_no": 0,
+            "stock_name": 1,
+            "foreign_buy": 2,
+            "foreign_sell": 3,
+            "foreign_net": 4,
+            "foreign_dealer_buy": 5,
+            "foreign_dealer_sell": 6,
+            "foreign_dealer_net": 7,
+            "foreign_total_buy": 8,
+            "foreign_total_sell": 9,
+            "foreign_total_net": 10,
+            "investment_trust_buy": 11,
+            "investment_trust_sell": 12,
+            "investment_trust_net": 13,
+            "dealer_self_buy": 14,
+            "dealer_self_sell": 15,
+            "dealer_self_net": 16,
+            "dealer_hedge_buy": 17,
+            "dealer_hedge_sell": 18,
+            "dealer_hedge_net": 19,
+            "dealer_total_buy": 20,
+            "dealer_total_sell": 21,
+            "dealer_total_net": 22,
+            "overall_net": 23,
+        }
+
+        def get_value(row, key, default=None):
+            idx = index_map.get(key)
+            if idx is None:
+                idx = fallback_indexes[key]
+            if not isinstance(row, list) or idx >= len(row):
+                return default
+            return row[idx]
+
+        results = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 5:
+                continue
+
+            stock_no = str(get_value(row, "stock_no", "") or "").strip()
+            stock_name = str(get_value(row, "stock_name", "") or "").strip()
+            if not stock_no or stock_no in {"代號", "證券代號"}:
+                continue
+
+            record = {
+                "date": dt.isoformat(),
+                "market": "TPEX",
+                "stock_no": stock_no,
+                "stock_name": stock_name,
+            }
+            for key in fallback_indexes:
+                if key in {"stock_no", "stock_name"}:
+                    continue
+                record[key] = self._t86_parse_int(get_value(row, key, 0))
+
+            # 某些版本不提供彙總欄位時，自行計算。
+            if index_map.get("foreign_total_buy") is None and len(row) <= fallback_indexes["foreign_total_buy"]:
+                record["foreign_total_buy"] = record["foreign_buy"] + record["foreign_dealer_buy"]
+                record["foreign_total_sell"] = record["foreign_sell"] + record["foreign_dealer_sell"]
+                record["foreign_total_net"] = record["foreign_net"] + record["foreign_dealer_net"]
+            if index_map.get("dealer_total_buy") is None and len(row) <= fallback_indexes["dealer_total_buy"]:
+                record["dealer_total_buy"] = record["dealer_self_buy"] + record["dealer_hedge_buy"]
+                record["dealer_total_sell"] = record["dealer_self_sell"] + record["dealer_hedge_sell"]
+                record["dealer_total_net"] = record["dealer_self_net"] + record["dealer_hedge_net"]
+            if index_map.get("overall_net") is None and len(row) <= fallback_indexes["overall_net"]:
+                record["overall_net"] = (
+                    record["foreign_total_net"]
+                    + record["investment_trust_net"]
+                    + record["dealer_total_net"]
+                )
+
+            results.append(record)
+
+        logger.info("TPEX T86 %s 抓取 %s 筆", dt.isoformat(), len(results))
+        return results
 
     def fetch_twse_t86_by_date(self, target_date):
         dt = self._ensure_date(target_date)
