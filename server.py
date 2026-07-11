@@ -7551,6 +7551,7 @@ def api_cash_flow_statement():
         'finishedAt': None,
         'year': str(year),
         'season': str(season),
+        'phase': 'init',
         'total': None,
         'processed': 0,
         'success_count': 0,
@@ -7578,6 +7579,7 @@ def api_cash_flow_statement():
 
     try:
         if write_to_db:
+            cash_flow_fetch_status['phase'] = 'connecting_db'
             db = DatabaseManager.from_request_args(request.args)
             if not db.connect() or not db.create_tables():
                 raise RuntimeError('資料庫初始化失敗')
@@ -7617,6 +7619,7 @@ def api_cash_flow_statement():
                     )
 
         from income_statement_service import fetch_all_stock_codes as _fetch_codes
+        cash_flow_fetch_status['phase'] = 'loading_codes'
         all_codes = _fetch_codes()
         if code_from or code_to:
             lower, upper = code_from, code_to
@@ -7628,6 +7631,11 @@ def api_cash_flow_statement():
             ]
         code_index = {item: index for index, item in enumerate(all_codes, 1)}
         total_codes = len(all_codes)
+        cash_flow_fetch_status.update({
+            'phase': 'fetching',
+            'total': total_codes,
+            'processed': 0,
+        })
         resume_from = None
         block_count = 0
 
@@ -7674,6 +7682,7 @@ def api_cash_flow_statement():
 
         cash_flow_fetch_status.update({
             'running': False,
+            'phase': 'done',
             'finishedAt': _dt.now(_tz.utc).isoformat(),
             'processed': total_codes,
             'success_count': len(collected),
@@ -8028,6 +8037,7 @@ cash_flow_fetch_status = {
     'finishedAt': None,
     'year': None,
     'season': None,
+    'phase': None,
     'total': None,
     'processed': 0,
     'success_count': 0,

@@ -205,7 +205,7 @@
   }
 
   document.addEventListener('DOMContentLoaded', () => {
-    document.querySelectorAll('#dbTargetToggle, #returnsDbToggle').forEach((element) => {
+    document.querySelectorAll('#dbTargetToggle, #returnsDbToggle, .module-db-toggle').forEach((element) => {
       element.style.display = 'none';
     });
     document.querySelectorAll('input[name="dbTarget"][value="remote"], input[name="returnsDbTarget"][value="neon"]')

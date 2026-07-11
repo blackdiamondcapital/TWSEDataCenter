@@ -159,14 +159,28 @@ class TaiwanStockApp {
     }
 
     setupDatabaseTargetToggle() {
-        const toggle = document.getElementById('dbTargetToggle');
-        if (!toggle) return;
+        const radios = document.querySelectorAll('input[name="dbTarget"]');
+        if (!radios.length) return;
 
-        const radios = toggle.querySelectorAll('input[name="dbTarget"]');
+        const syncRadios = () => {
+            radios.forEach((radio) => {
+                radio.checked = radio.value === this.dbTarget;
+            });
+        };
+
+        syncRadios();
+
+        if (!window.__CLOUD_DEPLOYMENT) {
+            document.querySelectorAll('#dbTargetToggle, .module-db-toggle').forEach((element) => {
+                element.style.display = '';
+            });
+        }
+
         radios.forEach((radio) => {
             radio.addEventListener('change', async (event) => {
                 if (!event.target.checked) return;
                 this.dbTarget = event.target.value === 'local' ? 'local' : 'remote';
+                syncRadios();
                 this.addLogMessage(`🔁 切換資料庫目標為 ${this.dbTarget === 'local' ? '本地 PostgreSQL' : 'Neon（雲端）'}`, 'info');
                 await this.checkDatabaseConnection();
                 try {
@@ -4833,35 +4847,70 @@ class TaiwanStockApp {
         return { params, isSingle: !!code };
     }
 
+    formatCashflowProgressMessage(state) {
+        if (!state) return '準備中…';
+        if (state.paused) {
+            return `MOPS 暫停中，預計 ${state.resumeAt || '稍後'} 續抓`;
+        }
+        const phase = String(state.phase || '');
+        if (phase === 'connecting_db') {
+            return '正在連線資料庫…';
+        }
+        if (phase === 'loading_codes' || (state.total == null && Number(state.processed || 0) === 0)) {
+            return '正在載入股票清單…';
+        }
+        const total = Number(state.total || 0);
+        const processed = Number(state.processed || 0);
+        const code = state.current_code ? ` ${state.current_code}` : '';
+        if (total > 0 && processed === 0) {
+            return `即將開始抓取，共 ${this.formatInteger(total)} 檔…`;
+        }
+        let message = `處理中 ${processed}/${total || '?'}${code}`;
+        if (state.db_write_enabled) {
+            message += `｜DB 已寫入 ${this.formatInteger(state.db_inserted_rows || 0)} 筆`;
+        }
+        return message;
+    }
+
+    cashflowProgressPercent(state) {
+        if (!state) return 3;
+        const phase = String(state.phase || '');
+        if (phase === 'connecting_db') return 3;
+        if (phase === 'loading_codes') return 5;
+        const total = Number(state.total || 0);
+        const processed = Number(state.processed || 0);
+        if (total <= 0) return 5;
+        if (processed <= 0) return 8;
+        return Math.max(8, Math.min(99, (processed / total) * 100));
+    }
+
     startCashflowProgressPolling(base) {
         this.stopCashflowProgressTimer();
-        this._cashflowProgressTimer = window.setInterval(async () => {
+        const poll = async () => {
             try {
                 const response = await fetch(`${base}/api/cash-flow-statement/status`);
                 if (!response.ok) return;
                 const payload = await response.json();
                 const state = payload?.status;
                 if (!state) return;
-                const total = Number(state.total || 0);
-                const processed = Number(state.processed || 0);
-                const pct = total > 0 ? Math.max(5, Math.min(99, (processed / total) * 100)) : 5;
-                let message = state.paused
-                    ? `MOPS 暫停中，預計 ${state.resumeAt || '稍後'} 續抓`
-                    : `處理中 ${processed}/${total || '?'} ${state.current_code || ''}`;
-                if (state.db_write_enabled) {
-                    message += `｜DB 已寫入 ${this.formatInteger(state.db_inserted_rows || 0)} 筆`;
-                }
+                const message = this.formatCashflowProgressMessage(state);
+                const pct = this.cashflowProgressPercent(state);
                 this.updateCashflowProgress(pct, message);
                 if (!state.running) this.stopCashflowProgressTimer();
             } catch (_) {}
-        }, 3000);
+        };
+        poll();
+        this._cashflowProgressTimer = window.setInterval(poll, 3000);
     }
 
     async requestCashflowPeriod(year, season) {
         const { params, isSingle } = this.cashflowRequestParams(year, season);
         const base = this.cashflowBaseUrl();
         const url = `${base}/api/cash-flow-statement?${params.toString()}`;
-        if (!isSingle) this.startCashflowProgressPolling(base);
+        if (!isSingle) {
+            this.startCashflowProgressPolling(base);
+            this.updateCashflowProgress(3, '正在載入股票清單…');
+        }
         this.addCashflowLog(`抓取 ${year} 年第 ${season} 季${isSingle ? '單一股票' : ''}`, 'info');
         const response = await fetch(url);
         if (!response.ok) {
@@ -4886,7 +4935,7 @@ class TaiwanStockApp {
             return;
         }
         try {
-            this.updateCashflowProgress(5, '準備抓取…');
+            this.updateCashflowProgress(3, '正在啟動抓取…');
             const data = await this.requestCashflowPeriod(year, season);
             this.cashflowData = data;
             this.updateCashflowSummary(data, year, season);

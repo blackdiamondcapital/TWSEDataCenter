@@ -401,6 +401,28 @@
                                     </select>
                                 </div>
                             </div>
+                            <div class="date-inputs-row" style="margin-top:0.75rem;">
+                                <div class="date-input-wrapper">
+                                    <label>資料庫目標</label>
+                                    <div class="db-toggle module-db-toggle" id="revenueDbTargetToggle">
+                                        <label class="db-option">
+                                            <input type="radio" name="dbTarget" value="remote">
+                                            <span>
+                                                <i class="fas fa-cloud"></i>
+                                                <span class="db-option-text">Neon（雲端）</span>
+                                            </span>
+                                        </label>
+                                        <label class="db-option">
+                                            <input type="radio" name="dbTarget" value="local">
+                                            <span>
+                                                <i class="fas fa-server"></i>
+                                                <span class="db-option-text">本地 PostgreSQL</span>
+                                            </span>
+                                        </label>
+                                    </div>
+                                    <p class="db-toggle-hint" style="margin-top:0.35rem;">抓取資料與 MOPS 匯入會寫入上方選定的資料庫。</p>
+                                </div>
+                            </div>
                             <div class="date-inputs-row" style="margin-top:1rem;">
                                 <div class="date-input-wrapper" style="display:flex; align-items:center; gap:.5rem;">
                                     <button id="revenueFetchBtn" class="btn btn-primary"><i class="fas fa-download"></i> 抓取資料</button>
