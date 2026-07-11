@@ -1,0 +1,200 @@
+name: Quarterly Financial Statements Fetch
+
+on:
+  schedule:
+    # 台北 09:00（UTC 01:00），各季法定申報截止日後執行
+    - cron: '0 1 16 5 *'   # Q1：5 月 16 日
+    - cron: '0 1 15 8 *'   # Q2：8 月 15 日
+    - cron: '0 1 15 11 *'  # Q3：11 月 15 日
+    - cron: '0 1 1 4 *'    # Q4：隔年 4 月 1 日
+  workflow_dispatch:
+    inputs:
+      year:
+        description: '西元年度（例如 2025）'
+        required: true
+        type: string
+      season:
+        description: '季度'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+      statement:
+        description: '報表'
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - income
+          - balance
+          - cashflow
+      code_from:
+        description: '股票代號起始（選填，例如 2330）'
+        required: false
+        type: string
+      code_to:
+        description: '股票代號結束（選填，例如 2899）'
+        required: false
+        type: string
+      pause_every:
+        description: '每幾檔休息一次'
+        required: true
+        default: '60'
+        type: string
+      pause_minutes:
+        description: '每批休息分鐘'
+        required: true
+        default: '2'
+        type: string
+      retry_max:
+        description: 'MOPS 封鎖重試次數'
+        required: true
+        default: '8'
+        type: string
+      retry_wait_minutes:
+        description: '封鎖後等待分鐘'
+        required: true
+        default: '5'
+        type: string
+
+env:
+  TZ: Asia/Taipei
+  PYTHONUNBUFFERED: '1'
+
+concurrency:
+  group: quarterly-statements-${{ github.event_name == 'schedule' && github.event.schedule || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  scheduled-shards:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - shard: 0000-2999
+            code_from: '0000'
+            code_to: '2999'
+          - shard: 3000-4999
+            code_from: '3000'
+            code_to: '4999'
+          - shard: 5000-6999
+            code_from: '5000'
+            code_to: '6999'
+          - shard: 7000-9999
+            code_from: '7000'
+            code_to: '9999'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch scheduled quarterly statements
+        env:
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          QUARTERLY_STATEMENTS_LOG: quarterly-statements-${{ matrix.shard }}.log
+        run: |
+          python scripts/fetch_quarterly_statements_scheduled.py \
+            --statement all \
+            --code-from "${{ matrix.code_from }}" \
+            --code-to "${{ matrix.code_to }}" \
+            --delay 0.8 \
+            --pause-every 60 \
+            --pause-minutes 2 \
+            --retry-max 8 \
+            --retry-wait-minutes 5 \
+            --flush-every 10
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarterly-statements-${{ matrix.shard }}-${{ github.run_number }}
+          path: quarterly-statements-${{ matrix.shard }}.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  manual-fetch:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch selected quarterly statements
+        env:
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          QUARTERLY_STATEMENTS_LOG: quarterly-statements-manual.log
+          INPUT_YEAR: ${{ inputs.year }}
+          INPUT_SEASON: ${{ inputs.season }}
+          INPUT_STATEMENT: ${{ inputs.statement }}
+          INPUT_CODE_FROM: ${{ inputs.code_from }}
+          INPUT_CODE_TO: ${{ inputs.code_to }}
+          INPUT_PAUSE_EVERY: ${{ inputs.pause_every }}
+          INPUT_PAUSE_MINUTES: ${{ inputs.pause_minutes }}
+          INPUT_RETRY_MAX: ${{ inputs.retry_max }}
+          INPUT_RETRY_WAIT_MINUTES: ${{ inputs.retry_wait_minutes }}
+        run: |
+          args=(
+            --year "$INPUT_YEAR"
+            --season "$INPUT_SEASON"
+            --statement "$INPUT_STATEMENT"
+            --pause-every "$INPUT_PAUSE_EVERY"
+            --pause-minutes "$INPUT_PAUSE_MINUTES"
+            --retry-max "$INPUT_RETRY_MAX"
+            --retry-wait-minutes "$INPUT_RETRY_WAIT_MINUTES"
+            --delay 0.8
+            --flush-every 10
+          )
+          if [ -n "$INPUT_CODE_FROM" ]; then
+            args+=(--code-from "$INPUT_CODE_FROM")
+          fi
+          if [ -n "$INPUT_CODE_TO" ]; then
+            args+=(--code-to "$INPUT_CODE_TO")
+          fi
+          python scripts/fetch_quarterly_statements_scheduled.py "${args[@]}"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarterly-statements-manual-${{ github.run_number }}
+          path: quarterly-statements-manual.log
+          if-no-files-found: warn
+          retention-days: 30

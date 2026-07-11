@@ -1,0 +1,102 @@
+name: Monthly Revenue Fetch
+
+on:
+  schedule:
+    # 每月 10、11 日 09:00（台北）= UTC 01:00
+    - cron: '0 1 10,11 * *'
+  workflow_dispatch:
+    inputs:
+      market:
+        description: '市場'
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - twse
+          - tpex
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  fetch-monthly-revenue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch monthly revenue and write to Neon
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          MARKET: ${{ github.event.inputs.market || 'both' }}
+          PYTHONUNBUFFERED: 1
+        run: |
+          python3 -u << 'PYTHON_SCRIPT'
+          import os
+          import sys
+          from datetime import datetime
+
+          sys.stdout.reconfigure(line_buffering=True)
+
+          market = os.environ.get("MARKET", "both").lower()
+          db_url = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
+
+          print("=" * 80, flush=True)
+          print("🚀 月營收排程抓取", flush=True)
+          print(f"⏰ 執行時間：{datetime.now()}", flush=True)
+          print(f"📊 市場：{market.upper()}", flush=True)
+          print("=" * 80, flush=True)
+
+          if not db_url:
+              print("❌ 未設定 NEON_DATABASE_URL secret", flush=True)
+              sys.exit(1)
+
+          from server import DatabaseManager, stock_api
+
+          records, summary = stock_api.fetch_monthly_revenue(market=market)
+          summary = summary or {}
+
+          print(f"✅ 抓取完成：{len(records)} 筆", flush=True)
+          per_market = summary.get("per_market") or {}
+          if per_market:
+              print(f"   TWSE={per_market.get('TWSE', 0)}, TPEX={per_market.get('TPEX', 0)}", flush=True)
+
+          inserted = 0
+          if records:
+              db = DatabaseManager(use_local=False)
+              try:
+                  inserted = stock_api.upsert_monthly_revenue(records, db_manager=db)
+                  print(f"💾 寫入 {db.table_revenue}：{inserted} 筆", flush=True)
+              finally:
+                  try:
+                      db.disconnect()
+                  except Exception:
+                      pass
+          else:
+              print("⚠️  本次無資料（可能尚未公告，11 日會再試）", flush=True)
+
+          year = summary.get("year")
+          month = summary.get("month")
+          if year and month:
+              print(f"📅 實際期別：{year}-{int(month):02d}", flush=True)
+
+          print("=" * 80, flush=True)
+          print("🎉 任務完成", flush=True)
+          print("=" * 80, flush=True)
+          PYTHON_SCRIPT

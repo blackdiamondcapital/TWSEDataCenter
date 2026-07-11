@@ -222,6 +222,36 @@ class StockDataScheduler:
             
         except Exception as e:
             logger.error(f"❌ 每週回補時發生錯誤: {e}", exc_info=True)
+
+    def fetch_monthly_revenue(self):
+        """抓取最新一期月營收並寫入資料庫（每月 10、11 日排程用）"""
+        logger.info("=" * 60)
+        logger.info("開始執行月營收排程抓取任務")
+        logger.info("=" * 60)
+
+        script_path = os.path.join(os.path.dirname(__file__), 'scripts', 'fetch_monthly_revenue_scheduled.py')
+        try:
+            result = subprocess.run(
+                [sys.executable, script_path],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                cwd=os.path.dirname(__file__),
+            )
+            if result.stdout:
+                logger.info(result.stdout)
+            if result.returncode == 0:
+                logger.info("✅ 月營收排程抓取成功")
+            elif result.returncode == 2:
+                logger.warning("⚠️ 月營收排程完成但本次無資料（可能尚未公告）")
+            else:
+                logger.error(f"❌ 月營收排程抓取失敗 (exit {result.returncode})")
+                if result.stderr:
+                    logger.error(result.stderr)
+        except subprocess.TimeoutExpired:
+            logger.error("❌ 月營收排程抓取超時")
+        except Exception as e:
+            logger.error(f"❌ 月營收排程抓取時發生錯誤: {e}", exc_info=True)
     
     def start(self):
         """啟動排程器"""
@@ -246,6 +276,16 @@ class StockDataScheduler:
             replace_existing=True
         )
         logger.info("📅 已設定每週排程：週日 02:00")
+
+        # 月營收：每月 10、11 日 09:00（多數公司 10 日前後公告，11 日再補抓）
+        self.scheduler.add_job(
+            self.fetch_monthly_revenue,
+            CronTrigger(day='10,11', hour=9, minute=0),
+            id='monthly_revenue_fetch',
+            name='月營收排程抓取',
+            replace_existing=True,
+        )
+        logger.info("📅 已設定月營收排程：每月 10、11 日 09:00")
         
         # 顯示所有排程任務
         logger.info("\n排程任務列表：")
@@ -268,6 +308,7 @@ def main():
     parser = argparse.ArgumentParser(description='股價資料自動排程系統')
     parser.add_argument('--test', action='store_true', help='測試執行一次抓取任務')
     parser.add_argument('--weekly', action='store_true', help='測試執行每週回補任務')
+    parser.add_argument('--revenue', action='store_true', help='測試執行月營收排程抓取')
     
     args = parser.parse_args()
     
@@ -279,6 +320,9 @@ def main():
     elif args.weekly:
         logger.info("🧪 測試模式：執行每週回補任務")
         scheduler.weekly_full_refresh()
+    elif args.revenue:
+        logger.info("🧪 測試模式：執行月營收排程抓取")
+        scheduler.fetch_monthly_revenue()
     else:
         scheduler.start()
 
