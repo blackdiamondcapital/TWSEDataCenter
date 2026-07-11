@@ -39,9 +39,14 @@ TARGET_KEYWORDS = {
     ],
     "OtherCurrentFinancialAssets": ["ifrs-full:OtherCurrentFinancialAssets"],
     "CurrentContractAssets": ["ifrs-full:CurrentContractAssets"],
-    "AccountsReceivableNet": ["ifrs-full:TradeAndOtherCurrentReceivables"],
+    "AccountsReceivableNet": [
+        "ifrs-full:TradeAndOtherCurrentReceivables",
+        "tifrs-bsci-ci:AccountsReceivableNet",
+    ],
     "AccountsReceivableDueFromRelatedPartiesNet": [
-        "ifrs-full:TradeAndOtherCurrentReceivablesDueFromRelatedParties"
+        "ifrs-full:TradeAndOtherCurrentReceivablesDueFromRelatedParties",
+        "tifrs-bsci-ci:AccountsReceivableDuefromRelatedPartiesNet",
+        "tifrs-bsci-ci:AccountsReceivableDueFromRelatedPartiesNet",
     ],
     "OtherCurrentReceivables": ["ifrs-full:OtherCurrentReceivables"],
     "Inventories": ["ifrs-full:Inventories"],
@@ -63,12 +68,16 @@ TARGET_KEYWORDS = {
     ],
     "NoncurrentContractAssets": ["ifrs-full:NoncurrentContractAssets"],
     "InvestmentAccountedForUsingEquityMethod": [
-        "ifrs-full:InvestmentsAccountedForUsingEquityMethod"
+        "ifrs-full:InvestmentsAccountedForUsingEquityMethod",
+        "ifrs-full:InvestmentAccountedForUsingEquityMethod",
     ],
     "PropertyPlantAndEquipment": ["ifrs-full:PropertyPlantAndEquipment"],
     "RightofuseAssets": ["ifrs-full:RightofuseAssets"],
     "InvestmentProperty": ["ifrs-full:InvestmentProperty"],
-    "IntangibleAssetsAndGoodwill": ["ifrs-full:IntangibleAssets"],
+    "IntangibleAssetsAndGoodwill": [
+        "ifrs-full:IntangibleAssets",
+        "ifrs-full:IntangibleAssetsAndGoodwill",
+    ],
     "LicencesAndFranchises": ["tifrs-bsci-ci:LicencesAndFranchises"],
     "Goodwill": ["ifrs-full:Goodwill"],
     "OtherIntangibleAssets": ["ifrs-full:OtherIntangibleAssets"],
@@ -114,7 +123,10 @@ TARGET_KEYWORDS = {
     "NoncurrentPortionOfNoncurrentBondsIssued": [
         "ifrs-full:NoncurrentPortionOfNoncurrentBondsIssued"
     ],
-    "LongtermBorrowings": ["ifrs-full:LongtermBorrowings"],
+    "LongtermBorrowings": [
+        "ifrs-full:LongtermBorrowings",
+        "ifrs-full:NoncurrentPortionOfNoncurrentLoansReceived",
+    ],
     "NoncurrentProvisions": ["ifrs-full:NoncurrentProvisions"],
     "DeferredTaxLiabilities": ["ifrs-full:DeferredTaxLiabilities"],
     "NoncurrentFinanceLeaseLiabilities": [
@@ -143,6 +155,58 @@ TARGET_KEYWORDS = {
     ],
     "NoncontrollingInterests": ["ifrs-full:NoncontrollingInterests"],
     "EquityAndLiabilities": ["ifrs-full:EquityAndLiabilities"],
+    "Equity": ["ifrs-full:Equity"],
+    "CurrentFinancialLiabilitiesAtFairValueThroughProfitOrLoss": [
+        "ifrs-full:CurrentFinancialLiabilitiesAtFairValueThroughProfitOrLoss"
+    ],
+    "IssuedCapital": ["ifrs-full:IssuedCapital"],
+    # Financial holding companies and banks use a separate balance-sheet
+    # taxonomy. Keep these as dedicated columns instead of forcing them into
+    # manufacturing-company current/non-current classifications.
+    "DueFromTheCentralBankAndCallLoansToBanks": [
+        "tifrs-bsci-fh:DueFromTheCentralBankAndCallLoansToBanks"
+    ],
+    "FinancialAssetsAtFairValueThroughProfitOrLoss": [
+        "ifrs-full:FinancialAssetsAtFairValueThroughProfitOrLoss"
+    ],
+    "FinancialAssetsAtFairValueThroughOtherComprehensiveIncome": [
+        "ifrs-full:FinancialAssetsAtFairValueThroughOtherComprehensiveIncome"
+    ],
+    "FinancialAssetsAtAmortisedCost": [
+        "ifrs-full:FinancialAssetsAtAmortisedCost"
+    ],
+    "SecuritiesPurchasedUnderResellAgreements": [
+        "tifrs-bsci-fh:SecuritiesPurchasedUnderResellAgreements"
+    ],
+    "ReceivablesNet": ["tifrs-bsci-fh:ReceivablesNet"],
+    "LoansDiscountedNet": ["tifrs-bsci-fh:LoansDiscountedNet"],
+    "InsuranceContractAndReinsuranceAssetsNet": [
+        "tifrs-bsci-fh:InsuranceContractAndReinsuranceAssetsNet"
+    ],
+    "OtherFinancialAssets": ["ifrs-full:OtherFinancialAssets"],
+    "DepositsFromBanks": ["ifrs-full:DepositsFromBanks"],
+    "DueToTheCentralBankAndBanks": [
+        "tifrs-bsci-fh:DueToTheCentralBankAndBanks"
+    ],
+    "FinancialLiabilitiesAtFairValueThroughProfitOrLoss": [
+        "ifrs-full:FinancialLiabilitiesAtFairValueThroughProfitOrLoss"
+    ],
+    "SecuritiesSoldUnderRepurchaseAgreements": [
+        "tifrs-bsci-fh:SecuritiesSoldUnderRepurchaseAgreements"
+    ],
+    "CommercialPapersIssuedNet": ["tifrs-bsci-fh:CommercialPapersIssuedNet"],
+    "TradeAndOtherPayables": ["ifrs-full:TradeAndOtherPayables"],
+    "DepositsFromCustomers": ["ifrs-full:DepositsFromCustomers"],
+    "BondsIssued": ["ifrs-full:BondsIssued"],
+    "OtherBorrowings": ["ifrs-full:OtherBorrowings"],
+    "Provisions": ["ifrs-full:Provisions"],
+    "OtherFinancialLiabilities": ["ifrs-full:OtherFinancialLiabilities"],
+    "InsuranceContractAndReinsuranceContractLiabilities": [
+        "tifrs-bsci-fh:InsuranceContractAndReinsuranceContractLiabilities"
+    ],
+    "LeaseLiabilities": ["ifrs-full:LeaseLiabilities"],
+    "OtherAssets": ["ifrs-full:OtherAssets"],
+    "OtherLiabilities": ["ifrs-full:OtherLiabilities"],
 }
 
 
@@ -290,7 +354,7 @@ def fetch_balance_sheet_row(co_id: str, year: str, season: str) -> pd.DataFrame:
     results = []
     for node in nonfraction_nodes:
         name_attr = node.get("name") or ""
-        text_content = (node.text or "").strip()
+        text_content = "".join(node.itertext()).strip()
 
         matched_key = None
         for key, kws in TARGET_KEYWORDS.items():
@@ -340,13 +404,29 @@ def fetch_balance_sheet_row(co_id: str, year: str, season: str) -> pd.DataFrame:
 
     period_label = f"{year}{int(season):02d}"
     df["period"] = period_label
+    quarter_end = {1: "0331", 2: "0630", 3: "0930", 4: "1231"}[int(season)]
+    expected_context = f"AsOf{year}{quarter_end}"
+    requested_year = str(year)
+    df["context_priority"] = df["contextref"].apply(
+        lambda context: (
+            0
+            if str(context) == expected_context
+            else 1
+            if requested_year in str(context)
+            else 2
+        )
+    )
 
     df["target"] = pd.Categorical(df["target"], categories=TARGET_ORDER, ordered=True)
-    df = df.sort_values(["target"]).reset_index(drop=True)
+    df = df.sort_values(["target", "context_priority"], kind="stable").reset_index(drop=True)
     df = df.groupby("target", observed=False).head(1).reset_index(drop=True)
 
     pivot = df.pivot_table(
-        index=["period"], columns="target", values="scaled_value", aggfunc="first"
+        index=["period"],
+        columns="target",
+        values="scaled_value",
+        aggfunc="first",
+        observed=False,
     ).reset_index()
     pivot.columns.name = None
     pivot.insert(0, "股票代號", co_id)
@@ -404,10 +484,7 @@ def fetch_all_balance_sheets(
             if not row_df.empty:
                 rows.append(row_df)
                 if row_cb is not None:
-                    try:
-                        row_cb(co_id, row_df)
-                    except Exception:
-                        pass
+                    row_cb(co_id, row_df)
                 if progress_cb is not None:
                     progress_cb(idx, total, co_id, "success", None)
             else:

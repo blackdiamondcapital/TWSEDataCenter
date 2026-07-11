@@ -125,6 +125,7 @@ class StatementRunner:
         self.write_to_db = write_to_db
         self.flush_every = max(1, flush_every)
         self.stock_api = None
+        self.db_manager = None
 
     def _flush(self, spec: StatementSpec, pending: list[dict]) -> int:
         if not pending:
@@ -140,10 +141,19 @@ class StatementRunner:
 
         records = list(pending)
         method = getattr(self.stock_api, spec.upsert_method)
-        inserted = method(records)
+        if self.db_manager is None:
+            from server import DatabaseManager
+
+            self.db_manager = DatabaseManager(use_local=False)
+        inserted = method(records, db_manager=self.db_manager)
         pending.clear()
         logger.info("[%s] 已寫入 Neon：%d 筆", spec.key, inserted)
         return inserted
+
+    def close(self) -> None:
+        if self.db_manager is not None:
+            self.db_manager.disconnect()
+            self.db_manager = None
 
     def run_statement(self, spec: StatementSpec) -> dict[str, int | str]:
         pending: list[dict] = []
@@ -294,14 +304,17 @@ def run(args: argparse.Namespace) -> int:
     )
 
     failed = 0
-    for key in selected:
-        try:
-            runner.run_statement(specs[key])
-        except Exception:
-            failed += 1
-            logger.exception("[%s] 抓取失敗", key)
-            if not args.continue_on_error:
-                break
+    try:
+        for key in selected:
+            try:
+                runner.run_statement(specs[key])
+            except Exception:
+                failed += 1
+                logger.exception("[%s] 抓取失敗", key)
+                if not args.continue_on_error:
+                    break
+    finally:
+        runner.close()
 
     if failed:
         logger.error("季度報表任務結束：%d 個報表失敗", failed)

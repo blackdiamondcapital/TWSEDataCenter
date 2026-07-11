@@ -305,6 +305,7 @@ class DatabaseManager:
             'sslmode': os.environ.get('DB_SSLMODE', ssl_default)
         }
         self.connection = None
+        self._tables_ready = False
         self.is_neon = resolve_use_neon(use_local=self.use_local, db_url=self.db_url)
         self.table_prices = stock_prices_table(use_neon=self.is_neon)
         self.table_returns = stock_returns_table(use_neon=self.is_neon)
@@ -477,6 +478,8 @@ class DatabaseManager:
     def connect(self):
         """連接到PostgreSQL資料庫"""
         try:
+            if self.connection is not None and getattr(self.connection, "closed", 1) == 0:
+                return True
             if self.db_url:
                 # 解析 URL 改用字典參數連線，避免 URI 解析問題
                 from urllib.parse import urlparse, parse_qs
@@ -533,6 +536,8 @@ class DatabaseManager:
     
     def create_tables(self):
         """创建股票数据表（带锁保护）"""
+        if self._tables_ready:
+            return True
         # 获取表锁，防止并发修改表结构
         acquired = db_table_lock.acquire(timeout=30)
         if not acquired:
@@ -988,6 +993,7 @@ class DatabaseManager:
             
             self.connection.commit()
             cursor.close()
+            self._tables_ready = True
             logger.info("资料库表创建成功")
             return True
         except Exception as e:
