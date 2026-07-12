@@ -4,6 +4,7 @@ pandas==2.2.2
 beautifulsoup4==4.12.2
 requests==2.31.0
 lxml==4.9.3
+html5lib==1.1
 numpy==1.26.2
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1

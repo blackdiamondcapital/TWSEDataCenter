@@ -713,7 +713,7 @@ def fetch_all_stock_codes() -> List[str]:
             except Exception:
                 html = resp.content.decode("cp950", errors="ignore")
 
-        tables = pd.read_html(StringIO(html))
+        tables = pd.read_html(StringIO(html), flavor=["lxml", "html5lib", "bs4"])
         if not tables:
             continue
         df = tables[0]
