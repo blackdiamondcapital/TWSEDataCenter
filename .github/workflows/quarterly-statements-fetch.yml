@@ -9,20 +9,10 @@ on:
     - cron: '0 1 1 4 *'    # Q4：隔年 4 月 1 日
   workflow_dispatch:
     inputs:
-      year:
-        description: '西元年度（例如 2025）'
+      periods:
+        description: '期間（單期 2025Q1、多期 2024Q1,2024Q2 或區間 2024Q1-2024Q4）'
         required: true
         type: string
-      season:
-        description: '季度'
-        required: true
-        default: '1'
-        type: choice
-        options:
-          - '1'
-          - '2'
-          - '3'
-          - '4'
       statement:
         description: '報表'
         required: true
@@ -161,8 +151,7 @@ jobs:
           DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
           QUARTERLY_STATEMENTS_LOG: quarterly-statements-manual.log
-          INPUT_YEAR: ${{ inputs.year }}
-          INPUT_SEASON: ${{ inputs.season }}
+          INPUT_PERIODS: ${{ inputs.periods }}
           INPUT_STATEMENT: ${{ inputs.statement }}
           INPUT_CODE_FROM: ${{ inputs.code_from }}
           INPUT_CODE_TO: ${{ inputs.code_to }}
@@ -172,8 +161,7 @@ jobs:
           INPUT_RETRY_WAIT_MINUTES: ${{ inputs.retry_wait_minutes }}
         run: |
           args=(
-            --year "$INPUT_YEAR"
-            --season "$INPUT_SEASON"
+            --periods "$INPUT_PERIODS"
             --statement "$INPUT_STATEMENT"
             --pause-every "$INPUT_PAUSE_EVERY"
             --pause-minutes "$INPUT_PAUSE_MINUTES"
