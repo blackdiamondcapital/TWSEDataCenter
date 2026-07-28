@@ -132,6 +132,7 @@ class TaiwanStockApp {
         this.incomeLogAutoScroll = true;
         this._incomeLogInitialized = false;
         this._incomeProgressTimer = null;
+        this._incomeFetchInProgress = false;
         // Balance sheet 狀態
         this.balanceData = [];
         this.balanceLogPanel = null;
@@ -193,6 +194,10 @@ class TaiwanStockApp {
 
     get useLocalDb() {
         return this.dbTarget === 'local';
+    }
+
+    getDbTargetLabel() {
+        return this.useLocalDb ? '本地 PostgreSQL' : 'Neon 雲端';
     }
 
     // ===== 異常檢核與修復 =====
@@ -1371,6 +1376,7 @@ class TaiwanStockApp {
         const keywordInput = document.getElementById('warrantsKeyword');
         const importBtn = document.getElementById('warrantsImportBtn');
         const marketSelect = document.getElementById('warrantsMarketSelect');
+        const twseMasterImportBtn = document.getElementById('warrantsTwseMasterImportBtn');
         const tpexMasterImportBtn = document.getElementById('warrantsTpexMasterImportBtn');
         const tpexDailyImportBtn = document.getElementById('warrantsTpexDailyImportBtn');
 
@@ -1397,6 +1403,12 @@ class TaiwanStockApp {
             marketSelect.addEventListener('change', async () => {
                 await this.loadWarrantsDates();
                 await this.fetchWarrants();
+            });
+        }
+
+        if (twseMasterImportBtn) {
+            twseMasterImportBtn.addEventListener('click', () => {
+                this.importTwseWarrantMaster();
             });
         }
 
@@ -1533,15 +1545,18 @@ class TaiwanStockApp {
     async pollWarrantImportStatus(type) {
         const statusEl = document.getElementById('warrantsStatus');
         try {
-            if (type === 'twse') {
+            if (type === 'twse' || type === 'twse-master') {
                 const respStatus = await fetch('http://localhost:5003/api/warrants/import-status');
                 const statusJson = await respStatus.json();
                 if (!respStatus.ok || !statusJson.success) return;
-                const s = statusJson.status || {};
+                const s = type === 'twse-master'
+                    ? (statusJson.master || {})
+                    : (statusJson.status || {});
                 if (!s.running || !statusEl) return;
+                const label = type === 'twse-master' ? 'TWSE 主檔' : 'TWSE 成交';
                 statusEl.textContent = s.total
-                    ? `TWSE 匯入中... 已處理 ${s.processed}/${s.total} 筆`
-                    : `TWSE 匯入中... 已處理 ${s.processed} 筆`;
+                    ? `${label}匯入中... 已處理 ${s.processed}/${s.total} 筆`
+                    : `${label}匯入中... 已處理 ${s.processed} 筆`;
                 return;
             }
 
@@ -1599,6 +1614,31 @@ class TaiwanStockApp {
         } catch (err) {
             console.error('importLatestWarrants error', err);
             if (statusEl) statusEl.textContent = `匯入失敗：${err.message}`;
+        } finally {
+            this.clearWarrantsImportTimer();
+        }
+    }
+
+    async importTwseWarrantMaster() {
+        const statusEl = document.getElementById('warrantsStatus');
+        try {
+            if (statusEl) statusEl.textContent = '正在匯入 TWSE 權證主檔（全部有發行），請稍候...';
+            this.startWarrantsImportPolling('twse-master');
+
+            const params = new URLSearchParams();
+            if (this.useLocalDb) params.set('use_local_db', 'true');
+
+            const resp = await fetch(`http://localhost:5003/api/warrants/twse/import-master?${params.toString()}`, {
+                method: 'POST',
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            if (statusEl) statusEl.textContent = `${data.message || 'TWSE 主檔匯入完成'}（${data.importedCount || 0} 筆）`;
+        } catch (err) {
+            console.error('importTwseWarrantMaster error', err);
+            if (statusEl) statusEl.textContent = `TWSE 主檔匯入失敗：${err.message}`;
         } finally {
             this.clearWarrantsImportTimer();
         }
@@ -3292,8 +3332,99 @@ class TaiwanStockApp {
         }
     }
 
+    getIncomeThrottleSettings() {
+        const batchSizeStr = document.getElementById('incomeBatchSize')?.value || '';
+        const restMinutesStr = document.getElementById('incomeBatchRestMinutes')?.value || '';
+        const retryMaxStr = document.getElementById('incomeRetryMax')?.value || '';
+        const retryWaitMinutesStr = document.getElementById('incomeRetryWaitMinutes')?.value || '';
+        const batchSize = parseInt(batchSizeStr, 10);
+        const restMinutes = parseFloat(restMinutesStr);
+        let retryMax = parseInt(retryMaxStr, 10);
+        if (!Number.isFinite(retryMax) || retryMax < 0) retryMax = 20;
+        const retryWaitMinutes = parseFloat(retryWaitMinutesStr);
+        return {
+            batchSize: Number.isFinite(batchSize) && batchSize > 0 ? batchSize : null,
+            restMinutes: Number.isFinite(restMinutes) && restMinutes > 0 ? restMinutes : null,
+            retryMax,
+            retryWaitMinutes: Number.isFinite(retryWaitMinutes) && retryWaitMinutes > 0 ? retryWaitMinutes : 5,
+        };
+    }
+
+    buildIncomeFetchParams(year, season, options = {}) {
+        const {
+            codeFrom = '',
+            codeTo = '',
+            writeToDb = false,
+        } = options;
+        const throttle = this.getIncomeThrottleSettings();
+        const params = new URLSearchParams({ year: String(year), season: String(season) });
+        if (codeFrom) params.append('code_from', codeFrom);
+        if (codeTo) params.append('code_to', codeTo);
+        if (throttle.batchSize) params.append('pause_every', String(throttle.batchSize));
+        if (throttle.restMinutes) params.append('pause_minutes', String(throttle.restMinutes));
+        params.append('retry_on_block', '1');
+        params.append('retry_wait_minutes', String(throttle.retryWaitMinutes));
+        params.append('retry_max', String(throttle.retryMax));
+        if (writeToDb) {
+            params.append('write_to_db', '1');
+            params.append('use_local_db', this.useLocalDb ? 'true' : 'false');
+        }
+        return params;
+    }
+
+    async fetchIncomePeriodWithRetry(base, requestUrl, params, periodLabel, clientRetries = 3) {
+        let lastError = 'MOPS/TWSE 顯示「因安全性考量無法存取」頁面，可能已觸發防護機制。';
+        for (let attempt = 0; attempt <= clientRetries; attempt += 1) {
+            if (attempt > 0) {
+                const waitMin = this.getIncomeThrottleSettings().retryWaitMinutes;
+                this.addIncomeLog(
+                    `期別 ${periodLabel} 遇 MOPS 封鎖，${waitMin} 分鐘後進行第 ${attempt}/${clientRetries} 次重試…`,
+                    'warning',
+                );
+                await new Promise((resolve) => setTimeout(resolve, waitMin * 60 * 1000));
+            }
+
+            const resp = await fetch(`${requestUrl}?${params.toString()}`);
+            if (resp.status === 409) {
+                let msg = '已有損益表抓取任務進行中，請等待完成後再試。';
+                try {
+                    const j = await resp.json();
+                    if (j && j.error) msg = j.error;
+                } catch (_) {}
+                throw new Error(msg);
+            }
+            if (resp.status === 429) {
+                try {
+                    const j = await resp.json();
+                    if (j && j.error) lastError = j.error;
+                } catch (_) {}
+                continue;
+            }
+            if (!resp.ok) {
+                let msg = `HTTP ${resp.status}`;
+                try {
+                    const j = await resp.json();
+                    if (j && j.error) msg = j.error;
+                } catch (_) {}
+                throw new Error(msg);
+            }
+            const data = await resp.json();
+            if (!Array.isArray(data)) {
+                throw new Error('伺服器回傳格式錯誤（預期為陣列）');
+            }
+            return data;
+        }
+        throw new Error(lastError);
+    }
+
     async fetchIncomeData() {
         try {
+            if (this._incomeFetchInProgress) {
+                this.addIncomeLog('已有損益表抓取進行中，請等待完成後再試。', 'warning');
+                return;
+            }
+            this._incomeFetchInProgress = true;
+
             const yearStr = document.getElementById('incomeYear')?.value;
             const seasonStr = document.getElementById('incomeSeason')?.value || '1';
 
@@ -3302,10 +3433,12 @@ class TaiwanStockApp {
 
             if (!Number.isFinite(year) || year < 2000) {
                 this.addIncomeLog('請輸入正確的西元年度（例如 2025）', 'warning');
+                this._incomeFetchInProgress = false;
                 return;
             }
             if (![1, 2, 3, 4].includes(season)) {
                 this.addIncomeLog('請選擇 1-4 季之一', 'warning');
+                this._incomeFetchInProgress = false;
                 return;
             }
 
@@ -3322,28 +3455,17 @@ class TaiwanStockApp {
                 );
             }
 
-            const batchSizeStr = document.getElementById('incomeBatchSize')?.value || '';
-            const restMinutesStr = document.getElementById('incomeBatchRestMinutes')?.value || '';
-            const retryMaxStr = document.getElementById('incomeRetryMax')?.value || '';
-            const retryWaitMinutesStr = document.getElementById('incomeRetryWaitMinutes')?.value || '';
-            const batchSize = parseInt(batchSizeStr, 10);
-            const restMinutes = parseFloat(restMinutesStr);
-            const retryMax = parseInt(retryMaxStr, 10);
-            const retryWaitMinutes = parseFloat(retryWaitMinutesStr);
-            const hasBatch = Number.isFinite(batchSize) && batchSize > 0;
-            const hasRest = Number.isFinite(restMinutes) && restMinutes > 0;
-            const hasRetryMax = Number.isFinite(retryMax) && retryMax >= 0;
-            const hasRetryWait = Number.isFinite(retryWaitMinutes) && retryWaitMinutes > 0;
-            if (hasBatch && hasRest) {
+            const throttle = this.getIncomeThrottleSettings();
+            if (throttle.batchSize && throttle.restMinutes) {
                 this.addIncomeLog(
-                    `節流設定：每抓取 ${batchSize} 檔休息 ${restMinutes} 分鐘後繼續。`,
+                    `節流設定：每抓取 ${throttle.batchSize} 檔休息 ${throttle.restMinutes} 分鐘後繼續。`,
                     'info',
                 );
             }
-            if (hasRetryMax) {
-                const waitLabel = hasRetryWait ? retryWaitMinutes : 5;
-                this.addIncomeLog(`封鎖自動續抓設定：最多暫停/重試 ${retryMax} 次（每次 ${waitLabel} 分鐘）。`, 'info');
-            }
+            this.addIncomeLog(
+                `封鎖自動續抓設定：最多暫停/重試 ${throttle.retryMax} 次（每次 ${throttle.retryWaitMinutes} 分鐘）。`,
+                'info',
+            );
 
             console.log('[Income] fetchIncomeData start', { year, season });
             this.addLogMessage(`📥 抓取損益表：${periodLabel} 全市場`, 'info');
@@ -3355,7 +3477,12 @@ class TaiwanStockApp {
             const writeToDb = !!(autoImportEl && autoImportEl.checked);
             if (writeToDb) {
                 this.addIncomeLog(
-                    `本次抓取將在伺服器端同步寫入資料庫（目標：${this.useLocalDb ? '本地 PostgreSQL' : 'Neon 雲端'}）。`,
+                    `本次抓取將在伺服器端同步寫入資料庫（目標：${this.getDbTargetLabel()}）。`,
+                    'info',
+                );
+            } else {
+                this.addIncomeLog(
+                    `本次抓取僅預覽資料，不會自動寫入資料庫（匯入目標：${this.getDbTargetLabel()}）。`,
                     'info',
                 );
             }
@@ -3364,18 +3491,11 @@ class TaiwanStockApp {
             this.stopIncomeProgressTimer();
             this.updateIncomeProgress(5, '準備開始抓取…');
 
-            const params = new URLSearchParams({ year: String(year), season: String(season) });
-            if (codeFrom) params.append('code_from', codeFrom);
-            if (codeTo) params.append('code_to', codeTo);
-            if (hasBatch) params.append('pause_every', String(batchSize));
-            if (hasRest) params.append('pause_minutes', String(restMinutes));
-            params.append('retry_on_block', '1');
-            params.append('retry_wait_minutes', String(hasRetryWait ? retryWaitMinutes : 5));
-            if (hasRetryMax) params.append('retry_max', String(retryMax));
-            if (writeToDb) {
-                params.append('write_to_db', '1');
-                params.append('use_local_db', this.useLocalDb ? 'true' : 'false');
-            }
+            const params = this.buildIncomeFetchParams(year, season, {
+                codeFrom,
+                codeTo,
+                writeToDb,
+            });
             const origin = (window && window.location && window.location.origin) ? window.location.origin : '';
             const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
             const requestUrl = `${base}/api/income-statement`;
@@ -3418,27 +3538,7 @@ class TaiwanStockApp {
 
             const startedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 
-            const resp = await fetch(`${requestUrl}?${params.toString()}`);
-            if (!resp.ok) {
-                let msg = `HTTP ${resp.status}`;
-                try {
-                    const raw = await resp.text();
-                    if (raw) {
-                        try {
-                            const j = JSON.parse(raw);
-                            if (j && j.error) msg = j.error;
-                            else msg = raw;
-                        } catch (_) {
-                            msg = raw;
-                        }
-                    }
-                } catch (_) {}
-                throw new Error(msg);
-            }
-            const data = await resp.json();
-            if (!Array.isArray(data)) {
-                throw new Error('伺服器回傳格式錯誤（預期為陣列）');
-            }
+            const data = await this.fetchIncomePeriodWithRetry(base, requestUrl, params, periodLabel, 3);
 
             const finishedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
             const elapsedMs = Math.max(0, finishedAt - startedAt);
@@ -3458,7 +3558,17 @@ class TaiwanStockApp {
             });
 
             this.addLogMessage(`✅ 完成損益表抓取，共 ${total} 筆，涵蓋 ${unique.size} 檔股票`, 'success');
-            this.addIncomeLog(`資料已整理完成：共 ${this.formatInteger(total)} 筆，${this.formatInteger(unique.size)} 檔股票`, 'success');
+            if (writeToDb) {
+                this.addIncomeLog(
+                    `資料已整理完成：共 ${this.formatInteger(total)} 筆，${this.formatInteger(unique.size)} 檔股票（已寫入 ${this.getDbTargetLabel()}）`,
+                    'success',
+                );
+            } else {
+                this.addIncomeLog(
+                    `資料已整理完成：共 ${this.formatInteger(total)} 筆，${this.formatInteger(unique.size)} 檔股票（僅預覽，匯入目標：${this.getDbTargetLabel()}）`,
+                    'success',
+                );
+            }
             this.updateIncomeProgress(100, `完成：共 ${this.formatInteger(total)} 筆，${this.formatInteger(unique.size)} 檔股票`);
         } catch (err) {
             console.error('[Income] fetch error', err);
@@ -3466,11 +3576,19 @@ class TaiwanStockApp {
             this.addIncomeLog(`損益表抓取失敗：${err.message}`, 'error');
             this.stopIncomeProgressTimer();
             this.updateIncomeProgress(0, '抓取失敗，請查看下方日誌訊息');
+        } finally {
+            this._incomeFetchInProgress = false;
         }
     }
 
     async fetchIncomeMultiPeriod() {
         try {
+            if (this._incomeFetchInProgress) {
+                this.addIncomeLog('已有損益表抓取進行中，請等待完成後再試。', 'warning');
+                return;
+            }
+            this._incomeFetchInProgress = true;
+
             const fromStr = document.getElementById('incomeYearFrom')?.value || '';
             const toStr = document.getElementById('incomeYearTo')?.value || '';
             const baseYearStr = document.getElementById('incomeYear')?.value || '';
@@ -3496,18 +3614,7 @@ class TaiwanStockApp {
             const codeFrom = codeFromEl ? String(codeFromEl.value || '').trim() : '';
             const codeTo = codeToEl ? String(codeToEl.value || '').trim() : '';
 
-            const batchSizeStr = document.getElementById('incomeBatchSize')?.value || '';
-            const restMinutesStr = document.getElementById('incomeBatchRestMinutes')?.value || '';
-            const retryMaxStr = document.getElementById('incomeRetryMax')?.value || '';
-            const retryWaitMinutesStr = document.getElementById('incomeRetryWaitMinutes')?.value || '';
-            const batchSize = parseInt(batchSizeStr, 10);
-            const restMinutes = parseFloat(restMinutesStr);
-            const retryMax = parseInt(retryMaxStr, 10);
-            const retryWaitMinutes = parseFloat(retryWaitMinutesStr);
-            const hasBatch = Number.isFinite(batchSize) && batchSize > 0;
-            const hasRest = Number.isFinite(restMinutes) && restMinutes > 0;
-            const hasRetryMax = Number.isFinite(retryMax) && retryMax >= 0;
-            const hasRetryWait = Number.isFinite(retryWaitMinutes) && retryWaitMinutes > 0;
+            const throttle = this.getIncomeThrottleSettings();
 
             const selectedSeasons = [];
             for (let s = 1; s <= 4; s += 1) {
@@ -3544,19 +3651,19 @@ class TaiwanStockApp {
                     'info',
                 );
             }
-            if (hasBatch && hasRest) {
+            if (throttle.batchSize && throttle.restMinutes) {
                 this.addIncomeLog(
-                    `多期別節流設定：每抓取 ${batchSize} 檔休息 ${restMinutes} 分鐘後繼續。`,
+                    `多期別節流設定：每抓取 ${throttle.batchSize} 檔休息 ${throttle.restMinutes} 分鐘後繼續。`,
                     'info',
                 );
             }
-            if (hasRetryMax) {
-                const waitLabel = hasRetryWait ? retryWaitMinutes : 5;
-                this.addIncomeLog(`多期別封鎖自動續抓：最多暫停/重試 ${retryMax} 次（每次 ${waitLabel} 分鐘）。`, 'info');
-            }
+            this.addIncomeLog(
+                `多期別封鎖自動續抓：最多暫停/重試 ${throttle.retryMax} 次（每次 ${throttle.retryWaitMinutes} 分鐘）。`,
+                'info',
+            );
             if (writeToDb) {
                 this.addIncomeLog(
-                    `多期別損益表將在伺服器端同步寫入資料庫（目標：${this.useLocalDb ? '本地 PostgreSQL' : 'Neon 雲端'}）。`,
+                    `多期別損益表將在伺服器端同步寫入資料庫（目標：${this.getDbTargetLabel()}）。`,
                     'info',
                 );
             }
@@ -3584,18 +3691,12 @@ class TaiwanStockApp {
                 this.stopIncomeProgressTimer();
                 this.updateIncomeProgress(5, `準備抓取期別 ${periodLabel}…`);
 
-                const params = new URLSearchParams({ year: String(year), season: String(season) });
-                if (codeFrom) params.append('code_from', codeFrom);
-                if (codeTo) params.append('code_to', codeTo);
-                if (hasBatch) params.append('pause_every', String(batchSize));
-                if (hasRest) params.append('pause_minutes', String(restMinutes));
-                params.append('retry_on_block', '1');
-                params.append('retry_wait_minutes', String(hasRetryWait ? retryWaitMinutes : 5));
-                if (hasRetryMax) params.append('retry_max', String(retryMax));
-                if (writeToDb) {
-                    params.append('write_to_db', '1');
-                    params.append('use_local_db', this.useLocalDb ? 'true' : 'false');
-                }
+                const params = this.buildIncomeFetchParams(year, season, {
+                    codeFrom,
+                    codeTo,
+                    writeToDb,
+                });
+                this.addIncomeLog(`向伺服器發送請求：${requestUrl}?${params.toString()}`, 'info');
 
                 this._incomeProgressTimer = window.setInterval(async () => {
                     try {
@@ -3633,16 +3734,7 @@ class TaiwanStockApp {
                     ? performance.now()
                     : Date.now();
 
-                const resp = await fetch(`${requestUrl}?${params.toString()}`);
-                if (!resp.ok) {
-                    let msg = `HTTP ${resp.status}`;
-                    try {
-                        const j = await resp.json();
-                        if (j && j.error) msg = j.error;
-                    } catch (_) {}
-                    throw new Error(msg);
-                }
-                const data = await resp.json();
+                const data = await this.fetchIncomePeriodWithRetry(base, requestUrl, params, periodLabel, 3);
 
                 const finishedAt = (typeof performance !== 'undefined' && performance.now)
                     ? performance.now()
@@ -3652,7 +3744,7 @@ class TaiwanStockApp {
 
                 this.stopIncomeProgressTimer();
 
-                if (!Array.isArray(data) || !data.length) {
+                if (!data.length) {
                     this.addIncomeLog(`⚠️ 期別 ${periodLabel} 無資料（可能尚未公告）`, 'warning');
                     continue;
                 }
@@ -3703,6 +3795,8 @@ class TaiwanStockApp {
             this.addIncomeLog(`多期別損益表抓取失敗：${err.message}`, 'error');
             this.stopIncomeProgressTimer();
             this.updateIncomeProgress(0, '多期別抓取失敗，請查看下方日誌訊息');
+        } finally {
+            this._incomeFetchInProgress = false;
         }
     }
 
@@ -3735,10 +3829,28 @@ class TaiwanStockApp {
             this.clearIncomeLog(true);
             this.addIncomeLog(`開始抓取單一股票損益表：股票代號 ${code}，年度 ${year}，季別 ${season}`, 'info');
 
+            const autoImportEl = document.getElementById('incomeAutoImportCheckbox');
+            const writeToDb = !!(autoImportEl && autoImportEl.checked);
+            if (writeToDb) {
+                this.addIncomeLog(
+                    `本次抓取將同步寫入資料庫（目標：${this.getDbTargetLabel()}）。`,
+                    'info',
+                );
+            } else {
+                this.addIncomeLog(
+                    `本次抓取僅預覽資料（匯入目標：${this.getDbTargetLabel()}，可勾選上方「抓取時直接寫入資料庫」）。`,
+                    'info',
+                );
+            }
+
             this.stopIncomeProgressTimer();
             this.updateIncomeProgress(0, `抓取單一股票 ${code} 損益表中…`);
 
             const params = new URLSearchParams({ year: String(year), season: String(season), code });
+            if (writeToDb) {
+                params.append('write_to_db', '1');
+                params.append('use_local_db', this.useLocalDb ? 'true' : 'false');
+            }
             const origin = (window && window.location && window.location.origin) ? window.location.origin : '';
             const base = origin && origin !== 'file://' ? origin : 'http://localhost:5003';
             const requestUrl = `${base}/api/income-statement`;
@@ -3776,7 +3888,17 @@ class TaiwanStockApp {
 
             const total = data.length;
             this.addLogMessage(`✅ 單一股票 ${code} 損益表抓取完成，共 ${total} 筆`, 'success');
-            this.addIncomeLog(`單一股票 ${code} 損益表抓取完成，共 ${this.formatInteger(total)} 筆`, 'success');
+            if (writeToDb) {
+                this.addIncomeLog(
+                    `單一股票 ${code} 損益表抓取完成，共 ${this.formatInteger(total)} 筆（已寫入 ${this.getDbTargetLabel()}）`,
+                    'success',
+                );
+            } else {
+                this.addIncomeLog(
+                    `單一股票 ${code} 損益表抓取完成，共 ${this.formatInteger(total)} 筆（僅預覽，匯入目標：${this.getDbTargetLabel()}）`,
+                    'success',
+                );
+            }
             this.updateIncomeProgress(100, `單一股票 ${code} 完成，筆數 ${this.formatInteger(total)}`);
         } catch (err) {
             console.error('[Income] single fetch error', err);
@@ -3801,7 +3923,7 @@ class TaiwanStockApp {
             const url = `${base}/api/income-statement/import`;
 
             this.addIncomeLog(
-                `開始將目前損益表資料寫入資料庫（目標：${this.useLocalDb ? '本地 PostgreSQL' : 'Neon 雲端'}），共 ${this.formatInteger(rows.length)} 筆`,
+                `開始將目前損益表資料寫入資料庫（目標：${this.getDbTargetLabel()}），共 ${this.formatInteger(rows.length)} 筆`,
                 'info',
             );
             this.addIncomeLog(`POST ${url}`, 'info');
@@ -3826,11 +3948,11 @@ class TaiwanStockApp {
 
             const inserted = Number(data.inserted || 0);
             this.addLogMessage(
-                `✅ 損益表寫入資料庫完成，成功寫入 ${this.formatInteger(inserted)} 筆（耗時 ${elapsedSec} 秒）`,
+                `✅ 損益表寫入資料庫完成，成功寫入 ${this.formatInteger(inserted)} 筆（目標：${this.getDbTargetLabel()}，耗時 ${elapsedSec} 秒）`,
                 'success',
             );
             this.addIncomeLog(
-                `損益表寫入資料庫完成：成功寫入 ${this.formatInteger(inserted)} 筆（耗時 ${elapsedSec} 秒）`,
+                `損益表寫入資料庫完成：成功寫入 ${this.formatInteger(inserted)} 筆（目標：${this.getDbTargetLabel()}，耗時 ${elapsedSec} 秒）`,
                 'success',
             );
         } catch (err) {
@@ -4828,7 +4950,7 @@ class TaiwanStockApp {
         const codeTo = String(document.getElementById('cashflowCodeTo')?.value || '').trim();
         const batch = parseInt(document.getElementById('cashflowBatchSize')?.value || '', 10);
         const rest = parseFloat(document.getElementById('cashflowBatchRestMinutes')?.value || '');
-        const retryMax = parseInt(document.getElementById('cashflowRetryMax')?.value || '1', 10);
+        const retryMax = parseInt(document.getElementById('cashflowRetryMax')?.value || '99', 10);
         const retryWait = parseFloat(document.getElementById('cashflowRetryWaitMinutes')?.value || '5');
         if (code) params.set('code', code);
         if (!code && codeFrom) params.set('code_from', codeFrom);
@@ -4837,7 +4959,7 @@ class TaiwanStockApp {
         if (!code && Number.isFinite(rest) && rest > 0) params.set('pause_minutes', String(rest));
         if (!code) {
             params.set('retry_on_block', '1');
-            params.set('retry_max', String(Number.isFinite(retryMax) ? Math.max(0, retryMax) : 1));
+            params.set('retry_max', String(Number.isFinite(retryMax) ? Math.max(0, retryMax) : 99));
             params.set('retry_wait_minutes', String(Number.isFinite(retryWait) && retryWait > 0 ? retryWait : 5));
         }
         if (document.getElementById('cashflowAutoImportCheckbox')?.checked) {
