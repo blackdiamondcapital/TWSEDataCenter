@@ -32,9 +32,21 @@ export async function fetchDates(limit = 120, market = 'both') {
   return data.dates || []
 }
 
-export async function fetchRankings({ date, metric = 'turnover', market = 'both', limit = 50 } = {}) {
+export async function fetchRankings({ date, metric = 'turnover', market = 'both', type = '', limit = 50 } = {}) {
+  const kind = type === 'call' || type === 'put' ? type : ''
+  // 用 GET + wtype（勿用 type，易衝突）；加 _ts 避免中間層快取錯結果
   return unwrap(
-    await api.get('/warrants/rankings', { params: { date, metric, market, limit } }),
+    await api.get('/warrants/rankings', {
+      params: {
+        date: date || undefined,
+        metric,
+        market: market || 'both',
+        limit,
+        wtype: kind || undefined,
+        _ts: Date.now(),
+      },
+      headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    }),
     '排行榜查詢失敗',
   )
 }

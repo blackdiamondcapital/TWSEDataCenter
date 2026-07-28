@@ -42,8 +42,8 @@ button {
   padding: 0.55rem 0.9rem;
   transition: border-color 0.2s, transform 0.15s, background 0.2s;
 }
-button:hover:not(:disabled) {
-  border-color: rgba(46, 211, 198, 0.55);
+button:hover:not(:disabled):not(.active) {
+  border-color: rgba(46, 211, 198, 0.35);
 }
 button:disabled { opacity: 0.55; cursor: not-allowed; }
 button.primary {
@@ -55,7 +55,8 @@ button.primary {
 button.active {
   border-color: var(--cyan);
   color: var(--cyan);
-  background: rgba(46, 211, 198, 0.08);
+  background: rgba(46, 211, 198, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(46, 211, 198, 0.35);
 }
 
 input, select {

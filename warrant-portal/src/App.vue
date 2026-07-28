@@ -37,6 +37,7 @@ const loadingMaster = ref(false)
 const dates = ref([])
 const selectedDate = ref('')
 const heatMarket = ref('both')
+const heatType = ref('') // '' | '認購' | '認售'
 const metric = ref('turnover')
 const rankings = ref([])
 const loadingRankings = ref(false)
@@ -93,23 +94,77 @@ async function loadDates() {
   }
 }
 
+let rankingsReqId = 0
+const rankingsMeta = ref({ kind: 'all', type: null })
+const rankingsError = ref('')
+
+function heatTypeToKind(v) {
+  if (v === '認購') return 'call'
+  if (v === '認售') return 'put'
+  return 'all'
+}
+
+function setHeatType(next) {
+  heatType.value = next
+  loadRankings()
+}
+
+function setMetric(next) {
+  metric.value = next
+  loadRankings()
+}
+
 async function loadRankings() {
+  const reqId = ++rankingsReqId
+  const expectedKind = heatTypeToKind(heatType.value)
+  const expectedType = heatType.value || null
   loadingRankings.value = true
+  rankingsError.value = ''
   try {
-    const data = await fetchRankings({
-      date: selectedDate.value || undefined,
-      metric: metric.value,
-      market: heatMarket.value,
-      limit: 80,
-    })
-    rankings.value = data.rows || []
+    const requestOnce = async (dateOverride) =>
+      fetchRankings({
+        date: dateOverride,
+        metric: metric.value,
+        market: heatMarket.value,
+        type: expectedKind === 'all' ? '' : expectedKind,
+        limit: 80,
+      })
+
+    let data = await requestOnce(selectedDate.value || undefined)
+    if (reqId === rankingsReqId && !(data.rows || []).length && selectedDate.value) {
+      data = await requestOnce(undefined)
+      if (data.date) selectedDate.value = data.date
+    }
+    if (reqId !== rankingsReqId) return
+
+    // 顯示層防線：若回傳混入錯類型，依類型／名稱再過濾
+    let rows = data.rows || []
+    if (expectedType === '認購') {
+      rows = rows.filter(
+        (r) => r.warrant_type === '認購' || String(r.warrant_name || '').includes('購'),
+      )
+    } else if (expectedType === '認售') {
+      rows = rows.filter(
+        (r) => r.warrant_type === '認售' || String(r.warrant_name || '').includes('售'),
+      )
+    }
+
+    rankings.value = rows.map((r, i) => ({ ...r, rank: i + 1 }))
+    rankingsMeta.value = { kind: data.kind || expectedKind, type: data.type || expectedType }
     if (data.date) selectedDate.value = data.date
+    if (!rows.length) {
+      rankingsError.value = expectedType
+        ? `沒有「${expectedType}」成交熱度（${data.date || selectedDate.value || '—'}）`
+        : `沒有成交資料（日期 ${data.date || selectedDate.value || '—'}）`
+    }
   } catch (err) {
+    if (reqId !== rankingsReqId) return
     console.error(err)
     rankings.value = []
+    rankingsError.value = err.message || '排行查詢失敗'
     statusText.value = `排行失敗：${err.message}`
   } finally {
-    loadingRankings.value = false
+    if (reqId === rankingsReqId) loadingRankings.value = false
   }
 }
 
@@ -172,7 +227,6 @@ async function onImportLatest() {
   }
 }
 
-watch(metric, () => loadRankings())
 watch(heatMarket, async () => {
   selectedDate.value = ''
   await loadDates()
@@ -308,10 +362,18 @@ onMounted(async () => {
             </select>
           </div>
           <div class="metric-toggle">
+            <label>類型</label>
+            <div class="btns">
+              <button type="button" :class="{ active: heatType === '' }" @click="setHeatType('')">全部</button>
+              <button type="button" :class="{ active: heatType === '認購' }" @click="setHeatType('認購')">認購</button>
+              <button type="button" :class="{ active: heatType === '認售' }" @click="setHeatType('認售')">認售</button>
+            </div>
+          </div>
+          <div class="metric-toggle">
             <label>指標</label>
             <div class="btns">
-              <button :class="{ active: metric === 'turnover' }" @click="metric = 'turnover'">成交金額</button>
-              <button :class="{ active: metric === 'volume' }" @click="metric = 'volume'">成交張數</button>
+              <button type="button" :class="{ active: metric === 'turnover' }" @click="setMetric('turnover')">成交金額</button>
+              <button type="button" :class="{ active: metric === 'volume' }" @click="setMetric('volume')">成交張數</button>
             </div>
           </div>
         </div>
@@ -322,6 +384,9 @@ onMounted(async () => {
             :loading="loadingRankings"
             :selected-code="selected?.warrant_code || ''"
             :metric="metric"
+            :heat-type="heatType"
+            :api-type="rankingsMeta.type"
+            :error-text="rankingsError"
             @select="selectWarrant"
           />
           <WarrantChart
@@ -446,7 +511,7 @@ onMounted(async () => {
 }
 .heat-controls {
   display: grid;
-  grid-template-columns: 1fr 1fr 1.2fr;
+  grid-template-columns: 1fr 1fr 1.2fr 1.2fr;
   gap: 0.85rem;
   padding: 0.9rem 1.05rem;
 }

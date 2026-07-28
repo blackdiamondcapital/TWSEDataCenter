@@ -9948,16 +9948,45 @@ def warrants_portal_master_detail(code: str):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/warrants/rankings', methods=['GET'])
-def warrants_rankings():
-    """當日成交熱度排行（turnover / volume）。"""
+@app.route('/api/warrants/rankings', methods=['GET', 'POST'])
+@app.route('/api/warrants/rankings/<kind>', methods=['GET', 'POST'])
+def warrants_rankings(kind: str | None = None):
+    """當日成交熱度排行（turnover / volume），可篩選認購／認售。
+
+    建議用 POST JSON：{ wtype: call|put, market, metric, date, limit }
+    相容 GET query：wtype / warrantType
+    """
     try:
-        metric_raw = (request.args.get('metric') or 'turnover').strip().lower()
+        body = request.get_json(silent=True) or {}
+        def pick(*keys, default=''):
+            for k in keys:
+                if k in body and body.get(k) not in (None, ''):
+                    return body.get(k)
+                if request.args.get(k) not in (None, ''):
+                    return request.args.get(k)
+            return default
+
+        metric_raw = str(pick('metric', default='turnover') or 'turnover').strip().lower()
         metric = 'volume' if metric_raw == 'volume' else 'turnover'
-        market = (request.args.get('market') or 'twse').strip().lower()
-        limit = request.args.get('limit', default=50, type=int) or 50
+        market = str(pick('market', default='both') or 'both').strip().lower()
+        raw = str(
+            (kind or '')
+            or pick('wtype', 'warrantType', 'warrant_type', default='')
+            or ''
+        ).strip().lower()
+        # 不要讀 query/body 的 type（易與其他框架欄位衝突）
+        if raw in ('認購', 'call', 'c'):
+            wtype = '認購'
+        elif raw in ('認售', 'put', 'p'):
+            wtype = '認售'
+        else:
+            wtype = ''
+        try:
+            limit = int(pick('limit', default=50) or 50)
+        except Exception:
+            limit = 50
         limit = max(1, min(200, limit))
-        date_str = (request.args.get('date') or '').strip() or None
+        date_str = str(pick('date', default='') or '').strip() or None
 
         db_manager = DatabaseManager.from_request_args(request.args)
         if not db_manager.connect():
@@ -9983,85 +10012,227 @@ def warrants_rankings():
                     cur.execute('SELECT MAX(trade_date) AS d FROM tw_warrant_trade')
                 date_str = _warrant_row_date((cur.fetchone() or {}).get('d'))
                 if not date_str:
-                    return jsonify({'success': True, 'date': None, 'metric': metric, 'market': market, 'rows': []})
+                    return jsonify({
+                        'success': True,
+                        'date': None,
+                        'metric': metric,
+                        'market': market,
+                        'type': wtype or None,
+                        'kind': 'put' if wtype == '認售' else ('call' if wtype == '認購' else 'all'),
+                        'rows': [],
+                    })
+
+            # 有類型篩選時用 INNER JOIN，避免漏接主檔時混入錯類型
+            if wtype:
+                tw_join = 'INNER JOIN tw_warrant_master m ON m.warrant_code = t.warrant_code AND m.warrant_type = %s'
+                tpex_join = 'INNER JOIN tpex_warrant_master m ON m.warrant_code = t.warrant_code AND m.warrant_type = %s'
+            else:
+                tw_join = 'LEFT JOIN tw_warrant_master m ON m.warrant_code = t.warrant_code'
+                tpex_join = 'LEFT JOIN tpex_warrant_master m ON m.warrant_code = t.warrant_code'
+
+            def order_sql(turnover_expr: str, volume_expr: str) -> str:
+                if metric == 'turnover':
+                    return f'{turnover_expr} DESC NULLS LAST, {volume_expr} DESC NULLS LAST, warrant_code ASC'
+                return f'{volume_expr} DESC NULLS LAST, {turnover_expr} DESC NULLS LAST, warrant_code ASC'
 
             if market == 'tpex':
-                order = (
-                    'trade_value DESC NULLS LAST, trade_volume DESC NULLS LAST, warrant_code ASC'
-                    if metric == 'turnover'
-                    else 'trade_volume DESC NULLS LAST, trade_value DESC NULLS LAST, warrant_code ASC'
-                )
+                params: list = []
+                if wtype:
+                    params.append(wtype)
+                params.extend([date_str, limit])
                 cur.execute(
                     f"""
-                    SELECT trade_date, warrant_code, warrant_name,
-                           trade_value AS turnover, trade_volume AS volume,
-                           close_price,
-                           underlying_code, underlying_name, 'TPEX' AS market
-                    FROM tpex_warrant_daily_quotes
-                    WHERE trade_date = %s::date
-                    ORDER BY {order}
+                    SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                           t.trade_value AS turnover, t.trade_volume AS volume,
+                           t.close_price,
+                           COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
+                           COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
+                           m.warrant_type,
+                           'TPEX' AS market
+                    FROM tpex_warrant_daily_quotes t
+                    {tpex_join}
+                    WHERE t.trade_date = %s::date
+                    ORDER BY {order_sql('turnover', 'volume')}
                     LIMIT %s
                     """,
-                    (date_str, limit),
+                    params,
                 )
             elif market in {'both', 'all'}:
-                order = (
-                    'turnover DESC NULLS LAST, volume DESC NULLS LAST, warrant_code ASC'
-                    if metric == 'turnover'
-                    else 'volume DESC NULLS LAST, turnover DESC NULLS LAST, warrant_code ASC'
-                )
+                params = []
+                if wtype:
+                    params.append(wtype)
+                params.append(date_str)
+                if wtype:
+                    params.append(wtype)
+                params.extend([date_str, limit])
                 cur.execute(
                     f"""
                     SELECT * FROM (
-                        SELECT trade_date, warrant_code, warrant_name,
-                               turnover, volume, close_price,
-                               NULL::varchar AS underlying_code,
-                               NULL::varchar AS underlying_name,
+                        SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                               t.turnover, t.volume, t.close_price,
+                               m.underlying_code,
+                               m.underlying_name,
+                               m.warrant_type,
                                'TWSE'::text AS market
-                        FROM tw_warrant_trade
-                        WHERE trade_date = %s::date
+                        FROM tw_warrant_trade t
+                        {tw_join}
+                        WHERE t.trade_date = %s::date
                         UNION ALL
-                        SELECT trade_date, warrant_code, warrant_name,
-                               trade_value AS turnover, trade_volume AS volume, close_price,
-                               underlying_code, underlying_name, 'TPEX'::text AS market
-                        FROM tpex_warrant_daily_quotes
-                        WHERE trade_date = %s::date
-                    ) m
-                    ORDER BY {order}
+                        SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                               t.trade_value AS turnover, t.trade_volume AS volume, t.close_price,
+                               COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
+                               COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
+                               m.warrant_type,
+                               'TPEX'::text AS market
+                        FROM tpex_warrant_daily_quotes t
+                        {tpex_join}
+                        WHERE t.trade_date = %s::date
+                    ) ranked
+                    ORDER BY {order_sql('turnover', 'volume')}
                     LIMIT %s
                     """,
-                    (date_str, date_str, limit),
+                    params,
                 )
             else:
-                order = (
-                    'turnover DESC NULLS LAST, volume DESC NULLS LAST, warrant_code ASC'
-                    if metric == 'turnover'
-                    else 'volume DESC NULLS LAST, turnover DESC NULLS LAST, warrant_code ASC'
-                )
+                params = []
+                if wtype:
+                    params.append(wtype)
+                params.extend([date_str, limit])
                 cur.execute(
                     f"""
-                    SELECT trade_date, warrant_code, warrant_name, turnover, volume, close_price,
-                           NULL::varchar AS underlying_code, NULL::varchar AS underlying_name,
+                    SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                           t.turnover, t.volume, t.close_price,
+                           m.underlying_code,
+                           m.underlying_name,
+                           m.warrant_type,
                            'TWSE' AS market
-                    FROM tw_warrant_trade
-                    WHERE trade_date = %s::date
-                    ORDER BY {order}
+                    FROM tw_warrant_trade t
+                    {tw_join}
+                    WHERE t.trade_date = %s::date
+                    ORDER BY {order_sql('turnover', 'volume')}
                     LIMIT %s
                     """,
-                    (date_str, limit),
+                    params,
                 )
             rows_raw = cur.fetchall() or []
+
+            # 指定日期若無資料，改抓該市場最新有資料的日期
+            if not rows_raw and date_str:
+                if market == 'tpex':
+                    cur.execute('SELECT MAX(trade_date) AS d FROM tpex_warrant_daily_quotes')
+                elif market in {'both', 'all'}:
+                    cur.execute(
+                        """
+                        SELECT MAX(trade_date) AS d FROM (
+                            SELECT trade_date FROM tw_warrant_trade
+                            UNION ALL
+                            SELECT trade_date FROM tpex_warrant_daily_quotes
+                        ) t
+                        """
+                    )
+                else:
+                    cur.execute('SELECT MAX(trade_date) AS d FROM tw_warrant_trade')
+                fallback_date = _warrant_row_date((cur.fetchone() or {}).get('d'))
+                if fallback_date and fallback_date != date_str:
+                    date_str = fallback_date
+                    # 重跑同一套查詢：最簡方式是遞迴參數重進不易，這裡僅對 both/tpex/twse 再查一次最新日
+                    # 重新組 params（與上方分支一致）
+                    if market == 'tpex':
+                        params = []
+                        if wtype:
+                            params.append(wtype)
+                        params.extend([date_str, limit])
+                        cur.execute(
+                            f"""
+                            SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                                   t.trade_value AS turnover, t.trade_volume AS volume,
+                                   t.close_price,
+                                   COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
+                                   COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
+                                   m.warrant_type,
+                                   'TPEX' AS market
+                            FROM tpex_warrant_daily_quotes t
+                            {tpex_join}
+                            WHERE t.trade_date = %s::date
+                            ORDER BY {order_sql('turnover', 'volume')}
+                            LIMIT %s
+                            """,
+                            params,
+                        )
+                    elif market in {'both', 'all'}:
+                        params = []
+                        if wtype:
+                            params.append(wtype)
+                        params.append(date_str)
+                        if wtype:
+                            params.append(wtype)
+                        params.extend([date_str, limit])
+                        cur.execute(
+                            f"""
+                            SELECT * FROM (
+                                SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                                       t.turnover, t.volume, t.close_price,
+                                       m.underlying_code,
+                                       m.underlying_name,
+                                       m.warrant_type,
+                                       'TWSE'::text AS market
+                                FROM tw_warrant_trade t
+                                {tw_join}
+                                WHERE t.trade_date = %s::date
+                                UNION ALL
+                                SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                                       t.trade_value AS turnover, t.trade_volume AS volume, t.close_price,
+                                       COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
+                                       COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
+                                       m.warrant_type,
+                                       'TPEX'::text AS market
+                                FROM tpex_warrant_daily_quotes t
+                                {tpex_join}
+                                WHERE t.trade_date = %s::date
+                            ) ranked
+                            ORDER BY {order_sql('turnover', 'volume')}
+                            LIMIT %s
+                            """,
+                            params,
+                        )
+                    else:
+                        params = []
+                        if wtype:
+                            params.append(wtype)
+                        params.extend([date_str, limit])
+                        cur.execute(
+                            f"""
+                            SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                                   t.turnover, t.volume, t.close_price,
+                                   m.underlying_code,
+                                   m.underlying_name,
+                                   m.warrant_type,
+                                   'TWSE' AS market
+                            FROM tw_warrant_trade t
+                            {tw_join}
+                            WHERE t.trade_date = %s::date
+                            ORDER BY {order_sql('turnover', 'volume')}
+                            LIMIT %s
+                            """,
+                            params,
+                        )
+                    rows_raw = cur.fetchall() or []
         finally:
             db_manager.disconnect()
 
         rows = []
         for idx, row in enumerate(rows_raw):
+            # 最後防線：若仍混入錯類型則丟棄
+            row_type = row.get('warrant_type')
+            if wtype and row_type and row_type != wtype:
+                continue
             rows.append({
-                'rank': idx + 1,
+                'rank': len(rows) + 1,
                 'market': row.get('market'),
                 'trade_date': _warrant_row_date(row.get('trade_date')),
                 'warrant_code': row.get('warrant_code'),
                 'warrant_name': row.get('warrant_name'),
+                'warrant_type': row_type,
                 'turnover': _warrant_row_num(row.get('turnover')),
                 'volume': _warrant_row_int(row.get('volume')),
                 'close_price': _warrant_row_num(row.get('close_price')),
@@ -10069,13 +10240,17 @@ def warrants_rankings():
                 'underlying_name': row.get('underlying_name'),
             })
 
-        return jsonify({
+        resp = jsonify({
             'success': True,
             'date': date_str,
             'metric': metric,
             'market': market,
+            'type': wtype or None,
+            'kind': 'put' if wtype == '認售' else ('call' if wtype == '認購' else 'all'),
             'rows': rows,
         })
+        resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+        return resp
     except Exception as e:
         logger.exception('權證 rankings 失敗')
         return jsonify({'success': False, 'error': str(e)}), 500
