@@ -25,6 +25,7 @@ const filters = reactive({
   expiryFrom: '',
   expiryTo: '',
   sort: 'expiry',
+  sortDir: 'asc',
   page: 1,
   pageSize: 50,
 })
@@ -65,6 +66,7 @@ async function loadMaster() {
       expiryFrom: filters.expiryFrom || undefined,
       expiryTo: filters.expiryTo || undefined,
       sort: filters.sort,
+      sortDir: filters.sortDir,
       page: filters.page,
       pageSize: filters.pageSize,
     })
@@ -176,6 +178,10 @@ watch(heatMarket, async () => {
   await loadDates()
   await loadRankings()
 })
+watch(() => [filters.sort, filters.sortDir], () => {
+  filters.page = 1
+  loadMaster()
+})
 
 onMounted(async () => {
   await Promise.all([loadStats(), loadMaster(), loadDates()])
@@ -213,10 +219,10 @@ onMounted(async () => {
 
     <section class="search-bar panel">
       <div class="search-main">
-        <label>搜尋標的／代號／名稱</label>
+        <label>搜尋標的／股票代號／權證代號／名稱</label>
         <input
           v-model="filters.q"
-          placeholder="例如：台積電、03002T、群益"
+          placeholder="例如：2330、台積電、03002T、群益"
           @keyup.enter="onSearch"
         />
       </div>
@@ -249,9 +255,17 @@ onMounted(async () => {
           <label>排序</label>
           <select v-model="filters.sort">
             <option value="expiry">到期日</option>
+            <option value="days">到期天數</option>
             <option value="exercise">履約價</option>
             <option value="code">代號</option>
             <option value="name">名稱</option>
+          </select>
+        </div>
+        <div>
+          <label>升降冪</label>
+          <select v-model="filters.sortDir">
+            <option value="asc">升冪 ↑</option>
+            <option value="desc">降冪 ↓</option>
           </select>
         </div>
       </div>
@@ -406,7 +420,7 @@ onMounted(async () => {
 }
 .filters {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 0.75rem;
 }
 .actions {

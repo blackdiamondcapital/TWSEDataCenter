@@ -11,6 +11,15 @@ const emit = defineEmits(['close'])
 const fields = computed(() => {
   const d = props.detail
   if (!d) return []
+  let days = d.days_to_expiry
+  if (days == null && d.expiry_date) {
+    const t = Date.parse(d.expiry_date)
+    if (Number.isFinite(t)) {
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      days = Math.round((t - today.getTime()) / 86400000)
+    }
+  }
   return [
     ['市場', d.market],
     ['代號', d.warrant_code],
@@ -19,11 +28,15 @@ const fields = computed(() => {
     ['類別', d.warrant_category],
     ['標的代號', d.underlying_code],
     ['標的', d.underlying_name],
+    ['最新收盤', d.latest_close_price],
+    ['漲跌', d.latest_price_change],
+    ['最近成交日', d.latest_trade_date],
     ['履約價', d.latest_exercise_price],
     ['行使比例', d.latest_exercise_ratio],
     ['發行量', d.issuance_units_thousand ?? d.accumulated_issuance ?? d.issuance],
     ['最後交易日', d.last_trade_date],
     ['到期日', d.expiry_date],
+    ['到期天數', days],
     ['出表日', d.report_date],
   ].filter(([, v]) => v != null && v !== '')
 })
@@ -53,6 +66,7 @@ function fmt(v) {
         <ul>
           <li v-for="t in detail.recent_trades" :key="t.trade_date">
             <span>{{ t.trade_date }}</span>
+            <span class="mono">收 {{ t.close_price ?? '—' }}</span>
             <span class="mono">金額 {{ t.turnover?.toLocaleString?.() ?? '—' }}</span>
             <span class="mono">量 {{ t.volume?.toLocaleString?.() ?? '—' }}</span>
           </li>
@@ -110,7 +124,7 @@ button.ghost {
 }
 .recent li {
   display: grid;
-  grid-template-columns: 6.5rem 1fr 1fr;
+  grid-template-columns: 6.5rem 4.5rem 1fr 1fr;
   gap: 0.5rem;
   font-size: 0.82rem;
   color: var(--text-dim);

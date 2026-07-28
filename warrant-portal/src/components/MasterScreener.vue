@@ -19,6 +19,13 @@ function fmt(n, digits = 2) {
   return Number(n).toLocaleString(undefined, { maximumFractionDigits: digits })
 }
 
+function daysClass(days) {
+  if (days == null) return ''
+  if (days <= 7) return 'days-urgent'
+  if (days <= 30) return 'days-soon'
+  return ''
+}
+
 function onRow(row) {
   emit('select', row)
 }
@@ -28,7 +35,7 @@ function onRow(row) {
   <div class="screener panel">
     <div class="head">
       <h2>發行主檔</h2>
-      <span class="muted">共 {{ total.toLocaleString() }} 檔</span>
+      <span class="muted">未到期 {{ total.toLocaleString() }} 檔</span>
     </div>
 
     <div v-if="loading" class="empty muted">查詢中…</div>
@@ -42,9 +49,11 @@ function onRow(row) {
             <th>名稱</th>
             <th>類型</th>
             <th>標的</th>
+            <th>收盤</th>
             <th>履約價</th>
             <th>行使比</th>
             <th>到期日</th>
+            <th>到期天數</th>
           </tr>
         </thead>
         <tbody>
@@ -62,10 +71,17 @@ function onRow(row) {
                 {{ row.warrant_type || '—' }}
               </span>
             </td>
-            <td>{{ row.underlying_name || row.underlying_code || '—' }}</td>
+            <td class="underlying">
+              <span v-if="row.underlying_code" class="mono code">{{ row.underlying_code }}</span>
+              <span>{{ row.underlying_name || '—' }}</span>
+            </td>
+            <td class="num mono">{{ fmt(row.close_price, 2) }}</td>
             <td class="num mono">{{ fmt(row.latest_exercise_price) }}</td>
             <td class="num mono">{{ fmt(row.latest_exercise_ratio, 4) }}</td>
             <td class="mono">{{ row.expiry_date || '—' }}</td>
+            <td class="num mono" :class="daysClass(row.days_to_expiry)">
+              {{ row.days_to_expiry == null ? '—' : row.days_to_expiry }}
+            </td>
           </tr>
         </tbody>
       </table>
@@ -102,5 +118,17 @@ function onRow(row) {
   justify-content: center;
   gap: 0.85rem;
   margin-top: 0.85rem;
+}
+.days-soon { color: #f0b429; font-weight: 600; }
+.days-urgent { color: #ff6b6b; font-weight: 700; }
+.underlying {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  line-height: 1.25;
+}
+.underlying .code {
+  font-size: 0.78rem;
+  opacity: 0.75;
 }
 </style>

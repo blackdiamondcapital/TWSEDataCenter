@@ -29,6 +29,7 @@ function fmt(n) {
             <th>#</th>
             <th>代號</th>
             <th>名稱</th>
+            <th>收盤</th>
             <th>{{ metric === 'volume' ? '張數' : '金額' }}</th>
           </tr>
         </thead>
@@ -42,6 +43,7 @@ function fmt(n) {
             <td class="mono">{{ row.rank }}</td>
             <td class="mono">{{ row.warrant_code }}</td>
             <td>{{ row.warrant_name }}</td>
+            <td class="num mono">{{ row.close_price == null ? '—' : Number(row.close_price).toLocaleString(undefined, { maximumFractionDigits: 2 }) }}</td>
             <td class="num mono">
               {{ metric === 'volume' ? fmt(row.volume) : fmt(row.turnover) }}
             </td>
