@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import {
   fetchPortalStats,
   fetchMasterSearch,
@@ -56,6 +56,14 @@ async function loadStats() {
     statusText.value = `統計載入失敗：${err.message}`
   }
 }
+
+/** 全市場最新成交日：取上市／上櫃兩者較新者（勿只用 TWSE，否則上櫃較新時會顯示過舊） */
+const latestTradeDate = computed(() => {
+  const a = stats.value?.twse?.latest_trade_date
+  const b = stats.value?.tpex?.latest_trade_date
+  if (a && b) return a >= b ? a : b
+  return a || b || '—'
+})
 
 async function loadMaster() {
   loadingMaster.value = true
@@ -266,7 +274,7 @@ onMounted(async () => {
         </div>
         <div class="stat">
           <span class="label">最新成交日</span>
-          <strong>{{ stats.twse?.latest_trade_date || stats.tpex?.latest_trade_date || '—' }}</strong>
+          <strong>{{ latestTradeDate }}</strong>
         </div>
       </div>
     </header>
