@@ -9,7 +9,7 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 import logging
 from bs4 import BeautifulSoup
 import urllib3
@@ -8353,19 +8353,33 @@ def _parse_twse_roc_slash_date(text: str | None):
         return None
 
 
-def _fetch_twse_mi_index_ohlc(trade_date_obj: date) -> dict[str, dict]:
-    """從 MI_INDEX 全市場收盤行情取出各證券 OHLC（含權證）。"""
+def _taipei_today() -> date:
+    return datetime.now(timezone(timedelta(hours=8))).date()
+
+
+def _is_warrant_like_name(name: str | None) -> bool:
+    s = name or ''
+    return any(k in s for k in ('購', '售', '牛', '熊', '權證'))
+
+
+def _fetch_twse_mi_index_payload(trade_date_obj: date) -> dict | None:
+    """抓取 MI_INDEX JSON；非交易日／無資料回傳 None。"""
     ymd = trade_date_obj.strftime('%Y%m%d')
     url = f'https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={ymd}&type=ALL'
     resp = requests.get(url, timeout=120, headers={'User-Agent': 'Mozilla/5.0'})
     if resp.status_code != 200:
         raise RuntimeError(f'MI_INDEX HTTP {resp.status_code}')
     payload = resp.json()
-    if not isinstance(payload, dict) or payload.get('stat') not in (None, 'OK'):
-        # 部分日期放假會回傳「很抱歉…」
-        stat = payload.get('stat') if isinstance(payload, dict) else None
-        if stat and stat != 'OK':
-            raise RuntimeError(f'MI_INDEX unavailable: {stat}')
+    if not isinstance(payload, dict):
+        return None
+    stat = payload.get('stat')
+    if stat and stat != 'OK':
+        return None
+    return payload
+
+
+def _parse_twse_mi_index_quotes(payload: dict) -> dict[str, dict]:
+    """從 MI_INDEX payload 取出各證券 OHLC + 成交金額／張數（含權證）。"""
     tables = payload.get('tables') if isinstance(payload, dict) else None
     if not isinstance(tables, list):
         return {}
@@ -8388,6 +8402,8 @@ def _fetch_twse_mi_index_ohlc(trade_date_obj: date) -> dict[str, dict]:
         code = str(row[idx['證券代號']]).strip() if '證券代號' in idx else ''
         if not code:
             continue
+        shares = _parse_twse_market_number(row[idx['成交股數']]) if '成交股數' in idx else None
+        volume_lots = int(shares / 1000) if shares is not None else None
         out[code] = {
             'warrant_name': str(row[idx['證券名稱']]).strip() if '證券名稱' in idx else None,
             'open_price': _parse_twse_market_number(row[idx['開盤價']]) if '開盤價' in idx else None,
@@ -8395,8 +8411,107 @@ def _fetch_twse_mi_index_ohlc(trade_date_obj: date) -> dict[str, dict]:
             'low_price': _parse_twse_market_number(row[idx['最低價']]) if '最低價' in idx else None,
             'close_price': _parse_twse_market_number(row[idx['收盤價']]) if '收盤價' in idx else None,
             'price_change': _parse_twse_market_number(row[idx['漲跌價差']]) if '漲跌價差' in idx else None,
+            'turnover': _parse_twse_market_number(row[idx['成交金額']]) if '成交金額' in idx else None,
+            'volume': volume_lots,
         }
     return out
+
+
+def _fetch_twse_mi_index_ohlc(trade_date_obj: date) -> dict[str, dict]:
+    """從 MI_INDEX 全市場收盤行情取出各證券 OHLC／成交（含權證）。"""
+    payload = _fetch_twse_mi_index_payload(trade_date_obj)
+    if not payload:
+        raise RuntimeError(f'MI_INDEX unavailable for {trade_date_obj.isoformat()}')
+    return _parse_twse_mi_index_quotes(payload)
+
+
+def _find_latest_twse_mi_index_date(max_back_days: int = 10) -> tuple[date, dict[str, dict]]:
+    """往回找最近一個有 MI_INDEX 收盤行情的交易日，回傳 (date, quotes)。"""
+    start = _taipei_today()
+    last_err = None
+    for i in range(max(1, max_back_days)):
+        d = start - timedelta(days=i)
+        try:
+            payload = _fetch_twse_mi_index_payload(d)
+            if not payload:
+                continue
+            quotes = _parse_twse_mi_index_quotes(payload)
+            if quotes:
+                return d, quotes
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise RuntimeError(f'找不到可用的 MI_INDEX 交易日：{last_err}')
+    raise RuntimeError('找不到可用的 MI_INDEX 交易日')
+
+
+def _upsert_tw_warrant_trade_from_mi_index(
+    cursor,
+    trade_date_obj: date,
+    quotes: dict[str, dict],
+    master_codes: set[str] | None = None,
+) -> int:
+    """以 MI_INDEX 整批 upsert 權證成交（含 OHLC／金額／張數）。"""
+    if not quotes:
+        return 0
+    rows = []
+    for code, q in quotes.items():
+        name = q.get('warrant_name')
+        if master_codes is not None:
+            if code not in master_codes and not _is_warrant_like_name(name):
+                continue
+        elif not _is_warrant_like_name(name):
+            continue
+        # 無價且無量則略過（避免塞一堆空白列）
+        if (
+            q.get('close_price') is None
+            and q.get('open_price') is None
+            and not (q.get('turnover') or 0)
+            and not (q.get('volume') or 0)
+        ):
+            continue
+        rows.append((
+            trade_date_obj,  # out_date
+            trade_date_obj,
+            code,
+            name,
+            q.get('turnover'),
+            q.get('volume'),
+            q.get('open_price'),
+            q.get('high_price'),
+            q.get('low_price'),
+            q.get('close_price'),
+            q.get('price_change'),
+        ))
+    if not rows:
+        return 0
+    execute_values(
+        cursor,
+        """
+        INSERT INTO tw_warrant_trade (
+            out_date, trade_date, warrant_code, warrant_name,
+            turnover, volume,
+            open_price, high_price, low_price, close_price, price_change,
+            updated_at
+        ) VALUES %s
+        ON CONFLICT (warrant_code, trade_date) DO UPDATE SET
+            out_date = EXCLUDED.out_date,
+            warrant_name = COALESCE(EXCLUDED.warrant_name, tw_warrant_trade.warrant_name),
+            turnover = COALESCE(EXCLUDED.turnover, tw_warrant_trade.turnover),
+            volume = COALESCE(EXCLUDED.volume, tw_warrant_trade.volume),
+            open_price = COALESCE(EXCLUDED.open_price, tw_warrant_trade.open_price),
+            high_price = COALESCE(EXCLUDED.high_price, tw_warrant_trade.high_price),
+            low_price = COALESCE(EXCLUDED.low_price, tw_warrant_trade.low_price),
+            close_price = COALESCE(EXCLUDED.close_price, tw_warrant_trade.close_price),
+            price_change = COALESCE(EXCLUDED.price_change, tw_warrant_trade.price_change),
+            updated_at = NOW()
+        """,
+        rows,
+        template='(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())',
+        page_size=2000,
+    )
+    return len(rows)
 
 
 def _enrich_tw_warrant_trade_ohlc(cursor, trade_date_obj: date) -> int:
@@ -8414,51 +8529,85 @@ def _enrich_tw_warrant_trade_ohlc(cursor, trade_date_obj: date) -> int:
             codes.add(row.get('warrant_code'))
         else:
             codes.add(row[0])
+    # 既有列優先；若當日尚無成交列，改整批 upsert（含新權證）
+    if codes:
+        subset = {c: quotes[c] for c in codes if c in quotes}
+        return _upsert_tw_warrant_trade_from_mi_index(cursor, trade_date_obj, subset, master_codes=codes)
+    return _upsert_tw_warrant_trade_from_mi_index(cursor, trade_date_obj, quotes, master_codes=None)
+
+
+def _import_tpex_warrant_daily_rows(cursor, data: list) -> tuple[int, str | None]:
+    """寫入上櫃權證日行情，回傳 (筆數, trade_date_str)。"""
+    if not data:
+        return 0, None
+    first_trade_date = _parse_roc_date_text(data[0].get('Date'))
+    trade_date_str = first_trade_date.strftime('%Y-%m-%d') if first_trade_date else None
+    sql = """
+        INSERT INTO tpex_warrant_daily_quotes (
+            trade_date, warrant_code, warrant_name, open_price, high_price, low_price,
+            close_price, price_change, trade_volume, transaction_count, trade_value,
+            underlying_code, underlying_name, underlying_close_price,
+            underlying_price_change, raw_trade_date_text, updated_at
+        ) VALUES %s
+        ON CONFLICT (trade_date, warrant_code) DO UPDATE SET
+            warrant_name = EXCLUDED.warrant_name,
+            open_price = EXCLUDED.open_price,
+            high_price = EXCLUDED.high_price,
+            low_price = EXCLUDED.low_price,
+            close_price = EXCLUDED.close_price,
+            price_change = EXCLUDED.price_change,
+            trade_volume = EXCLUDED.trade_volume,
+            transaction_count = EXCLUDED.transaction_count,
+            trade_value = EXCLUDED.trade_value,
+            underlying_code = EXCLUDED.underlying_code,
+            underlying_name = EXCLUDED.underlying_name,
+            underlying_close_price = EXCLUDED.underlying_close_price,
+            underlying_price_change = EXCLUDED.underlying_price_change,
+            raw_trade_date_text = EXCLUDED.raw_trade_date_text,
+            updated_at = NOW()
+    """
     rows = []
-    for code in codes:
-        q = quotes.get(code)
-        if not q or (q.get('close_price') is None and q.get('open_price') is None):
+    batch_size = 1000
+    affected = 0
+    for item in data:
+        trade_date = _parse_roc_date_text(item.get('Date'))
+        code = str(item.get('Code') or '').strip()
+        if trade_date is None or not code:
             continue
         rows.append((
-            trade_date_obj,
+            trade_date,
             code,
-            q.get('open_price'),
-            q.get('high_price'),
-            q.get('low_price'),
-            q.get('close_price'),
-            q.get('price_change'),
+            str(item.get('Name') or '').strip() or None,
+            _to_decimal_or_none(item.get('Open')),
+            _to_decimal_or_none(item.get('High')),
+            _to_decimal_or_none(item.get('Low')),
+            _to_decimal_or_none(item.get('Close')),
+            _to_decimal_or_none(item.get('Change')),
+            _to_int_or_none(item.get('TradeVol.')),
+            _to_int_or_none(item.get('No.OfTransactions')),
+            _to_decimal_or_none(item.get('TradeValue')),
+            str(item.get('UnderlyingStockCode') or '').strip() or None,
+            str(item.get('UnderlyingStock') or '').strip() or None,
+            _to_decimal_or_none(item.get('UnderlyingStockClosePrice')),
+            _to_decimal_or_none(item.get('UnderlyingStock PriceChange')),
+            item.get('Date'),
         ))
-    if not rows:
-        return 0
-    cursor.execute(
-        """
-        CREATE TEMP TABLE IF NOT EXISTS tmp_warrant_ohlc (
-            trade_date DATE,
-            warrant_code VARCHAR(20),
-            open_price NUMERIC,
-            high_price NUMERIC,
-            low_price NUMERIC,
-            close_price NUMERIC,
-            price_change NUMERIC
-        ) ON COMMIT DROP
-        """
-    )
-    cursor.execute('DELETE FROM tmp_warrant_ohlc')
-    execute_values(cursor, 'INSERT INTO tmp_warrant_ohlc VALUES %s', rows, page_size=2000)
-    cursor.execute(
-        """
-        UPDATE tw_warrant_trade w SET
-            open_price = COALESCE(t.open_price, w.open_price),
-            high_price = COALESCE(t.high_price, w.high_price),
-            low_price = COALESCE(t.low_price, w.low_price),
-            close_price = COALESCE(t.close_price, w.close_price),
-            price_change = COALESCE(t.price_change, w.price_change),
-            updated_at = NOW()
-        FROM tmp_warrant_ohlc t
-        WHERE w.warrant_code = t.warrant_code AND w.trade_date = t.trade_date
-        """
-    )
-    return len(rows)
+        if len(rows) >= batch_size:
+            execute_values(
+                cursor, sql, rows,
+                template='(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())',
+                page_size=batch_size,
+            )
+            affected += len(rows)
+            rows = []
+    if rows:
+        execute_values(
+            cursor, sql, rows,
+            template='(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())',
+            page_size=batch_size,
+        )
+        affected += len(rows)
+    return affected, trade_date_str
 
 
 def _fetch_twse_warrant_stock_day(code: str, year: int, month: int) -> list[dict]:
@@ -8613,15 +8762,12 @@ twse_warrant_master_import_status = {
 
 @app.route('/api/warrants/import-latest', methods=['POST'])
 def import_latest_warrants():
-    """從 TWSE API 抓取最新權證資料並匯入 tw_warrant_trade。
+    """同步最新權證成交：上市用 MI_INDEX（OHLC＋成交金額／張數），上櫃用 TPEX 日行情。
 
-    資料來源：https://openapi.twse.com.tw/v1/opendata/t187ap42_L
-    寫入欄位：out_date, trade_date, warrant_code, warrant_name, turnover, volume,
-             raw_out_date_text, raw_trade_date_text, updated_at
-    唯一鍵： (warrant_code, trade_date)
+    不再依賴較慢更新的 openapi t187ap42_L。
     """
     try:
-        global warrants_import_status
+        global warrants_import_status, tpex_warrant_daily_import_status
         warrants_import_status = {
             'running': True,
             'startedAt': datetime.utcnow().isoformat(),
@@ -8630,6 +8776,7 @@ def import_latest_warrants():
             'processed': 0,
             'importedCount': 0,
             'error': None,
+            'source': 'MI_INDEX+TPEX',
         }
 
         db_manager = DatabaseManager.from_request_args(request.args)
@@ -8638,182 +8785,90 @@ def import_latest_warrants():
 
         try:
             db_manager.create_tables()
-            # 1) 呼叫 TWSE API
-            twse_url = 'https://openapi.twse.com.tw/v1/opendata/t187ap42_L'
-            resp = requests.get(twse_url, timeout=30)
-            if resp.status_code != 200:
-                warrants_import_status['running'] = False
-                warrants_import_status['finishedAt'] = datetime.utcnow().isoformat()
-                warrants_import_status['error'] = f'TWSE API 狀態碼 {resp.status_code}'
-                return jsonify({'success': False, 'error': f'TWSE API 狀態碼 {resp.status_code}'}), 502
-
-            try:
-                data = resp.json()
-            except Exception as e:
-                logger.exception('解析 TWSE API JSON 失敗')
-                warrants_import_status['running'] = False
-                warrants_import_status['finishedAt'] = datetime.utcnow().isoformat()
-                warrants_import_status['error'] = f'TWSE API JSON 格式錯誤: {e}'
-                return jsonify({'success': False, 'error': f'TWSE API JSON 格式錯誤: {e}'}), 502
-
-            if not isinstance(data, list) or not data:
-                warrants_import_status['running'] = False
-                warrants_import_status['finishedAt'] = datetime.utcnow().isoformat()
-                warrants_import_status['error'] = 'TWSE API 回傳資料為空'
-                return jsonify({'success': False, 'error': 'TWSE API 回傳資料為空'}), 502
-
-            def parse_roc_date(text: str | None):
-                if not text:
-                    return None
-                s = str(text).strip()
-                if not s.isdigit() or len(s) != 7:
-                    return None
-                try:
-                    roc_year = int(s[:3])
-                    month = int(s[3:5])
-                    day = int(s[5:7])
-                    year = roc_year + 1911
-                    return date(year, month, day)
-                except Exception:
-                    return None
-
-            def to_number(val):
-                if val is None:
-                    return None
-                s = str(val).replace(',', '').strip()
-                if not s:
-                    return None
-                try:
-                    n = float(s)
-                    return n
-                except Exception:
-                    return None
-
-            first = data[0]
-            trade_date_text = first.get('交易日期') or first.get('出表日期')
-            trade_date_obj = parse_roc_date(trade_date_text)
+            date_param = (request.args.get('date') or '').strip() or None
+            body = request.get_json(silent=True) or {}
+            if not date_param:
+                date_param = str(body.get('date') or '').strip() or None
 
             cursor = db_manager.connection.cursor()
             cursor.execute('BEGIN')
 
-            sql = (
-                """
-                INSERT INTO tw_warrant_trade (
-                    out_date,
-                    trade_date,
-                    warrant_code,
-                    warrant_name,
-                    turnover,
-                    volume,
-                    raw_out_date_text,
-                    raw_trade_date_text,
-                    updated_at
-                )
-                VALUES %s
-                ON CONFLICT (warrant_code, trade_date) DO UPDATE SET
-                    out_date = EXCLUDED.out_date,
-                    warrant_name = EXCLUDED.warrant_name,
-                    turnover = EXCLUDED.turnover,
-                    volume = EXCLUDED.volume,
-                    raw_out_date_text = EXCLUDED.raw_out_date_text,
-                    raw_trade_date_text = EXCLUDED.raw_trade_date_text,
-                    updated_at = NOW()
-                """
+            # --- TWSE MI_INDEX ---
+            if date_param:
+                trade_date_obj = datetime.strptime(date_param, '%Y-%m-%d').date()
+                quotes = _fetch_twse_mi_index_ohlc(trade_date_obj)
+            else:
+                trade_date_obj, quotes = _find_latest_twse_mi_index_date(max_back_days=10)
+
+            cursor.execute('SELECT warrant_code FROM tw_warrant_master')
+            master_codes = set()
+            for row in cursor.fetchall() or []:
+                code = row.get('warrant_code') if isinstance(row, dict) else row[0]
+                if code:
+                    master_codes.add(str(code).strip())
+
+            twse_count = _upsert_tw_warrant_trade_from_mi_index(
+                cursor, trade_date_obj, quotes, master_codes=master_codes or None,
             )
+            warrants_import_status['total'] = len(quotes)
+            warrants_import_status['processed'] = twse_count
+            warrants_import_status['importedCount'] = twse_count
+            warrants_import_status['tradeDate'] = trade_date_obj.strftime('%Y-%m-%d')
+            warrants_import_status['ohlcUpdated'] = twse_count
 
-            affected = 0
-            total = len(data)
-            warrants_import_status['total'] = total
-            batch_size = 1000
-            batch_rows = []
-            for item in data:
-                out_text = item.get('出表日期')
-                trade_text = item.get('交易日期')
-                out_date_obj = parse_roc_date(out_text)
-                trade_obj = parse_roc_date(trade_text)
-
-                # 若交易日期無法解析則略過
-                if trade_obj is None:
-                    continue
-
-                out_date_val = out_date_obj or trade_obj
-                code = str(item.get('權證代號') or '').strip()
-                name = str(item.get('權證名稱') or '').strip() or None
-                if not code:
-                    continue
-
-                turnover = to_number(item.get('成交金額'))
-                volume_num = to_number(item.get('成交張數'))
-                if volume_num is not None:
-                    try:
-                        volume_num = int(volume_num)
-                    except Exception:
-                        volume_num = None
-
-                row_tuple = (
-                    out_date_val,
-                    trade_obj,
-                    code,
-                    name,
-                    turnover,
-                    volume_num,
-                    out_text,
-                    trade_text,
-                )
-                batch_rows.append(row_tuple)
-
-                if len(batch_rows) >= batch_size:
-                    # 使用 execute_values 批次插入，並在模板中為 updated_at 加上 NOW()
-                    execute_values(
-                        cursor,
-                        sql,
-                        batch_rows,
-                        template='(%s,%s,%s,%s,%s,%s,%s,%s,NOW())',
-                        page_size=batch_size,
-                    )
-                    affected += len(batch_rows)
-                    warrants_import_status['processed'] = affected
-                    warrants_import_status['importedCount'] = affected
-                    batch_rows = []
-
-            if batch_rows:
-                execute_values(
-                    cursor,
-                    sql,
-                    batch_rows,
-                    template='(%s,%s,%s,%s,%s,%s,%s,%s,NOW())',
-                    page_size=batch_size,
-                )
-                affected += len(batch_rows)
-                warrants_import_status['processed'] = affected
-                warrants_import_status['importedCount'] = affected
-
-            ohlc_updated = 0
-            if trade_date_obj is not None:
-                try:
-                    ohlc_updated = _enrich_tw_warrant_trade_ohlc(cursor, trade_date_obj)
-                except Exception:
-                    logger.exception('權證 OHLC（MI_INDEX）回填失敗，成交金額／量仍已匯入')
+            # --- TPEX daily ---
+            tpex_count = 0
+            tpex_date_str = None
+            tpex_error = None
+            try:
+                tpex_warrant_daily_import_status = {
+                    'running': True,
+                    'startedAt': datetime.utcnow().isoformat(),
+                    'finishedAt': None,
+                    'total': None,
+                    'processed': 0,
+                    'importedCount': 0,
+                    'tradeDate': None,
+                    'error': None,
+                }
+                tpex_data = _fetch_json_list('https://www.tpex.org.tw/openapi/v1/tpex_warrant_daily_quts')
+                tpex_warrant_daily_import_status['total'] = len(tpex_data)
+                tpex_count, tpex_date_str = _import_tpex_warrant_daily_rows(cursor, tpex_data)
+                tpex_warrant_daily_import_status['processed'] = tpex_count
+                tpex_warrant_daily_import_status['importedCount'] = tpex_count
+                tpex_warrant_daily_import_status['tradeDate'] = tpex_date_str
+                tpex_warrant_daily_import_status['running'] = False
+                tpex_warrant_daily_import_status['finishedAt'] = datetime.utcnow().isoformat()
+            except Exception as e:
+                logger.exception('同步時匯入 TPEX 權證日行情失敗（上市資料仍會寫入）')
+                tpex_error = str(e)
+                tpex_warrant_daily_import_status['running'] = False
+                tpex_warrant_daily_import_status['finishedAt'] = datetime.utcnow().isoformat()
+                tpex_warrant_daily_import_status['error'] = tpex_error
 
             db_manager.connection.commit()
 
-            trade_date_str = (
-                trade_date_obj.strftime('%Y-%m-%d') if isinstance(trade_date_obj, (datetime, date)) else None
-            )
-
+            trade_date_str = trade_date_obj.strftime('%Y-%m-%d')
             warrants_import_status['running'] = False
             warrants_import_status['finishedAt'] = datetime.utcnow().isoformat()
             warrants_import_status['error'] = None
-            warrants_import_status['importedCount'] = affected
-            warrants_import_status['tradeDate'] = trade_date_str
-            warrants_import_status['ohlcUpdated'] = ohlc_updated
+            warrants_import_status['tpexImportedCount'] = tpex_count
+            warrants_import_status['tpexTradeDate'] = tpex_date_str
 
+            msg_parts = [f'上市 MI_INDEX {twse_count} 筆（{trade_date_str}）']
+            if tpex_date_str:
+                msg_parts.append(f'上櫃 {tpex_count} 筆（{tpex_date_str}）')
+            elif tpex_error:
+                msg_parts.append(f'上櫃失敗：{tpex_error}')
             return jsonify({
                 'success': True,
-                'message': f'權證資料匯入完成（收盤價更新 {ohlc_updated} 筆）' if ohlc_updated else '權證資料匯入完成',
-                'importedCount': affected,
-                'ohlcUpdated': ohlc_updated,
+                'message': '權證資料匯入完成：' + '；'.join(msg_parts),
+                'importedCount': twse_count,
+                'ohlcUpdated': twse_count,
                 'tradeDate': trade_date_str,
+                'tpexImportedCount': tpex_count,
+                'tpexTradeDate': tpex_date_str,
+                'source': 'MI_INDEX+TPEX',
             })
         except Exception as e:
             logger.exception('匯入最新權證資料失敗')
@@ -9190,77 +9245,12 @@ def import_tpex_warrant_daily():
         try:
             db_manager.create_tables()
             data = _fetch_json_list('https://www.tpex.org.tw/openapi/v1/tpex_warrant_daily_quts')
-            first_trade_date = _parse_roc_date_text(data[0].get('Date'))
-            trade_date_str = first_trade_date.strftime('%Y-%m-%d') if first_trade_date else None
-            tpex_warrant_daily_import_status['tradeDate'] = trade_date_str
+            tpex_warrant_daily_import_status['total'] = len(data)
 
             cursor = db_manager.connection.cursor()
             cursor.execute('BEGIN')
-
-            sql = """
-                INSERT INTO tpex_warrant_daily_quotes (
-                    trade_date, warrant_code, warrant_name, open_price, high_price, low_price,
-                    close_price, price_change, trade_volume, transaction_count, trade_value,
-                    underlying_code, underlying_name, underlying_close_price,
-                    underlying_price_change, raw_trade_date_text, updated_at
-                ) VALUES %s
-                ON CONFLICT (trade_date, warrant_code) DO UPDATE SET
-                    warrant_name = EXCLUDED.warrant_name,
-                    open_price = EXCLUDED.open_price,
-                    high_price = EXCLUDED.high_price,
-                    low_price = EXCLUDED.low_price,
-                    close_price = EXCLUDED.close_price,
-                    price_change = EXCLUDED.price_change,
-                    trade_volume = EXCLUDED.trade_volume,
-                    transaction_count = EXCLUDED.transaction_count,
-                    trade_value = EXCLUDED.trade_value,
-                    underlying_code = EXCLUDED.underlying_code,
-                    underlying_name = EXCLUDED.underlying_name,
-                    underlying_close_price = EXCLUDED.underlying_close_price,
-                    underlying_price_change = EXCLUDED.underlying_price_change,
-                    raw_trade_date_text = EXCLUDED.raw_trade_date_text,
-                    updated_at = NOW()
-            """
-
-            total = len(data)
-            tpex_warrant_daily_import_status['total'] = total
-            rows = []
-            batch_size = 1000
-            affected = 0
-
-            for item in data:
-                trade_date = _parse_roc_date_text(item.get('Date'))
-                code = str(item.get('Code') or '').strip()
-                if trade_date is None or not code:
-                    continue
-                rows.append((
-                    trade_date,
-                    code,
-                    str(item.get('Name') or '').strip() or None,
-                    _to_decimal_or_none(item.get('Open')),
-                    _to_decimal_or_none(item.get('High')),
-                    _to_decimal_or_none(item.get('Low')),
-                    _to_decimal_or_none(item.get('Close')),
-                    _to_decimal_or_none(item.get('Change')),
-                    _to_int_or_none(item.get('TradeVol.')),
-                    _to_int_or_none(item.get('No.OfTransactions')),
-                    _to_decimal_or_none(item.get('TradeValue')),
-                    str(item.get('UnderlyingStockCode') or '').strip() or None,
-                    str(item.get('UnderlyingStock') or '').strip() or None,
-                    _to_decimal_or_none(item.get('UnderlyingStockClosePrice')),
-                    _to_decimal_or_none(item.get('UnderlyingStock PriceChange')),
-                    item.get('Date'),
-                ))
-                if len(rows) >= batch_size:
-                    execute_values(cursor, sql, rows, template='(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())', page_size=batch_size)
-                    affected += len(rows)
-                    tpex_warrant_daily_import_status['processed'] = affected
-                    tpex_warrant_daily_import_status['importedCount'] = affected
-                    rows = []
-
-            if rows:
-                execute_values(cursor, sql, rows, template='(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())', page_size=batch_size)
-                affected += len(rows)
+            affected, trade_date_str = _import_tpex_warrant_daily_rows(cursor, data)
+            tpex_warrant_daily_import_status['tradeDate'] = trade_date_str
 
             db_manager.connection.commit()
             tpex_warrant_daily_import_status['running'] = False

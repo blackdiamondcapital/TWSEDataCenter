@@ -221,10 +221,10 @@ function onPage(p) {
 
 async function onImportLatest() {
   importing.value = true
-  statusText.value = '正在同步 TWSE 最新成交…'
+  statusText.value = '正在同步上市 MI_INDEX 與上櫃日行情…'
   try {
     const resp = await importLatestWarrants()
-    statusText.value = `${resp.message || '匯入完成'}${resp.tradeDate ? `（${resp.tradeDate}）` : ''}`
+    statusText.value = `${resp.message || '匯入完成'}`
     await loadDates()
     await loadRankings()
     await loadStats()
