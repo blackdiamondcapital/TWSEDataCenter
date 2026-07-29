@@ -6,14 +6,13 @@ import {
   fetchMasterDetail,
   fetchDates,
   fetchRankings,
-  fetchTimeseries,
   importLatestWarrants,
 } from './api'
 import { buildOAuthStartUrl } from './lib/oauthStart'
 import { useAuth } from './lib/auth'
 import MasterScreener from './components/MasterScreener.vue'
 import RankingPanel from './components/RankingPanel.vue'
-import WarrantTechChart from './components/WarrantTechChart.vue'
+import StockChartECharts from './components/StockChartECharts.vue'
 import WarrantDetail from './components/WarrantDetail.vue'
 
 const {
@@ -70,9 +69,6 @@ const loadingRankings = ref(false)
 const selected = ref(null)
 const detail = ref(null)
 const loadingDetail = ref(false)
-const timeseries = ref([])
-const loadingSeries = ref(false)
-const chartPeriodDays = ref(120)
 const techChartRef = ref(null)
 const chartFullscreen = ref(false)
 
@@ -208,13 +204,8 @@ async function selectWarrant(row) {
   if (!row?.warrant_code) return
   selected.value = row
   loadingDetail.value = true
-  loadingSeries.value = true
-  timeseries.value = []
   try {
-    const [detailResp, seriesResp] = await Promise.all([
-      fetchMasterDetail(row.warrant_code).catch(() => null),
-      fetchTimeseries({ code: row.warrant_code, limitDays: chartPeriodDays.value }),
-    ])
+    const detailResp = await fetchMasterDetail(row.warrant_code).catch(() => null)
     detail.value = detailResp?.data || {
       market: row.market,
       warrant_code: row.warrant_code,
@@ -227,7 +218,6 @@ async function selectWarrant(row) {
       expiry_date: row.expiry_date,
       issuance: row.issuance,
     }
-    timeseries.value = seriesResp.data || []
     await nextTick()
     // 對齊 quantgems.com：選檔後進入全螢幕技術分析
     techChartRef.value?.enterFullscreen?.()
@@ -236,30 +226,11 @@ async function selectWarrant(row) {
     statusText.value = `載入詳情失敗：${err.message}`
   } finally {
     loadingDetail.value = false
-    loadingSeries.value = false
   }
 }
 
 function onChartFullscreenChange(active) {
   chartFullscreen.value = !!active
-}
-
-async function onChartPeriodDays(days) {
-  chartPeriodDays.value = days
-  if (!selected.value?.warrant_code) return
-  loadingSeries.value = true
-  try {
-    const seriesResp = await fetchTimeseries({
-      code: selected.value.warrant_code,
-      limitDays: days,
-    })
-    timeseries.value = seriesResp.data || []
-  } catch (err) {
-    console.error(err)
-    statusText.value = `載入走勢失敗：${err.message}`
-  } finally {
-    loadingSeries.value = false
-  }
 }
 
 function onSearch() {
@@ -505,14 +476,13 @@ onMounted(async () => {
             :error-text="rankingsError"
             @select="selectWarrant"
           />
-          <WarrantTechChart
+          <StockChartECharts
             ref="techChartRef"
-            :code="selected?.warrant_code || ''"
-            :name="selected?.warrant_name || ''"
-            :series="timeseries"
-            :loading="loadingSeries"
-            :period-days="chartPeriodDays"
-            @update:period-days="onChartPeriodDays"
+            class="warrant-stock-chart"
+            :symbol="selected?.warrant_code || ''"
+            :stock-name="selected?.warrant_name || ''"
+            period="1D"
+            :fullscreen-search-enabled="false"
             @fullscreen-change="onChartFullscreenChange"
           />
         </div>
@@ -728,6 +698,15 @@ onMounted(async () => {
   display: grid;
   grid-template-columns: 0.9fr 1.1fr;
   gap: 1rem;
+  align-items: stretch;
+}
+.warrant-stock-chart {
+  min-height: 520px;
+  width: 100%;
+}
+:global(body.warrant-ta-fs),
+:global(html.warrant-ta-fs) {
+  overflow: hidden;
 }
 
 @keyframes rise {

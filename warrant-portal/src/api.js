@@ -51,9 +51,16 @@ export async function fetchRankings({ date, metric = 'turnover', market = 'both'
   )
 }
 
-export async function fetchTimeseries({ code, limitDays = 90 } = {}) {
+export async function fetchTimeseries({ code, limitDays = 90, start, end } = {}) {
   return unwrap(
-    await api.get('/warrants/timeseries', { params: { code, limitDays } }),
+    await api.get('/warrants/timeseries', {
+      params: {
+        code,
+        limitDays,
+        start: start || undefined,
+        end: end || undefined,
+      },
+    }),
     '時間序列查詢失敗',
   )
 }

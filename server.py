@@ -10318,7 +10318,8 @@ def warrants_timeseries():
         start = (request.args.get('start') or '').strip() or None
         end = (request.args.get('end') or '').strip() or None
         limit_days = request.args.get('limitDays', default=90, type=int) or 90
-        limit_days = max(1, min(365, limit_days))
+        # 技術分析圖（日／週／月）需要較長歷史；上限對齊主站常用區間
+        limit_days = max(1, min(750, limit_days))
 
         db_manager = DatabaseManager.from_request_args(request.args)
         if not db_manager.connect():

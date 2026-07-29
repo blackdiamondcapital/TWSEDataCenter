@@ -11,6 +11,12 @@ import {
   calcMACD,
 } from '../lib/indicators'
 import { buildWarrantSignals } from '../lib/signalRules'
+import {
+  CHART_THEME,
+  DEFAULT_MA_PERIODS,
+  DEFAULT_DUO_KONG_PERIOD,
+  DEFAULT_DUO_KONG_TREND_PERIOD,
+} from '../lib/chartTheme'
 
 const props = defineProps({
   code: { type: String, default: '' },
@@ -44,16 +50,26 @@ function lsBool(key, fallback) {
   return v === 'true'
 }
 
+function lsPeriod(key, fallback) {
+  const raw = localStorage.getItem(key)
+  if (raw == null) return fallback
+  const n = Number(raw)
+  // 舊預設 55 → 對齊主站 77
+  if (key === LS.dkPeriod && n === 55) return fallback
+  return Number.isFinite(n) && n >= 2 ? n : fallback
+}
+
 const showK = ref(lsBool(LS.k, true))
 const showMA = ref(lsBool(LS.ma, true))
-const showDuoKong = ref(lsBool(LS.dk, false))
+const showDuoKong = ref(lsBool(LS.dk, true))
 const showVolume = ref(lsBool(LS.vol, true))
 const showDuoKongTrend = ref(lsBool(LS.dkt, false))
 const showKD = ref(lsBool(LS.kd, false))
 const showRSI = ref(lsBool(LS.rsi, false))
 const showMACD = ref(lsBool(LS.macd, false))
-const duoKongPeriod = ref(Number(localStorage.getItem(LS.dkPeriod) || 55))
-const duoKongTrendPeriod = ref(Number(localStorage.getItem(LS.dktPeriod) || 24))
+const duoKongPeriod = ref(lsPeriod(LS.dkPeriod, DEFAULT_DUO_KONG_PERIOD))
+const duoKongTrendPeriod = ref(lsPeriod(LS.dktPeriod, DEFAULT_DUO_KONG_TREND_PERIOD))
+const showControls = ref(false)
 
 const chartRef = ref(null)
 let chartInstance = null
@@ -90,6 +106,22 @@ watch(showDuoKongTrend, (v) => persist(LS.dkt, v))
 watch(showKD, (v) => persist(LS.kd, v))
 watch(showRSI, (v) => persist(LS.rsi, v))
 watch(showMACD, (v) => persist(LS.macd, v))
+watch(duoKongPeriod, (v) => {
+  const n = Number(v)
+  if (!Number.isFinite(n) || n < 2) {
+    duoKongPeriod.value = DEFAULT_DUO_KONG_PERIOD
+    return
+  }
+  persist(LS.dkPeriod, Math.round(n))
+})
+watch(duoKongTrendPeriod, (v) => {
+  const n = Number(v)
+  if (!Number.isFinite(n) || n < 2) {
+    duoKongTrendPeriod.value = DEFAULT_DUO_KONG_TREND_PERIOD
+    return
+  }
+  persist(LS.dktPeriod, Math.round(n))
+})
 
 const bars = computed(() => mapBars(props.series))
 const closes = computed(() => bars.value.map((b) => b.close))
@@ -100,23 +132,36 @@ const duoKong = computed(() =>
 const duoKongTrend = computed(() =>
   calcDuoKongTrend(closes.value, duoKongTrendPeriod.value),
 )
-const ma5 = computed(() => calcSMA(closes.value, 5))
-const ma10 = computed(() => calcSMA(closes.value, 10))
-const ma20 = computed(() => calcSMA(closes.value, 20))
-const ma60 = computed(() => calcSMA(closes.value, 60))
+const maSeries = computed(() =>
+  DEFAULT_MA_PERIODS.map((p, i) => ({
+    period: p,
+    name: `MA${p}`,
+    data: calcSMA(closes.value, p),
+    color: CHART_THEME.ma[i] || CHART_THEME.ma[0],
+  })),
+)
 const kd = computed(() => calcKD(bars.value))
 const rsi = computed(() => calcRSI(closes.value, 14))
 const macd = computed(() => calcMACD(closes.value))
 
-const signals = computed(() =>
-  buildWarrantSignals({
+const visibleSignals = computed(() => {
+  const all = buildWarrantSignals({
     closes: closes.value,
     duoKongBase: duoKong.value.base,
     kd: kd.value,
     rsi: rsi.value,
     macd: macd.value,
-  }),
-)
+  })
+  return all.filter((s) => {
+    if (s.id === 'price-vs-dk' || s.id === 'dk-slope') return showDuoKong.value
+    if (s.id === 'kd') return showKD.value
+    if (s.id === 'rsi') return showRSI.value
+    if (s.id === 'macd') return showMACD.value
+    return true
+  })
+})
+
+const signals = visibleSignals
 
 const ohlcCount = computed(
   () => bars.value.filter((b) => b.open != null && b.close != null).length,
@@ -291,7 +336,9 @@ function renderChart() {
   const yAxes = []
   const series = []
 
-  const mainH = subIds.length === 0 ? 78 : Math.max(36, Math.round(78 * mainRatio))
+  // 底部留 dataZoom slider
+  const usable = 82
+  const mainH = subIds.length === 0 ? usable - 4 : Math.max(34, Math.round(usable * mainRatio))
   let cursor = topPad
   grids.push({ left: 56, right: 18, top: `${cursor}%`, height: `${mainH}%` })
   const mainIdx = 0
@@ -300,7 +347,7 @@ function renderChart() {
   const subH =
     subIds.length === 0
       ? 0
-      : Math.max(10, Math.floor((88 - cursor) / subIds.length) - 1)
+      : Math.max(9, Math.floor((usable - cursor + topPad) / subIds.length) - 1)
   const subIndex = {}
   subIds.forEach((id) => {
     const idx = grids.length
@@ -344,10 +391,10 @@ function renderChart() {
       yAxisIndex: mainIdx,
       data: candle,
       itemStyle: {
-        color: '#ef4444',
-        color0: '#22c55e',
-        borderColor: '#ef4444',
-        borderColor0: '#22c55e',
+        color: CHART_THEME.up,
+        color0: CHART_THEME.down,
+        borderColor: CHART_THEME.up,
+        borderColor0: CHART_THEME.down,
       },
       z: 2,
     })
@@ -367,13 +414,7 @@ function renderChart() {
   }
 
   if (showMA.value) {
-    const mas = [
-      { name: 'MA5', data: ma5.value, color: '#fbbf24' },
-      { name: 'MA10', data: ma10.value, color: '#38bdf8' },
-      { name: 'MA20', data: ma20.value, color: '#c084fc' },
-      { name: 'MA60', data: ma60.value, color: '#fb7185' },
-    ]
-    mas.forEach((m) => {
+    maSeries.value.forEach((m) => {
       series.push({
         name: m.name,
         type: 'line',
@@ -494,7 +535,7 @@ function renderChart() {
       yAxisIndex: yi,
       data: kd.value.k,
       showSymbol: false,
-      lineStyle: { width: 1.4, color: '#fbbf24' },
+      lineStyle: { width: 1.4, color: CHART_THEME.kdK },
       connectNulls: false,
     })
     series.push({
@@ -504,7 +545,7 @@ function renderChart() {
       yAxisIndex: yi,
       data: kd.value.d,
       showSymbol: false,
-      lineStyle: { width: 1.4, color: '#38bdf8' },
+      lineStyle: { width: 1.4, color: CHART_THEME.kdD },
       connectNulls: false,
     })
   }
@@ -527,7 +568,7 @@ function renderChart() {
       yAxisIndex: yi,
       data: rsi.value,
       showSymbol: false,
-      lineStyle: { width: 1.5, color: '#c084fc' },
+      lineStyle: { width: 1.5, color: CHART_THEME.rsi },
       markLine: {
         silent: true,
         symbol: 'none',
@@ -569,7 +610,7 @@ function renderChart() {
       yAxisIndex: yi,
       data: macd.value.dif,
       showSymbol: false,
-      lineStyle: { width: 1.3, color: '#fbbf24' },
+      lineStyle: { width: 1.3, color: CHART_THEME.dif },
       connectNulls: false,
     })
     series.push({
@@ -579,7 +620,7 @@ function renderChart() {
       yAxisIndex: yi,
       data: macd.value.dea,
       showSymbol: false,
-      lineStyle: { width: 1.3, color: '#38bdf8' },
+      lineStyle: { width: 1.3, color: CHART_THEME.dea },
       connectNulls: false,
     })
   }
@@ -587,7 +628,7 @@ function renderChart() {
   const legendData = []
   if (showK.value && ohlcCount.value > 0) legendData.push('K線')
   else legendData.push('收盤價')
-  if (showMA.value) legendData.push('MA5', 'MA10', 'MA20', 'MA60')
+  if (showMA.value) legendData.push(...maSeries.value.map((m) => m.name))
   if (showDuoKong.value) legendData.push(`多空線(${duoKongPeriod.value})`)
   if (showVolume.value) legendData.push('成交量')
   if (showDuoKongTrend.value) legendData.push(`多空趨勢線(${duoKongTrendPeriod.value})`)
@@ -595,6 +636,7 @@ function renderChart() {
   if (showRSI.value) legendData.push('RSI')
   if (showMACD.value) legendData.push('MACD柱', 'DIF', 'DEA')
 
+  const xAxisIndexes = xAxes.map((_, i) => i)
   chartInstance.setOption(
     {
       backgroundColor: 'transparent',
@@ -605,7 +647,7 @@ function renderChart() {
         backgroundColor: 'rgba(10, 16, 22, 0.94)',
         borderColor: 'rgba(148,183,205,0.25)',
         textStyle: { color: '#eef5f8', fontSize: 12 },
-        axisPointer: { type: 'cross', lineStyle: { color: 'rgba(0,212,255,0.35)' } },
+        axisPointer: { type: 'cross', lineStyle: { color: CHART_THEME.cross } },
       },
       legend: {
         data: [...new Set(legendData)],
@@ -623,9 +665,31 @@ function renderChart() {
       dataZoom: [
         {
           type: 'inside',
-          xAxisIndex: xAxes.map((_, i) => i),
+          xAxisIndex: xAxisIndexes,
           start: 0,
           end: 100,
+        },
+        {
+          type: 'slider',
+          xAxisIndex: xAxisIndexes,
+          height: 18,
+          bottom: 6,
+          start: 0,
+          end: 100,
+          borderColor: 'rgba(148,183,205,0.25)',
+          backgroundColor: 'rgba(8,14,20,0.55)',
+          fillerColor: 'rgba(0,212,255,0.12)',
+          handleStyle: { color: '#00d4ff', borderColor: '#00d4ff' },
+          moveHandleStyle: { color: 'rgba(0,212,255,0.45)' },
+          dataBackground: {
+            lineStyle: { color: 'rgba(148,183,205,0.35)' },
+            areaStyle: { color: 'rgba(148,183,205,0.12)' },
+          },
+          selectedDataBackground: {
+            lineStyle: { color: 'rgba(0,212,255,0.55)' },
+            areaStyle: { color: 'rgba(0,212,255,0.18)' },
+          },
+          textStyle: { color: '#8fa3b3', fontSize: 10 },
         },
       ],
     },
@@ -666,6 +730,8 @@ watch(
     showKD.value,
     showRSI.value,
     showMACD.value,
+    duoKongPeriod.value,
+    duoKongTrendPeriod.value,
     isFullscreen.value,
   ],
   () => renderChart(),
@@ -681,11 +747,12 @@ watch(
         <span class="muted" v-if="code">{{ code }} · {{ name || '' }}</span>
       </div>
       <div class="head-actions">
-        <div class="periods">
+        <div class="periods" role="group" aria-label="期間">
           <button
             v-for="p in periods"
             :key="p.days"
             type="button"
+            class="chip"
             :class="{ active: periodDays === p.days }"
             @click="setPeriod(p.days)"
           >
@@ -694,24 +761,62 @@ watch(
         </div>
         <button
           type="button"
-          class="fs-btn"
+          class="icon-btn"
+          :class="{ active: showControls }"
+          title="指標參數"
+          aria-label="指標參數"
+          @click="showControls = !showControls"
+        >
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M4 7h10v2H4V7zm12 0h4v2h-4V7zM4 15h4v2H4v-2zm6 0h10v2H10v-2zm7.5-11a1.5 1.5 0 110 3 1.5 1.5 0 010-3zM6.5 13a1.5 1.5 0 110 3 1.5 1.5 0 010-3z"
+            />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="icon-btn"
           :title="isFullscreen ? '退出全螢幕' : '全螢幕'"
+          :aria-label="isFullscreen ? '退出全螢幕' : '全螢幕'"
           @click="toggleFullscreen"
         >
-          {{ isFullscreen ? '退出全螢幕' : '全螢幕' }}
+          <svg v-if="!isFullscreen" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"
+            />
+          </svg>
+          <svg v-else viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"
+            />
+          </svg>
         </button>
       </div>
     </div>
 
-    <div class="toggles">
-      <label><input v-model="showK" type="checkbox" /> K線</label>
-      <label><input v-model="showMA" type="checkbox" /> MA</label>
-      <label><input v-model="showDuoKong" type="checkbox" /> 多空線</label>
-      <label><input v-model="showVolume" type="checkbox" /> 成交量</label>
-      <label><input v-model="showDuoKongTrend" type="checkbox" /> 多空趨勢線</label>
-      <label><input v-model="showKD" type="checkbox" /> KD</label>
-      <label><input v-model="showRSI" type="checkbox" /> RSI</label>
-      <label><input v-model="showMACD" type="checkbox" /> MACD</label>
+    <div class="toggles" role="group" aria-label="指標開關">
+      <button type="button" class="chip" :class="{ active: showK }" @click="showK = !showK">K線</button>
+      <button type="button" class="chip" :class="{ active: showMA }" @click="showMA = !showMA">MA</button>
+      <button type="button" class="chip" :class="{ active: showDuoKong }" @click="showDuoKong = !showDuoKong">多空線</button>
+      <button type="button" class="chip" :class="{ active: showVolume }" @click="showVolume = !showVolume">成交量</button>
+      <button type="button" class="chip" :class="{ active: showDuoKongTrend }" @click="showDuoKongTrend = !showDuoKongTrend">多空趨勢線</button>
+      <button type="button" class="chip" :class="{ active: showKD }" @click="showKD = !showKD">KD</button>
+      <button type="button" class="chip" :class="{ active: showRSI }" @click="showRSI = !showRSI">RSI</button>
+      <button type="button" class="chip" :class="{ active: showMACD }" @click="showMACD = !showMACD">MACD</button>
+    </div>
+
+    <div v-if="showControls" class="params">
+      <label>
+        多空線週期
+        <input v-model.number="duoKongPeriod" type="number" min="2" max="250" step="1" />
+      </label>
+      <label>
+        多空趨勢線週期
+        <input v-model.number="duoKongTrendPeriod" type="number" min="2" max="120" step="1" />
+      </label>
     </div>
 
     <p v-if="code && !loading && ohlcCount === 0 && bars.length" class="hint">
@@ -733,6 +838,9 @@ watch(
         >
           <span class="sig-title">{{ s.title }}</span>
           <span class="sig-detail">{{ s.detail }}</span>
+        </div>
+        <div v-if="!signals.length" class="signal muted-empty">
+          <span class="sig-detail">開啟對應指標後顯示訊號</span>
         </div>
       </div>
     </div>
@@ -762,7 +870,7 @@ watch(
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.45rem;
 }
 .title-row {
   display: flex;
@@ -780,42 +888,73 @@ watch(
 }
 .periods {
   display: flex;
-  gap: 0.35rem;
+  gap: 0.3rem;
 }
-.periods button,
-.fs-btn {
-  border: 1px solid rgba(0, 212, 255, 0.22);
-  background: rgba(0, 212, 255, 0.05);
-  color: #c2cce0;
-  border-radius: 8px;
-  padding: 0.28rem 0.65rem;
-  font-size: 0.8rem;
+.chip,
+.icon-btn {
+  border: 1px solid rgba(148, 183, 205, 0.22);
+  background: rgba(8, 14, 20, 0.45);
+  color: #a8bac8;
+  border-radius: 999px;
+  padding: 0.26rem 0.72rem;
+  font-size: 0.78rem;
+  line-height: 1.2;
   cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
-.periods button.active,
-.fs-btn:hover {
-  border-color: #00d4ff;
+.chip:hover,
+.icon-btn:hover {
+  border-color: rgba(0, 212, 255, 0.45);
+  color: #e8f7ff;
+}
+.chip.active,
+.icon-btn.active {
+  border-color: rgba(0, 212, 255, 0.7);
   color: #00d4ff;
+  background: rgba(0, 212, 255, 0.12);
 }
-.fs-btn {
-  font-weight: 600;
-  background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(129, 140, 248, 0.14));
+.icon-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
 }
 .toggles {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.55rem 0.9rem;
+  gap: 0.35rem;
   margin-bottom: 0.55rem;
-  font-size: 0.82rem;
-  color: #c5d4de;
   flex-shrink: 0;
 }
-.toggles label {
+.params {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.1rem;
+  margin: -0.15rem 0 0.65rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid rgba(148, 183, 205, 0.14);
+  border-radius: 10px;
+  background: rgba(8, 14, 20, 0.35);
+  flex-shrink: 0;
+}
+.params label {
   display: inline-flex;
   align-items: center;
-  gap: 0.28rem;
-  cursor: pointer;
-  user-select: none;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: #9bb0c0;
+}
+.params input {
+  width: 64px;
+  border: 1px solid rgba(148, 183, 205, 0.28);
+  border-radius: 6px;
+  background: rgba(2, 8, 14, 0.65);
+  color: #e8f7ff;
+  padding: 0.22rem 0.4rem;
+  font-size: 0.8rem;
 }
 .hint {
   margin: 0 0 0.5rem;
@@ -838,8 +977,8 @@ watch(
 }
 .is-fullscreen .chart-box {
   flex: 1 1 auto;
-  min-height: calc(100svh - 220px);
-  height: calc(100svh - 220px) !important;
+  min-height: calc(100svh - 240px);
+  height: calc(100svh - 240px) !important;
 }
 .signals {
   margin-top: 0.75rem;
@@ -884,5 +1023,8 @@ watch(
 }
 .signal.bear .sig-detail {
   color: #86efac;
+}
+.muted-empty .sig-detail {
+  color: #8fa3b3;
 }
 </style>

@@ -65,10 +65,10 @@ function calcWMA(arr, period) {
 }
 
 /**
- * 多空線（Hull 移動平均）
+ * 多空線（主圖疊加；演算法為 Hull MA，對外不顯示此名稱）
  * @returns {{ base: (number|null)[], up: (number|null)[], flatDown: (number|null)[] }}
  */
-export function calcDuoKongLine(closes, period = 55) {
+export function calcDuoKongLine(closes, period = 77) {
   const n = Math.max(2, Math.floor(period))
   const n2 = Math.max(1, Math.floor(n / 2))
   const ns = Math.max(1, Math.floor(Math.sqrt(n)))

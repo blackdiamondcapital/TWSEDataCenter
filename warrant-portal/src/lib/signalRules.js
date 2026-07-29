@@ -33,14 +33,14 @@ export function buildWarrantSignals({
         id: 'price-vs-dk',
         title: '價格 vs 多空線',
         direction: 'bull',
-        detail: `收盤 ${lastClose.v} 站上多空線 ${lastDk.v}`,
+        detail: `收盤 ${Number(lastClose.v).toFixed(2)} 站上多空線 ${Number(lastDk.v).toFixed(2)}`,
       })
     } else if (lastClose.v < lastDk.v) {
       signals.push({
         id: 'price-vs-dk',
         title: '價格 vs 多空線',
         direction: 'bear',
-        detail: `收盤 ${lastClose.v} 跌破多空線 ${lastDk.v}`,
+        detail: `收盤 ${Number(lastClose.v).toFixed(2)} 跌破多空線 ${Number(lastDk.v).toFixed(2)}`,
       })
     } else {
       signals.push({
