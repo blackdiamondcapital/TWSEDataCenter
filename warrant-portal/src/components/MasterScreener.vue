@@ -21,6 +21,7 @@ const columns = [
   { key: 'type', label: '類型' },
   { key: 'underlying', label: '標的' },
   { key: 'close', label: '收盤', align: 'num' },
+  { key: 'volume', label: '成交量', align: 'num' },
   { key: 'exercise', label: '履約價', align: 'num' },
   { key: 'days', label: '到期天數', align: 'num' },
   { key: 'ratio', label: '行使比', align: 'num' },
@@ -104,6 +105,7 @@ function onSort(key) {
               <span>{{ row.underlying_name || '—' }}</span>
             </td>
             <td class="num mono">{{ fmt(row.close_price, 2) }}</td>
+            <td class="num mono">{{ fmt(row.volume, 0) }}</td>
             <td class="num mono">{{ fmt(row.latest_exercise_price) }}</td>
             <td class="num mono" :class="daysClass(row.days_to_expiry)">
               {{ row.days_to_expiry == null ? '—' : row.days_to_expiry }}

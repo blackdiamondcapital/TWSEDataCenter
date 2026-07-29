@@ -359,6 +359,7 @@ onMounted(async () => {
             <option value="exercise">履約價</option>
             <option value="ratio">行使比</option>
             <option value="close">收盤</option>
+            <option value="volume">成交量</option>
             <option value="code">代號</option>
             <option value="name">名稱</option>
             <option value="market">市場</option>

@@ -9733,13 +9733,18 @@ def warrants_portal_master_search():
             elif sort == 'close':
                 # 以最新收盤價排序（TWSE / TPEX 取較新交易日價）
                 order_sql = f'ORDER BY close_price {direction} {nulls}, warrant_code ASC'
+            elif sort == 'volume':
+                order_sql = f'ORDER BY volume {direction} {nulls}, warrant_code ASC'
+            elif sort == 'turnover':
+                order_sql = f'ORDER BY turnover {direction} {nulls}, warrant_code ASC'
             else:
                 order_sql = f'ORDER BY expiry_date {direction} {nulls}, warrant_code ASC'
 
             cur.execute(f'SELECT COUNT(*) AS cnt FROM ({base}) c', params)
             total = int((cur.fetchone() or {}).get('cnt') or 0)
 
-            if sort == 'close':
+            need_px_join = sort in ('close', 'volume', 'turnover')
+            if need_px_join:
                 list_sql = f"""
                     SELECT m.*,
                            COALESCE(twpx.close_price, tppx.close_price) AS close_price,
@@ -9764,7 +9769,6 @@ def warrants_portal_master_search():
                 """
                 cur.execute(list_sql, params + [page_size, offset])
                 rows = cur.fetchall() or []
-                # 已含 close，略過後續補價仍可覆蓋一致性
             else:
                 cur.execute(
                     f'SELECT * FROM ({base}) m {order_sql} LIMIT %s OFFSET %s',
@@ -9774,8 +9778,8 @@ def warrants_portal_master_search():
 
             # 補上最近一筆收盤價（TWSE trade / TPEX daily）
             price_map: dict[str, dict] = {}
-            # 若已依 close 排序並帶出價格，先填入
-            if sort == 'close':
+            # 若已依行情欄位排序並帶出價格，先填入
+            if need_px_join:
                 for r in rows:
                     code = r.get('warrant_code')
                     if not code:
@@ -9788,7 +9792,7 @@ def warrants_portal_master_search():
                     }
 
             codes = [r.get('warrant_code') for r in rows if r.get('warrant_code')]
-            if codes and sort != 'close':
+            if codes and not need_px_join:
                 cur.execute(
                     """
                     SELECT DISTINCT ON (warrant_code)
