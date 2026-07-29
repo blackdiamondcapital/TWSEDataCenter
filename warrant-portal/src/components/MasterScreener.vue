@@ -22,9 +22,9 @@ const columns = [
   { key: 'underlying', label: '標的' },
   { key: 'close', label: '收盤', align: 'num' },
   { key: 'exercise', label: '履約價', align: 'num' },
+  { key: 'days', label: '到期天數', align: 'num' },
   { key: 'ratio', label: '行使比', align: 'num' },
   { key: 'expiry', label: '到期日' },
-  { key: 'days', label: '到期天數', align: 'num' },
 ]
 
 const pageCount = computed(() => Math.max(1, Math.ceil((props.total || 0) / props.pageSize)))
@@ -105,11 +105,11 @@ function onSort(key) {
             </td>
             <td class="num mono">{{ fmt(row.close_price, 2) }}</td>
             <td class="num mono">{{ fmt(row.latest_exercise_price) }}</td>
-            <td class="num mono">{{ fmt(row.latest_exercise_ratio, 4) }}</td>
-            <td class="mono">{{ row.expiry_date || '—' }}</td>
             <td class="num mono" :class="daysClass(row.days_to_expiry)">
               {{ row.days_to_expiry == null ? '—' : row.days_to_expiry }}
             </td>
+            <td class="num mono">{{ fmt(row.latest_exercise_ratio, 4) }}</td>
+            <td class="mono">{{ row.expiry_date || '—' }}</td>
           </tr>
         </tbody>
       </table>
