@@ -333,7 +333,7 @@ function renderChart() {
     gridIndex: mainIdx,
     scale: true,
     axisLabel: { color: '#9bb0c0' },
-    splitLine: { lineStyle: { color: 'rgba(148,183,205,0.12)' } },
+      splitLine: { lineStyle: { color: 'rgba(100,200,255,0.12)' } },
   })
 
   if (showK.value && ohlcCount.value > 0) {
@@ -605,7 +605,7 @@ function renderChart() {
         backgroundColor: 'rgba(10, 16, 22, 0.94)',
         borderColor: 'rgba(148,183,205,0.25)',
         textStyle: { color: '#eef5f8', fontSize: 12 },
-        axisPointer: { type: 'cross', lineStyle: { color: 'rgba(46,211,198,0.35)' } },
+        axisPointer: { type: 'cross', lineStyle: { color: 'rgba(0,212,255,0.35)' } },
       },
       legend: {
         data: [...new Set(legendData)],
@@ -614,7 +614,7 @@ function renderChart() {
         itemWidth: 10,
         itemHeight: 8,
         itemGap: 12,
-        textStyle: { color: '#c5d4de', fontSize: 11 },
+        textStyle: { color: '#c2cce0', fontSize: 11 },
       },
       grid: grids,
       xAxis: xAxes,
@@ -784,21 +784,22 @@ watch(
 }
 .periods button,
 .fs-btn {
-  border: 1px solid rgba(148, 183, 205, 0.28);
-  background: rgba(12, 22, 30, 0.55);
-  color: #c5d4de;
-  border-radius: 6px;
+  border: 1px solid rgba(0, 212, 255, 0.22);
+  background: rgba(0, 212, 255, 0.05);
+  color: #c2cce0;
+  border-radius: 8px;
   padding: 0.28rem 0.65rem;
   font-size: 0.8rem;
   cursor: pointer;
 }
 .periods button.active,
 .fs-btn:hover {
-  border-color: #2ed3c6;
-  color: #2ed3c6;
+  border-color: #00d4ff;
+  color: #00d4ff;
 }
 .fs-btn {
   font-weight: 600;
+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(129, 140, 248, 0.14));
 }
 .toggles {
   display: flex;
@@ -819,7 +820,7 @@ watch(
 .hint {
   margin: 0 0 0.5rem;
   font-size: 0.78rem;
-  color: #f0b429;
+  color: #38bdf8;
   flex-shrink: 0;
 }
 .chart-stage {

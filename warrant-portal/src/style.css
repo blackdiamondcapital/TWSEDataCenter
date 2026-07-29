@@ -1,16 +1,29 @@
+/* QuantGems Black Diamond Tech — warrant portal */
 :root {
-  --bg-deep: #070b10;
-  --bg-panel: #101820;
-  --bg-elevated: #16202b;
-  --line: rgba(148, 183, 205, 0.16);
-  --text: #eef5f8;
-  --text-dim: #8fa3b3;
-  --cyan: #2ed3c6;
-  --amber: #f0b429;
-  --call: #ff6b6b;
-  --put: #3dd68c;
-  --shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
-  font-family: 'Instrument Sans', system-ui, sans-serif;
+  --brand-primary: #00d4ff;
+  --brand-secondary: #6366f1;
+  --brand-tertiary: #a78bfa;
+  --brand-gradient: linear-gradient(135deg, #00d4ff 0%, #6366f1 100%);
+  --btn-gradient: linear-gradient(135deg, #38bdf8, #818cf8);
+
+  --bg-deep: #06121e;
+  --bg-panel: rgba(7, 11, 20, 0.82);
+  --bg-elevated: #121b2c;
+  --bg-surface: #0d1420;
+  --line: rgba(0, 212, 255, 0.12);
+  --line-strong: rgba(0, 212, 255, 0.28);
+  --text: #f0f4ff;
+  --text-dim: #8896aa;
+  --cyan: #00d4ff;
+  --cyan-bright: #38bdf8;
+  --amber: #60a5fa;
+  --call: #f87171;
+  --put: #4ade80;
+  --shadow: 0 4px 20px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(0, 212, 255, 0.06);
+  --shadow-glow: 0 0 24px rgba(0, 212, 255, 0.18);
+  --chart-fs-bg: #0b1220;
+
+  font-family: 'Inter', 'Noto Sans TC', 'PingFang TC', 'Microsoft JhengHei', system-ui, sans-serif;
   color: var(--text);
   background: var(--bg-deep);
   line-height: 1.45;
@@ -24,9 +37,9 @@ html, body, #app { margin: 0; min-height: 100%; }
 body {
   min-height: 100vh;
   background:
-    radial-gradient(900px 480px at 12% -10%, rgba(46, 211, 198, 0.16), transparent 55%),
-    radial-gradient(700px 420px at 95% 0%, rgba(240, 180, 41, 0.10), transparent 50%),
-    linear-gradient(165deg, #070b10 0%, #0c131b 45%, #0a1016 100%);
+    radial-gradient(900px 480px at 12% -10%, rgba(0, 212, 255, 0.14), transparent 55%),
+    radial-gradient(700px 420px at 95% 0%, rgba(99, 102, 241, 0.10), transparent 50%),
+    linear-gradient(180deg, #06121e 0%, #0a1220 55%, #070d18 100%);
 }
 
 button, input, select {
@@ -37,53 +50,58 @@ button, input, select {
 button {
   cursor: pointer;
   border: 1px solid var(--line);
-  background: var(--bg-elevated);
-  border-radius: 10px;
+  background: rgba(0, 212, 255, 0.04);
+  border-radius: 8px;
   padding: 0.55rem 0.9rem;
-  transition: border-color 0.2s, transform 0.15s, background 0.2s;
+  transition: border-color 0.2s, transform 0.15s, background 0.2s, box-shadow 0.2s;
 }
 button:hover:not(:disabled):not(.active) {
-  border-color: rgba(46, 211, 198, 0.35);
+  border-color: var(--line-strong);
+  background: rgba(0, 212, 255, 0.08);
 }
 button:disabled { opacity: 0.55; cursor: not-allowed; }
 button.primary {
-  background: linear-gradient(120deg, rgba(46, 211, 198, 0.95), rgba(46, 211, 198, 0.55));
-  color: #041016;
+  background: var(--btn-gradient);
+  color: #0f172a;
   border-color: transparent;
   font-weight: 600;
+  box-shadow: 0 8px 20px rgba(56, 189, 248, 0.22);
+}
+button.primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-glow);
 }
 button.active {
   border-color: var(--cyan);
   color: var(--cyan);
-  background: rgba(46, 211, 198, 0.14);
-  box-shadow: inset 0 0 0 1px rgba(46, 211, 198, 0.35);
+  background: rgba(0, 212, 255, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(0, 212, 255, 0.35);
 }
 
 input, select {
   width: 100%;
-  background: rgba(7, 11, 16, 0.55);
+  background: rgba(6, 10, 18, 0.9);
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 0.6rem 0.8rem;
   outline: none;
 }
 input:focus, select:focus {
-  border-color: rgba(46, 211, 198, 0.65);
-  box-shadow: 0 0 0 3px rgba(46, 211, 198, 0.12);
+  border-color: rgba(0, 212, 255, 0.65);
+  box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.12);
 }
 
 .panel {
-  background: linear-gradient(160deg, rgba(22, 32, 43, 0.92), rgba(16, 24, 32, 0.88));
-  border: 1px solid var(--line);
-  border-radius: 18px;
+  background: linear-gradient(160deg, rgba(18, 27, 44, 0.94), rgba(7, 11, 20, 0.9));
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
   box-shadow: var(--shadow);
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(14px);
 }
 
 .muted { color: var(--text-dim); }
 .mono { font-variant-numeric: tabular-nums; }
 
-/* 技術分析全螢幕時鎖住底層捲動 */
 html.warrant-ta-fs,
 html.warrant-ta-fs body {
   overflow: hidden !important;
@@ -102,18 +120,18 @@ html.warrant-ta-fs body {
 }
 .tag.call {
   color: var(--call);
-  background: rgba(255, 107, 107, 0.12);
-  border-color: rgba(255, 107, 107, 0.25);
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.28);
 }
 .tag.put {
   color: var(--put);
-  background: rgba(61, 214, 140, 0.12);
-  border-color: rgba(61, 214, 140, 0.25);
+  background: rgba(74, 222, 128, 0.1);
+  border-color: rgba(74, 222, 128, 0.25);
 }
 .tag.market {
-  color: var(--cyan);
-  background: rgba(46, 211, 198, 0.1);
-  border-color: rgba(46, 211, 198, 0.25);
+  color: var(--cyan-bright);
+  background: rgba(0, 212, 255, 0.1);
+  border-color: rgba(0, 212, 255, 0.25);
 }
 
 .table-wrap {
@@ -128,14 +146,14 @@ table.data {
 table.data th,
 table.data td {
   padding: 0.65rem 0.75rem;
-  border-bottom: 1px solid rgba(148, 183, 205, 0.1);
+  border-bottom: 1px solid rgba(0, 212, 255, 0.08);
   text-align: left;
   white-space: nowrap;
 }
 table.data th {
   position: sticky;
   top: 0;
-  background: #121b24;
+  background: #0d1420;
   color: var(--text-dim);
   font-weight: 500;
   z-index: 1;
@@ -146,6 +164,6 @@ table.data tbody tr {
 }
 table.data tbody tr:hover,
 table.data tbody tr.selected {
-  background: rgba(46, 211, 198, 0.08);
+  background: rgba(0, 212, 255, 0.08);
 }
 table.data td.num { text-align: right; }

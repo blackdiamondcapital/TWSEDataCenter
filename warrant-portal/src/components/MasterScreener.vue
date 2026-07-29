@@ -119,7 +119,7 @@ function onRow(row) {
   gap: 0.85rem;
   margin-top: 0.85rem;
 }
-.days-soon { color: #f0b429; font-weight: 600; }
+.days-soon { color: #38bdf8; font-weight: 600; }
 .days-urgent { color: #ff6b6b; font-weight: 700; }
 .underlying {
   display: flex;

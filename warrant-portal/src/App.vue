@@ -283,9 +283,14 @@ onMounted(async () => {
   <div class="app">
     <header class="hero">
       <div class="hero-copy">
-        <p class="eyebrow">BlackDiamond · Warrant Radar</p>
-        <h1>權證雷達</h1>
-        <p class="lede">篩選全市場發行主檔，並追蹤當日成交熱度與單檔走勢。</p>
+        <div class="brand-row">
+          <img class="brand-mark" src="/quantgems-brand-icon.png" alt="QuantGems" width="40" height="40" />
+          <div>
+            <p class="eyebrow">QuantGems · Warrant Radar</p>
+            <h1>權證雷達</h1>
+          </div>
+        </div>
+        <p class="lede">篩選全市場發行主檔，追蹤當日成交熱度，並以全螢幕技術分析檢視單檔走勢。</p>
       </div>
       <div class="hero-stats" v-if="stats">
         <div class="stat">
@@ -465,26 +470,42 @@ onMounted(async () => {
   animation: rise 0.7s ease both;
 }
 .eyebrow {
-  margin: 0 0 0.35rem;
-  color: var(--cyan);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  margin: 0 0 0.2rem;
+  color: var(--cyan-bright);
+  letter-spacing: 0.06em;
+  text-transform: none;
   font-size: 0.78rem;
   font-weight: 600;
 }
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+}
+.brand-mark {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  box-shadow: 0 0 20px rgba(0, 212, 255, 0.2);
+  flex-shrink: 0;
+}
 .hero h1 {
   margin: 0;
-  font-family: 'Newsreader', Georgia, serif;
-  font-size: clamp(2.4rem, 5vw, 3.4rem);
-  font-weight: 600;
+  font-family: inherit;
+  font-size: clamp(1.85rem, 3.6vw, 2.55rem);
+  font-weight: 800;
   letter-spacing: -0.02em;
+  background: var(--brand-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
   animation: rise 0.85s ease both;
 }
 .lede {
-  margin: 0.55rem 0 0;
+  margin: 0.7rem 0 0;
   color: var(--text-dim);
-  max-width: 34rem;
-  font-size: 1.02rem;
+  max-width: 36rem;
+  font-size: 0.98rem;
 }
 .hero-stats {
   display: grid;
@@ -492,10 +513,16 @@ onMounted(async () => {
   gap: 0.75rem;
 }
 .stat {
-  background: rgba(16, 24, 32, 0.7);
-  border: 1px solid var(--line);
-  border-radius: 14px;
+  background: rgba(7, 11, 20, 0.72);
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
   padding: 0.85rem 1rem;
+  box-shadow: var(--shadow);
+  transition: border-color 0.2s, transform 0.15s;
+}
+.stat:hover {
+  border-color: rgba(0, 212, 255, 0.45);
+  transform: translateY(-1px);
 }
 .stat .label {
   display: block;
