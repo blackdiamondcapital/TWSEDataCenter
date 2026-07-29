@@ -65,7 +65,7 @@ function calcWMA(arr, period) {
 }
 
 /**
- * 多空線（內部 Hull MA）
+ * 多空線（Hull 移動平均）
  * @returns {{ base: (number|null)[], up: (number|null)[], flatDown: (number|null)[] }}
  */
 export function calcDuoKongLine(closes, period = 55) {
