@@ -458,14 +458,14 @@ onMounted(async () => {
 .app {
   width: min(1280px, calc(100% - 2rem));
   margin: 0 auto;
-  padding: 1.5rem 0 3rem;
+  padding: 0.75rem 0 3rem;
 }
 
 .hero {
-  display: grid;
-  grid-template-columns: 1.3fr 1fr;
-  gap: 1.5rem;
-  align-items: end;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1.15rem;
   margin-bottom: 1.25rem;
   animation: rise 0.7s ease both;
 }
@@ -509,7 +509,7 @@ onMounted(async () => {
 }
 .hero-stats {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.75rem;
 }
 .stat {
@@ -598,7 +598,9 @@ onMounted(async () => {
 }
 
 @media (max-width: 980px) {
-  .hero,
+  .hero-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
   .workspace,
   .heat-grid,
   .filters,
