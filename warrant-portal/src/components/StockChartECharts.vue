@@ -256,10 +256,13 @@ function closeUpgradeModal() {
 
 function goToPricing() {
   try {
-    window.dispatchEvent(new CustomEvent('qg:switch-view', { detail: 'pricing' }))
-    window.location.assign('/?view=pricing')
+    window.open('https://www.quantgems.com/?view=pricing', '_blank', 'noopener,noreferrer')
   } catch {
-    // ignore
+    try {
+      window.location.assign('https://www.quantgems.com/?view=pricing')
+    } catch {
+      // ignore
+    }
   }
 }
 

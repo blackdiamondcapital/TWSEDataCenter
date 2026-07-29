@@ -35,8 +35,18 @@ function handleGoogleLogin() {
 }
 
 async function handleLogout() {
+  try {
+    // 登出後關閉技術分析全螢幕
+    if (chartFullscreen.value) {
+      document.exitFullscreen?.().catch?.(() => {})
+      chartFullscreen.value = false
+    }
+  } catch {
+    /* ignore */
+  }
   await logout()
   authStatus.value = '已登出'
+  statusText.value = '已登出，技術分析需重新登入後才能查看'
 }
 
 const stats = ref(null)
@@ -201,6 +211,13 @@ async function loadRankings() {
   }
 }
 
+function requireLoginForChart() {
+  if (isAuthenticated.value) return true
+  authStatus.value = '技術分析需先登入（Google）'
+  statusText.value = '技術分析需先登入後才能查看'
+  return false
+}
+
 async function selectWarrant(row) {
   if (!row?.warrant_code) return
   selected.value = row
@@ -220,7 +237,8 @@ async function selectWarrant(row) {
       issuance: row.issuance,
     }
     await nextTick()
-    // 對齊 quantgems.com：選檔後進入全螢幕技術分析
+    // 技術分析需登入；指標權限比照主站 Pro／Lite
+    if (!requireLoginForChart()) return
     techChartRef.value?.enterFullscreen?.()
   } catch (err) {
     console.error(err)
@@ -235,6 +253,7 @@ function onChartFullscreenChange(active) {
 }
 
 function openTechChart() {
+  if (!requireLoginForChart()) return
   techChartRef.value?.enterFullscreen?.()
 }
 
@@ -512,15 +531,29 @@ onMounted(async () => {
             :error-text="rankingsError"
             @select="selectWarrant"
           />
-          <StockChartECharts
-            ref="techChartRef"
-            class="warrant-stock-chart"
-            :symbol="selected?.warrant_code || ''"
-            :stock-name="selected?.warrant_name || ''"
-            period="1D"
-            :fullscreen-search-enabled="false"
-            @fullscreen-change="onChartFullscreenChange"
-          />
+          <div class="chart-gate">
+            <StockChartECharts
+              v-if="isAuthenticated"
+              ref="techChartRef"
+              class="warrant-stock-chart"
+              :symbol="selected?.warrant_code || ''"
+              :stock-name="selected?.warrant_name || ''"
+              period="1D"
+              :fullscreen-search-enabled="false"
+              @fullscreen-change="onChartFullscreenChange"
+            />
+            <div v-else class="chart-login panel">
+              <h3>技術分析需登入</h3>
+              <p class="muted">登入後可查看權證 K 線與技術指標；神奇 K／階梯線／進階指標權限比照 QuantGems 主站方案。</p>
+              <button type="button" class="primary" @click="handleGoogleLogin">Google 登入</button>
+              <a
+                class="pricing-link"
+                href="https://www.quantgems.com/?view=pricing"
+                target="_blank"
+                rel="noopener noreferrer"
+              >查看方案</a>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -728,9 +761,45 @@ onMounted(async () => {
   gap: 1rem;
   align-items: stretch;
 }
+.chart-gate {
+  min-height: 520px;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
 .warrant-stock-chart {
   min-height: 520px;
   width: 100%;
+  flex: 1;
+}
+.chart-login {
+  flex: 1;
+  min-height: 520px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 0.65rem;
+  padding: 1.4rem 1.35rem;
+}
+.chart-login h3 {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 650;
+}
+.chart-login p {
+  margin: 0;
+  max-width: 34rem;
+  line-height: 1.55;
+  font-size: 0.88rem;
+}
+.chart-login .pricing-link {
+  color: #7dd3fc;
+  font-size: 0.84rem;
+  text-decoration: none;
+}
+.chart-login .pricing-link:hover {
+  text-decoration: underline;
 }
 :global(body.warrant-ta-fs),
 :global(html.warrant-ta-fs) {
