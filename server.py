@@ -9715,26 +9715,80 @@ def warrants_portal_master_search():
                 order_sql = f'ORDER BY warrant_code {direction}'
             elif sort == 'exercise':
                 order_sql = f'ORDER BY latest_exercise_price {direction} {nulls}, warrant_code ASC'
+            elif sort == 'ratio':
+                order_sql = f'ORDER BY latest_exercise_ratio {direction} {nulls}, warrant_code ASC'
             elif sort == 'name':
                 order_sql = f'ORDER BY warrant_name {direction} {nulls}, warrant_code ASC'
             elif sort == 'days':
                 order_sql = f'ORDER BY days_to_expiry {direction} {nulls}, warrant_code ASC'
+            elif sort == 'market':
+                order_sql = f'ORDER BY market {direction}, warrant_code ASC'
+            elif sort == 'type':
+                order_sql = f'ORDER BY warrant_type {direction} {nulls}, warrant_code ASC'
+            elif sort == 'underlying':
+                order_sql = (
+                    f'ORDER BY underlying_code {direction} {nulls}, '
+                    f'underlying_name {direction} {nulls}, warrant_code ASC'
+                )
+            elif sort == 'close':
+                # 以最新收盤價排序（TWSE / TPEX 取較新交易日價）
+                order_sql = f'ORDER BY close_price {direction} {nulls}, warrant_code ASC'
             else:
                 order_sql = f'ORDER BY expiry_date {direction} {nulls}, warrant_code ASC'
 
             cur.execute(f'SELECT COUNT(*) AS cnt FROM ({base}) c', params)
             total = int((cur.fetchone() or {}).get('cnt') or 0)
 
-            cur.execute(
-                f'SELECT * FROM ({base}) m {order_sql} LIMIT %s OFFSET %s',
-                params + [page_size, offset],
-            )
-            rows = cur.fetchall() or []
+            if sort == 'close':
+                list_sql = f"""
+                    SELECT m.*,
+                           COALESCE(twpx.close_price, tppx.close_price) AS close_price,
+                           COALESCE(twpx.trade_date, tppx.trade_date) AS _px_trade_date,
+                           COALESCE(twpx.turnover, tppx.trade_value) AS turnover,
+                           COALESCE(twpx.volume, tppx.trade_volume) AS volume
+                    FROM ({base}) m
+                    LEFT JOIN (
+                        SELECT DISTINCT ON (warrant_code)
+                            warrant_code, trade_date, close_price, turnover, volume
+                        FROM tw_warrant_trade
+                        ORDER BY warrant_code, trade_date DESC
+                    ) twpx ON twpx.warrant_code = m.warrant_code
+                    LEFT JOIN (
+                        SELECT DISTINCT ON (warrant_code)
+                            warrant_code, trade_date, close_price, trade_value, trade_volume
+                        FROM tpex_warrant_daily_quotes
+                        ORDER BY warrant_code, trade_date DESC
+                    ) tppx ON tppx.warrant_code = m.warrant_code
+                    {order_sql}
+                    LIMIT %s OFFSET %s
+                """
+                cur.execute(list_sql, params + [page_size, offset])
+                rows = cur.fetchall() or []
+                # 已含 close，略過後續補價仍可覆蓋一致性
+            else:
+                cur.execute(
+                    f'SELECT * FROM ({base}) m {order_sql} LIMIT %s OFFSET %s',
+                    params + [page_size, offset],
+                )
+                rows = cur.fetchall() or []
 
             # 補上最近一筆收盤價（TWSE trade / TPEX daily）
             price_map: dict[str, dict] = {}
+            # 若已依 close 排序並帶出價格，先填入
+            if sort == 'close':
+                for r in rows:
+                    code = r.get('warrant_code')
+                    if not code:
+                        continue
+                    price_map[code] = {
+                        'latest_trade_date': _warrant_row_date(r.get('_px_trade_date')),
+                        'close_price': _warrant_row_num(r.get('close_price')),
+                        'turnover': _warrant_row_num(r.get('turnover')),
+                        'volume': _warrant_row_int(r.get('volume')),
+                    }
+
             codes = [r.get('warrant_code') for r in rows if r.get('warrant_code')]
-            if codes:
+            if codes and sort != 'close':
                 cur.execute(
                     """
                     SELECT DISTINCT ON (warrant_code)

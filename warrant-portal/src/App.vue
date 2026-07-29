@@ -247,6 +247,11 @@ function onPage(p) {
   loadMaster()
 }
 
+function onMasterSort({ sort, sortDir }) {
+  filters.sort = sort
+  filters.sortDir = sortDir
+}
+
 async function onImportLatest() {
   importing.value = true
   statusText.value = '正在同步上市 MI_INDEX 與上櫃日行情…'
@@ -352,8 +357,13 @@ onMounted(async () => {
             <option value="expiry">到期日</option>
             <option value="days">到期天數</option>
             <option value="exercise">履約價</option>
+            <option value="ratio">行使比</option>
+            <option value="close">收盤</option>
             <option value="code">代號</option>
             <option value="name">名稱</option>
+            <option value="market">市場</option>
+            <option value="type">類型</option>
+            <option value="underlying">標的</option>
           </select>
         </div>
         <div>
@@ -383,8 +393,11 @@ onMounted(async () => {
           :page-size="filters.pageSize"
           :loading="loadingMaster"
           :selected-code="selected?.warrant_code || ''"
+          :sort="filters.sort"
+          :sort-dir="filters.sortDir"
           @select="selectWarrant"
           @page="onPage"
+          @sort="onMasterSort"
         />
 
         <div class="heat-controls panel">

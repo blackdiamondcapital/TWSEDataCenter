@@ -8,9 +8,24 @@ const props = defineProps({
   pageSize: { type: Number, default: 50 },
   loading: { type: Boolean, default: false },
   selectedCode: { type: String, default: '' },
+  sort: { type: String, default: 'expiry' },
+  sortDir: { type: String, default: 'asc' },
 })
 
-const emit = defineEmits(['select', 'page'])
+const emit = defineEmits(['select', 'page', 'sort'])
+
+const columns = [
+  { key: 'market', label: '市場' },
+  { key: 'code', label: '代號' },
+  { key: 'name', label: '名稱' },
+  { key: 'type', label: '類型' },
+  { key: 'underlying', label: '標的' },
+  { key: 'close', label: '收盤', align: 'num' },
+  { key: 'exercise', label: '履約價', align: 'num' },
+  { key: 'ratio', label: '行使比', align: 'num' },
+  { key: 'expiry', label: '到期日' },
+  { key: 'days', label: '到期天數', align: 'num' },
+]
 
 const pageCount = computed(() => Math.max(1, Math.ceil((props.total || 0) / props.pageSize)))
 
@@ -29,6 +44,19 @@ function daysClass(days) {
 function onRow(row) {
   emit('select', row)
 }
+
+function sortIndicator(key) {
+  if (props.sort !== key) return ''
+  return props.sortDir === 'desc' ? '↓' : '↑'
+}
+
+function onSort(key) {
+  if (props.sort === key) {
+    emit('sort', { sort: key, sortDir: props.sortDir === 'asc' ? 'desc' : 'asc' })
+  } else {
+    emit('sort', { sort: key, sortDir: 'asc' })
+  }
+}
 </script>
 
 <template>
@@ -44,16 +72,16 @@ function onRow(row) {
       <table class="data">
         <thead>
           <tr>
-            <th>市場</th>
-            <th>代號</th>
-            <th>名稱</th>
-            <th>類型</th>
-            <th>標的</th>
-            <th>收盤</th>
-            <th>履約價</th>
-            <th>行使比</th>
-            <th>到期日</th>
-            <th>到期天數</th>
+            <th
+              v-for="col in columns"
+              :key="col.key"
+              class="sortable"
+              :class="[{ active: sort === col.key }, col.align]"
+              @click="onSort(col.key)"
+            >
+              <span class="th-label">{{ col.label }}</span>
+              <span class="th-ind" :class="{ on: sort === col.key }">{{ sortIndicator(col.key) || '↕' }}</span>
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -131,4 +159,27 @@ function onRow(row) {
   font-size: 0.78rem;
   opacity: 0.75;
 }
+
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s, background 0.15s;
+}
+th.sortable:hover {
+  color: var(--cyan-bright, #38bdf8);
+  background: rgba(0, 212, 255, 0.06);
+}
+th.sortable.active {
+  color: var(--cyan-bright, #38bdf8);
+}
+th.sortable.num {
+  text-align: right;
+}
+.th-label { margin-right: 0.25rem; }
+.th-ind {
+  font-size: 0.72rem;
+  opacity: 0.35;
+  font-weight: 600;
+}
+.th-ind.on { opacity: 1; }
 </style>
