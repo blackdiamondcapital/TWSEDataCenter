@@ -233,6 +233,14 @@ function onChartFullscreenChange(active) {
   chartFullscreen.value = !!active
 }
 
+function openTechChart() {
+  techChartRef.value?.enterFullscreen?.()
+}
+
+function closeDetail() {
+  detail.value = null
+}
+
 function onSearch() {
   filters.page = 1
   loadMaster()
@@ -433,6 +441,25 @@ onMounted(async () => {
           @sort="onMasterSort"
         />
 
+        <Teleport to="body">
+          <WarrantDetail
+            v-if="chartFullscreen && (detail || loadingDetail)"
+            :detail="detail"
+            :loading="loadingDetail"
+            overlay
+            @close="closeDetail"
+            @open-chart="openTechChart"
+          />
+        </Teleport>
+
+        <WarrantDetail
+          v-if="!chartFullscreen && (detail || loadingDetail)"
+          :detail="detail"
+          :loading="loadingDetail"
+          @close="closeDetail"
+          @open-chart="openTechChart"
+        />
+
         <div class="heat-controls panel">
           <div>
             <label>熱度日期</label>
@@ -486,14 +513,6 @@ onMounted(async () => {
             @fullscreen-change="onChartFullscreenChange"
           />
         </div>
-      </div>
-
-      <div class="col-side">
-        <WarrantDetail
-          :detail="detail"
-          :loading="loadingDetail"
-          @close="detail = null"
-        />
       </div>
     </div>
   </div>
@@ -676,7 +695,7 @@ onMounted(async () => {
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
   align-items: start;
 }
@@ -724,6 +743,5 @@ onMounted(async () => {
   .heat-controls {
     grid-template-columns: 1fr;
   }
-  .col-side { order: -1; }
 }
 </style>
