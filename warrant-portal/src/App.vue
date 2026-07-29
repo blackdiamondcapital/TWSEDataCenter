@@ -11,7 +11,7 @@ import {
 } from './api'
 import MasterScreener from './components/MasterScreener.vue'
 import RankingPanel from './components/RankingPanel.vue'
-import WarrantChart from './components/WarrantChart.vue'
+import WarrantTechChart from './components/WarrantTechChart.vue'
 import WarrantDetail from './components/WarrantDetail.vue'
 
 const stats = ref(null)
@@ -47,6 +47,7 @@ const detail = ref(null)
 const loadingDetail = ref(false)
 const timeseries = ref([])
 const loadingSeries = ref(false)
+const chartPeriodDays = ref(120)
 
 async function loadStats() {
   try {
@@ -185,7 +186,7 @@ async function selectWarrant(row) {
   try {
     const [detailResp, seriesResp] = await Promise.all([
       fetchMasterDetail(row.warrant_code).catch(() => null),
-      fetchTimeseries({ code: row.warrant_code, limitDays: 90 }),
+      fetchTimeseries({ code: row.warrant_code, limitDays: chartPeriodDays.value }),
     ])
     detail.value = detailResp?.data || {
       market: row.market,
@@ -205,6 +206,24 @@ async function selectWarrant(row) {
     statusText.value = `載入詳情失敗：${err.message}`
   } finally {
     loadingDetail.value = false
+    loadingSeries.value = false
+  }
+}
+
+async function onChartPeriodDays(days) {
+  chartPeriodDays.value = days
+  if (!selected.value?.warrant_code) return
+  loadingSeries.value = true
+  try {
+    const seriesResp = await fetchTimeseries({
+      code: selected.value.warrant_code,
+      limitDays: days,
+    })
+    timeseries.value = seriesResp.data || []
+  } catch (err) {
+    console.error(err)
+    statusText.value = `載入走勢失敗：${err.message}`
+  } finally {
     loadingSeries.value = false
   }
 }
@@ -397,11 +416,13 @@ onMounted(async () => {
             :error-text="rankingsError"
             @select="selectWarrant"
           />
-          <WarrantChart
+          <WarrantTechChart
             :code="selected?.warrant_code || ''"
             :name="selected?.warrant_name || ''"
             :series="timeseries"
             :loading="loadingSeries"
+            :period-days="chartPeriodDays"
+            @update:period-days="onChartPeriodDays"
           />
         </div>
       </div>
