@@ -9980,6 +9980,10 @@ def warrants_portal_master_detail(code: str):
 
         detail['market'] = market
         detail['recent_trades'] = recent
+        # 統一發行日：上櫃 listed_date；上市以履約開始日作為發行／上市參考日
+        issue_date = detail.get('listed_date') or detail.get('exercise_start_date')
+        if issue_date:
+            detail['issue_date'] = issue_date
         if recent:
             detail['latest_close_price'] = recent[0].get('close_price')
             detail['latest_trade_date'] = recent[0].get('trade_date')

@@ -34,6 +34,7 @@ const fields = computed(() => {
     ['履約價', d.latest_exercise_price],
     ['行使比例', d.latest_exercise_ratio],
     ['發行量', d.issuance_units_thousand ?? d.accumulated_issuance ?? d.issuance],
+    ['發行日', d.issue_date || d.listed_date || d.exercise_start_date],
     ['最後交易日', d.last_trade_date],
     ['到期日', d.expiry_date],
     ['到期天數', days],
