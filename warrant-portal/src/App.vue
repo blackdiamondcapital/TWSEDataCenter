@@ -19,6 +19,7 @@ const {
   isAuthenticated,
   displayName,
   planLabel,
+  isAdmin,
   user,
   setToken,
   fetchCurrentUser,
@@ -257,6 +258,10 @@ function onMasterSort({ sort, sortDir }) {
 }
 
 async function onImportLatest() {
+  if (!isAdmin.value) {
+    statusText.value = '同步最新成交僅限管理員'
+    return
+  }
   importing.value = true
   statusText.value = '正在同步上市 MI_INDEX 與上櫃日行情…'
   try {
@@ -417,7 +422,11 @@ onMounted(async () => {
       </div>
       <div class="actions">
         <button class="primary" @click="onSearch">搜尋主檔</button>
-        <button :disabled="importing" @click="onImportLatest">
+        <button
+          v-if="isAdmin"
+          :disabled="importing"
+          @click="onImportLatest"
+        >
           {{ importing ? '同步中…' : '同步最新成交' }}
         </button>
       </div>

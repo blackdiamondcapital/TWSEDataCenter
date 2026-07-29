@@ -55,6 +55,13 @@ const planLabel = computed(() => {
   return 'Free'
 })
 
+/** 與主站一致：role === 'admin' 才是管理員 */
+const isAdmin = computed(() => {
+  const u = user.value
+  if (!u || typeof u !== 'object') return false
+  return String(u.role ?? '').trim().toLowerCase() === 'admin'
+})
+
 function setToken(newToken) {
   token.value = newToken || null
   if (newToken) localStorage.setItem(TOKEN_KEY, newToken)
@@ -150,6 +157,7 @@ export function useAuth() {
     isAuthenticated,
     displayName,
     planLabel,
+    isAdmin,
     setToken,
     setUser,
     getAuthHeaders,

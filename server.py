@@ -8760,12 +8760,78 @@ twse_warrant_master_import_status = {
 }
 
 
+def _quantgems_auth_api_base() -> str:
+    """主站後端 API base（用於驗證 JWT／角色）。"""
+    for key in ('QUANTGEMS_AUTH_API_BASE', 'QUANTGEMS_BACKEND_URL', 'VITE_BACKEND_URL'):
+        raw = (os.environ.get(key) or '').strip().rstrip('/')
+        if not raw:
+            continue
+        if raw.endswith('/api'):
+            return raw
+        return f'{raw}/api'
+    return 'https://taiwan-stock-returns-quantgems-vue-vercel.onrender.com/api'
+
+
+def _bearer_token_from_request() -> str:
+    auth = request.headers.get('Authorization') or ''
+    if auth.lower().startswith('bearer '):
+        return auth[7:].strip()
+    return (request.headers.get('X-Admin-Token') or '').strip()
+
+
+def _require_quantgems_admin():
+    """權證寫入類操作：需 QuantGems role=admin（或 ADMIN_API_TOKEN）。
+
+    Returns:
+        None if authorized; otherwise (response, status_code).
+    """
+    import secrets as _secrets
+
+    provided = _bearer_token_from_request()
+    admin_token = (os.environ.get('ADMIN_API_TOKEN') or '').strip()
+    if admin_token and provided and _secrets.compare_digest(provided, admin_token):
+        return None
+
+    if not provided:
+        return jsonify({'success': False, 'error': '請先以管理員帳號登入'}), 401
+
+    me_url = f'{_quantgems_auth_api_base()}/auth/me'
+    try:
+        resp = requests.get(
+            me_url,
+            headers={'Authorization': f'Bearer {provided}'},
+            timeout=12,
+        )
+    except Exception as e:
+        logger.exception('驗證管理員身分失敗（連線）')
+        return jsonify({'success': False, 'error': f'無法驗證登入狀態：{e}'}), 503
+
+    if resp.status_code == 401:
+        return jsonify({'success': False, 'error': '登入已失效，請重新登入'}), 401
+    if resp.status_code >= 400:
+        return jsonify({'success': False, 'error': '驗證登入狀態失敗'}), 403
+
+    try:
+        payload = resp.json() if resp.content else {}
+    except Exception:
+        payload = {}
+    user = (payload.get('data') or {}).get('user') or payload.get('user') or {}
+    role = str(user.get('role') or '').strip().lower()
+    if role != 'admin':
+        return jsonify({'success': False, 'error': '同步最新成交僅限管理員'}), 403
+    return None
+
+
 @app.route('/api/warrants/import-latest', methods=['POST'])
 def import_latest_warrants():
     """同步最新權證成交：上市用 MI_INDEX（OHLC＋成交金額／張數），上櫃用 TPEX 日行情。
 
-    不再依賴較慢更新的 openapi t187ap42_L。
+    不再依賴較慢更新的 openapi t187ap42_L。僅管理員可呼叫。
     """
+    denied = _require_quantgems_admin()
+    if denied is not None:
+        return denied
+
     try:
         global warrants_import_status, tpex_warrant_daily_import_status
         warrants_import_status = {

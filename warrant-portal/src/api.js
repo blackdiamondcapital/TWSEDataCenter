@@ -67,11 +67,22 @@ export async function fetchTimeseries({ code, limitDays = 90, start, end } = {})
 
 export async function importLatestWarrants() {
   try {
-    return unwrap(await api.post('/warrants/import-latest'), '匯入失敗')
+    let authHeader = {}
+    try {
+      const token = localStorage.getItem('quantgem_auth_token')
+      if (token) authHeader = { Authorization: `Bearer ${token}` }
+    } catch {
+      /* ignore */
+    }
+    return unwrap(
+      await api.post('/warrants/import-latest', null, { headers: authHeader }),
+      '匯入失敗',
+    )
   } catch (err) {
     const status = err?.response?.status
     const data = err?.response?.data
     if (status === 409 && data?.inProgress) return data
-    throw err
+    const msg = data?.error || data?.message || err.message
+    throw new Error(msg || '匯入失敗')
   }
 }
