@@ -20,7 +20,10 @@ const props = defineProps({
   periodDays: { type: Number, default: 120 },
 })
 
-const emit = defineEmits(['update:periodDays'])
+const emit = defineEmits(['update:periodDays', 'fullscreen-change'])
+
+const rootRef = ref(null)
+const isFullscreen = ref(false)
 
 const LS = {
   k: 'warrantChartShowK',
@@ -120,6 +123,7 @@ const ohlcCount = computed(
 )
 
 const chartHeight = computed(() => {
+  if (isFullscreen.value) return '100%'
   const n =
     (showVolume.value ? 1 : 0) +
     (showDuoKongTrend.value ? 1 : 0) +
@@ -128,6 +132,95 @@ const chartHeight = computed(() => {
     (showMACD.value ? 1 : 0)
   return `${Math.max(360, 320 + n * 88)}px`
 })
+
+function applyCssFullscreen(el) {
+  if (!el) return
+  el.style.position = 'fixed'
+  el.style.inset = '0'
+  el.style.width = '100vw'
+  el.style.height = '100svh'
+  el.style.zIndex = '9999'
+  el.style.margin = '0'
+  el.style.borderRadius = '0'
+  el.style.border = 'none'
+  el.style.background = '#0b1220'
+  document.documentElement.classList.add('warrant-ta-fs')
+  document.body.classList.add('warrant-ta-fs')
+}
+
+function clearCssFullscreen(el) {
+  if (!el) return
+  el.style.position = ''
+  el.style.inset = ''
+  el.style.width = ''
+  el.style.height = ''
+  el.style.zIndex = ''
+  el.style.margin = ''
+  el.style.borderRadius = ''
+  el.style.border = ''
+  el.style.background = ''
+  document.documentElement.classList.remove('warrant-ta-fs')
+  document.body.classList.remove('warrant-ta-fs')
+}
+
+function enterFullscreen() {
+  if (isFullscreen.value) return
+  isFullscreen.value = true
+  applyCssFullscreen(rootRef.value)
+  emit('fullscreen-change', true)
+  requestAnimationFrame(() => {
+    chartInstance?.resize()
+    renderChart()
+    try {
+      rootRef.value?.requestFullscreen?.()
+    } catch (_) {
+      /* CSS fullscreen is enough */
+    }
+  })
+}
+
+function exitFullscreen() {
+  if (!isFullscreen.value) return
+  isFullscreen.value = false
+  clearCssFullscreen(rootRef.value)
+  emit('fullscreen-change', false)
+  try {
+    if (document.fullscreenElement) document.exitFullscreen?.()
+  } catch (_) {
+    /* ignore */
+  }
+  requestAnimationFrame(() => {
+    chartInstance?.resize()
+    renderChart()
+  })
+}
+
+function toggleFullscreen() {
+  if (isFullscreen.value) exitFullscreen()
+  else enterFullscreen()
+}
+
+function onKeydown(e) {
+  if (e.key === 'Escape' && isFullscreen.value) {
+    e.preventDefault()
+    exitFullscreen()
+  }
+}
+
+function onNativeFsChange() {
+  // 使用者按 Esc／瀏覽器退出原生全螢幕時，同步關閉 CSS 覆蓋
+  if (!document.fullscreenElement && isFullscreen.value) {
+    isFullscreen.value = false
+    clearCssFullscreen(rootRef.value)
+    emit('fullscreen-change', false)
+    requestAnimationFrame(() => {
+      chartInstance?.resize()
+      renderChart()
+    })
+  }
+}
+
+defineExpose({ enterFullscreen, exitFullscreen, toggleFullscreen, isFullscreen })
 
 function disposeChart() {
   if (chartInstance) {
@@ -548,10 +641,15 @@ function handleResize() {
 onMounted(() => {
   renderChart()
   window.addEventListener('resize', handleResize)
+  window.addEventListener('keydown', onKeydown)
+  document.addEventListener('fullscreenchange', onNativeFsChange)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  window.removeEventListener('keydown', onKeydown)
+  document.removeEventListener('fullscreenchange', onNativeFsChange)
+  clearCssFullscreen(rootRef.value)
   disposeChart()
 })
 
@@ -568,6 +666,7 @@ watch(
     showKD.value,
     showRSI.value,
     showMACD.value,
+    isFullscreen.value,
   ],
   () => renderChart(),
   { deep: true },
@@ -575,21 +674,31 @@ watch(
 </script>
 
 <template>
-  <div class="tech panel">
+  <div ref="rootRef" class="tech panel" :class="{ 'is-fullscreen': isFullscreen }">
     <div class="head">
       <div class="title-row">
         <h2>技術分析</h2>
         <span class="muted" v-if="code">{{ code }} · {{ name || '' }}</span>
       </div>
-      <div class="periods">
+      <div class="head-actions">
+        <div class="periods">
+          <button
+            v-for="p in periods"
+            :key="p.days"
+            type="button"
+            :class="{ active: periodDays === p.days }"
+            @click="setPeriod(p.days)"
+          >
+            {{ p.label }}
+          </button>
+        </div>
         <button
-          v-for="p in periods"
-          :key="p.days"
           type="button"
-          :class="{ active: periodDays === p.days }"
-          @click="setPeriod(p.days)"
+          class="fs-btn"
+          :title="isFullscreen ? '退出全螢幕' : '全螢幕'"
+          @click="toggleFullscreen"
         >
-          {{ p.label }}
+          {{ isFullscreen ? '退出全螢幕' : '全螢幕' }}
         </button>
       </div>
     </div>
@@ -609,7 +718,9 @@ watch(
       此檔暫無完整 OHLC，改以收盤價線顯示；可切換較長期間或同步最新成交。
     </p>
 
-    <div ref="chartRef" class="chart-box" :style="{ height: chartHeight }"></div>
+    <div class="chart-stage">
+      <div ref="chartRef" class="chart-box" :style="{ height: chartHeight }"></div>
+    </div>
 
     <div class="signals">
       <div class="signals-head">訊號列</div>
@@ -632,6 +743,12 @@ watch(
 .tech {
   padding: 1rem 1.1rem 1.1rem;
 }
+.tech.is-fullscreen {
+  display: flex;
+  flex-direction: column;
+  padding: 0.75rem 1rem 1rem;
+  overflow: auto;
+}
 .head {
   display: flex;
   flex-wrap: wrap;
@@ -639,6 +756,13 @@ watch(
   justify-content: space-between;
   gap: 0.75rem;
   margin-bottom: 0.55rem;
+  flex-shrink: 0;
+}
+.head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
 }
 .title-row {
   display: flex;
@@ -658,7 +782,8 @@ watch(
   display: flex;
   gap: 0.35rem;
 }
-.periods button {
+.periods button,
+.fs-btn {
   border: 1px solid rgba(148, 183, 205, 0.28);
   background: rgba(12, 22, 30, 0.55);
   color: #c5d4de;
@@ -667,9 +792,13 @@ watch(
   font-size: 0.8rem;
   cursor: pointer;
 }
-.periods button.active {
+.periods button.active,
+.fs-btn:hover {
   border-color: #2ed3c6;
   color: #2ed3c6;
+}
+.fs-btn {
+  font-weight: 600;
 }
 .toggles {
   display: flex;
@@ -678,6 +807,7 @@ watch(
   margin-bottom: 0.55rem;
   font-size: 0.82rem;
   color: #c5d4de;
+  flex-shrink: 0;
 }
 .toggles label {
   display: inline-flex;
@@ -690,15 +820,31 @@ watch(
   margin: 0 0 0.5rem;
   font-size: 0.78rem;
   color: #f0b429;
+  flex-shrink: 0;
+}
+.chart-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 .chart-box {
   width: 100%;
   min-height: 360px;
 }
+.is-fullscreen .chart-stage {
+  flex: 1 1 auto;
+}
+.is-fullscreen .chart-box {
+  flex: 1 1 auto;
+  min-height: calc(100svh - 220px);
+  height: calc(100svh - 220px) !important;
+}
 .signals {
   margin-top: 0.75rem;
   border-top: 1px solid rgba(148, 183, 205, 0.14);
   padding-top: 0.65rem;
+  flex-shrink: 0;
 }
 .signals-head {
   font-size: 0.82rem;

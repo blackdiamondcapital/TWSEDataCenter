@@ -83,6 +83,13 @@ input:focus, select:focus {
 .muted { color: var(--text-dim); }
 .mono { font-variant-numeric: tabular-nums; }
 
+/* 技術分析全螢幕時鎖住底層捲動 */
+html.warrant-ta-fs,
+html.warrant-ta-fs body {
+  overflow: hidden !important;
+  overscroll-behavior: none;
+}
+
 .tag {
   display: inline-flex;
   align-items: center;

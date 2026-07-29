@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, onMounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, watch, nextTick } from 'vue'
 import {
   fetchPortalStats,
   fetchMasterSearch,
@@ -48,6 +48,8 @@ const loadingDetail = ref(false)
 const timeseries = ref([])
 const loadingSeries = ref(false)
 const chartPeriodDays = ref(120)
+const techChartRef = ref(null)
+const chartFullscreen = ref(false)
 
 async function loadStats() {
   try {
@@ -201,6 +203,9 @@ async function selectWarrant(row) {
       issuance: row.issuance,
     }
     timeseries.value = seriesResp.data || []
+    await nextTick()
+    // 對齊 quantgems.com：選檔後進入全螢幕技術分析
+    techChartRef.value?.enterFullscreen?.()
   } catch (err) {
     console.error(err)
     statusText.value = `載入詳情失敗：${err.message}`
@@ -208,6 +213,10 @@ async function selectWarrant(row) {
     loadingDetail.value = false
     loadingSeries.value = false
   }
+}
+
+function onChartFullscreenChange(active) {
+  chartFullscreen.value = !!active
 }
 
 async function onChartPeriodDays(days) {
@@ -417,12 +426,14 @@ onMounted(async () => {
             @select="selectWarrant"
           />
           <WarrantTechChart
+            ref="techChartRef"
             :code="selected?.warrant_code || ''"
             :name="selected?.warrant_name || ''"
             :series="timeseries"
             :loading="loadingSeries"
             :period-days="chartPeriodDays"
             @update:period-days="onChartPeriodDays"
+            @fullscreen-change="onChartFullscreenChange"
           />
         </div>
       </div>
