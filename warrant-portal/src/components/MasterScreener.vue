@@ -165,23 +165,35 @@ function onSort(key) {
 th.sortable {
   cursor: pointer;
   user-select: none;
-  transition: color 0.15s, background 0.15s;
+  color: #e8f4ff;
+  transition: color 0.15s, background 0.15s, box-shadow 0.15s;
 }
 th.sortable:hover {
-  color: var(--cyan-bright, #38bdf8);
-  background: rgba(0, 212, 255, 0.06);
+  color: #7dd3fc;
+  background: rgba(56, 189, 248, 0.16);
 }
 th.sortable.active {
-  color: var(--cyan-bright, #38bdf8);
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.14);
+  box-shadow: inset 0 -2px 0 #38bdf8;
 }
 th.sortable.num {
   text-align: right;
 }
-.th-label { margin-right: 0.25rem; }
-.th-ind {
-  font-size: 0.72rem;
-  opacity: 0.35;
-  font-weight: 600;
+.th-label {
+  margin-right: 0.28rem;
+  font-weight: 650;
 }
-.th-ind.on { opacity: 1; }
+.th-ind {
+  display: inline-block;
+  min-width: 0.9em;
+  font-size: 0.78rem;
+  color: #9ec9e8;
+  opacity: 0.85;
+  font-weight: 700;
+}
+.th-ind.on {
+  color: #7dd3fc;
+  opacity: 1;
+}
 </style>
