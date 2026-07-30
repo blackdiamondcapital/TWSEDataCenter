@@ -14,6 +14,7 @@ import MasterScreener from './components/MasterScreener.vue'
 import RankingPanel from './components/RankingPanel.vue'
 import StockChartECharts from './components/StockChartECharts.vue'
 import WarrantDetail from './components/WarrantDetail.vue'
+import PwaInstallPrompt from './components/PwaInstallPrompt.vue'
 
 const {
   isAuthenticated,
@@ -325,6 +326,7 @@ onMounted(async () => {
 
 <template>
   <div class="app">
+    <PwaInstallPrompt />
     <div class="topbar">
       <a class="home-link" href="https://www.quantgems.com/" target="_blank" rel="noopener">
         QuantGems® 主站
