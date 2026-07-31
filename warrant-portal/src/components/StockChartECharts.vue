@@ -103,6 +103,8 @@ const warrantFsTitle = computed(() => {
   return [d.warrant_code, d.warrant_name].filter(Boolean).join(' · ')
 })
 
+const warrantInfoOpen = ref(false)
+
 const { user } = useAuth()
 
 const CHART_SETTINGS_VERSION = 1
@@ -4804,6 +4806,7 @@ const panelSections = ref({
 
 function toggleControlPanel() {
   controlPanelOpen.value = !controlPanelOpen.value
+  if (controlPanelOpen.value) warrantInfoOpen.value = false
   if (!controlPanelOpen.value) {
     applySheetStage('half')
   } else {
@@ -4815,6 +4818,30 @@ function toggleControlPanel() {
   }
   persistControlPanelOpenState()
 }
+
+function toggleWarrantInfoPanel() {
+  if (!warrantFsChips.value.length) return
+  warrantInfoOpen.value = !warrantInfoOpen.value
+  if (warrantInfoOpen.value) {
+    controlPanelOpen.value = false
+    persistControlPanelOpenState()
+  }
+}
+
+function closeWarrantInfoPanel() {
+  warrantInfoOpen.value = false
+}
+
+watch(isFullscreen, (fs) => {
+  if (!fs) warrantInfoOpen.value = false
+})
+
+watch(
+  () => props.warrantInfo?.warrant_code,
+  () => {
+    warrantInfoOpen.value = false
+  },
+)
 
 watch(() => controlPanelOpen.value, (open) => {
   if (open && showMobileToolbarSearchTrigger.value) {
@@ -12319,6 +12346,17 @@ onUnmounted(() => {
               </ul>
             </Teleport>
 
+            <button
+              v-if="isFullscreen && warrantFsChips.length"
+              type="button"
+              class="action-icon-btn"
+              :class="{ active: warrantInfoOpen }"
+              @click="toggleWarrantInfoPanel"
+              title="權證基本資料"
+              aria-label="權證基本資料"
+            >
+              <i class="fas fa-id-card"></i>
+            </button>
             <button 
               v-show="!controlPanelOpen" 
               class="action-icon-btn" 
@@ -12398,6 +12436,17 @@ onUnmounted(() => {
             <i class="fas fa-download"></i>
           </button>
           
+          <button
+            v-if="isFullscreen && warrantFsChips.length"
+            type="button"
+            class="action-icon-btn"
+            :class="{ active: warrantInfoOpen }"
+            @click="toggleWarrantInfoPanel"
+            title="權證基本資料"
+            aria-label="權證基本資料"
+          >
+            <i class="fas fa-id-card"></i>
+          </button>
           <button 
             v-show="!controlPanelOpen" 
             class="action-icon-btn" 
@@ -12452,24 +12501,42 @@ onUnmounted(() => {
         </div>
       </template>
 
-      <!-- 權證雷達：基本資料必須在全螢幕元素內，否則 Teleport 到 body 會看不到 -->
-      <div
-        v-if="isFullscreen && warrantFsChips.length"
-        class="warrant-fs-info"
+    </div>
+
+    <!-- 權證基本資料：全螢幕內垂直面板（需在 fullscreen 元素內） -->
+    <transition name="panel-fade">
+      <aside
+        v-if="isFullscreen && warrantInfoOpen && warrantFsChips.length"
+        class="warrant-fs-panel"
+        @click.stop
       >
-        <div class="warrant-fs-info__title" v-if="warrantFsTitle">{{ warrantFsTitle }}</div>
-        <div class="warrant-fs-info__chips">
+        <div class="warrant-fs-panel__head">
+          <div class="warrant-fs-panel__titles">
+            <span class="warrant-fs-panel__eyebrow">權證基本資料</span>
+            <strong class="warrant-fs-panel__title">{{ warrantFsTitle || '—' }}</strong>
+          </div>
+          <button
+            type="button"
+            class="warrant-fs-panel__close"
+            title="關閉"
+            aria-label="關閉權證基本資料"
+            @click="closeWarrantInfoPanel"
+          >
+            <i class="fas fa-times"></i>
+          </button>
+        </div>
+        <dl class="warrant-fs-panel__list">
           <div
             v-for="chip in warrantFsChips"
             :key="chip.label"
-            class="warrant-fs-chip"
+            class="warrant-fs-panel__row"
           >
-            <span class="warrant-fs-chip__label">{{ chip.label }}</span>
-            <span class="warrant-fs-chip__value">{{ chip.value }}</span>
+            <dt>{{ chip.label }}</dt>
+            <dd>{{ chip.value }}</dd>
           </div>
-        </div>
-      </div>
-    </div>
+        </dl>
+      </aside>
+    </transition>
 
     <div
       class="chart-wrapper"
@@ -14159,56 +14226,101 @@ onUnmounted(() => {
 
 /* CSS-first fullscreen: applied immediately by applyCssFullscreen().
    Override the transparent background so the overlay is opaque. */
-.warrant-fs-info {
-  width: 100%;
-  margin-top: 0.35rem;
-  padding: 0.4rem 0.55rem 0.45rem;
-  border-radius: 10px;
-  border: 1px solid rgba(0, 212, 255, 0.28);
-  background: rgba(8, 14, 22, 0.72);
+.warrant-fs-panel {
+  position: absolute;
+  top: 4.5rem;
+  right: 0.75rem;
+  z-index: 40;
+  width: min(300px, calc(100vw - 1.5rem));
+  max-height: min(70vh, 520px);
+  overflow: auto;
+  border-radius: 12px;
+  border: 1px solid rgba(0, 212, 255, 0.35);
+  background: rgba(8, 14, 22, 0.96);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(10px);
+  padding: 0.7rem 0.8rem 0.85rem;
+}
+.warrant-fs-panel__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.55rem;
+  margin-bottom: 0.65rem;
+  padding-bottom: 0.55rem;
+  border-bottom: 1px solid rgba(148, 183, 205, 0.16);
+}
+.warrant-fs-panel__titles {
+  min-width: 0;
+  display: grid;
+  gap: 0.15rem;
+}
+.warrant-fs-panel__eyebrow {
+  font-size: 0.72rem;
+  color: #7dd3fc;
+  font-weight: 600;
+}
+.warrant-fs-panel__title {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: #e8f7ff;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.warrant-fs-panel__close {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  border: 1px solid rgba(148, 183, 205, 0.22);
+  border-radius: 8px;
+  background: transparent;
+  color: #c2cce0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.warrant-fs-panel__close:hover {
+  border-color: rgba(0, 212, 255, 0.45);
+  color: #e8f7ff;
+}
+.warrant-fs-panel__list {
+  margin: 0;
   display: grid;
   gap: 0.35rem;
 }
-.warrant-fs-info__title {
-  font-size: 0.86rem;
-  font-weight: 700;
-  color: #e8f7ff;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.warrant-fs-info__chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem;
-}
-.warrant-fs-chip {
-  display: inline-flex;
+.warrant-fs-panel__row {
+  display: grid;
+  grid-template-columns: 5.2rem 1fr;
+  gap: 0.45rem;
   align-items: baseline;
-  gap: 0.28rem;
-  padding: 0.18rem 0.45rem;
-  border-radius: 999px;
-  border: 1px solid rgba(148, 183, 205, 0.22);
-  background: rgba(2, 8, 14, 0.45);
-  max-width: 100%;
+  padding: 0.28rem 0.35rem;
+  border-radius: 8px;
+  background: rgba(2, 8, 14, 0.4);
 }
-.warrant-fs-chip__label {
-  font-size: 0.68rem;
+.warrant-fs-panel__row dt {
+  margin: 0;
+  font-size: 0.75rem;
   color: #9bb0c0;
-  flex-shrink: 0;
 }
-.warrant-fs-chip__value {
-  font-size: 0.78rem;
+.warrant-fs-panel__row dd {
+  margin: 0;
+  font-size: 0.86rem;
   font-weight: 650;
   color: #eef5f8;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  text-align: right;
+  word-break: break-word;
+}
+.action-icon-btn.active {
+  border-color: rgba(0, 212, 255, 0.65);
+  color: #38bdf8;
+  background: rgba(0, 212, 255, 0.12);
 }
 
 .stock-chart.is-fullscreen {
   background: #0b1220 !important;
+  position: relative;
 }
 
 
