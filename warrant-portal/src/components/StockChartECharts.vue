@@ -41,10 +41,67 @@ const props = defineProps({
   fsHostQuadCell: { type: Boolean, default: false },
   /** 四分割格內圖表：不向上 emit fullscreen-change，避免關閉整層 chart-page */
   fsSuppressHostSync: { type: Boolean, default: false },
+  /** 權證雷達：全螢幕內顯示權證基本資料 */
+  warrantInfo: { type: Object, default: null },
 })
 
 const emit = defineEmits(['search-symbol', 'update:period', 'carousel-prev', 'carousel-next', 'carousel-toggle', 'fullscreen-change', 'requestFsQuad'])
 const { quadLayoutAvailable } = useQuadLayoutAvailable()
+
+function warrantFmtNum(v, digits) {
+  if (v == null || v === '') return null
+  const n = Number(v)
+  if (!Number.isFinite(n)) return String(v)
+  if (digits == null) return n.toLocaleString()
+  return n.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: digits,
+  })
+}
+
+const warrantFsChips = computed(() => {
+  const d = props.warrantInfo
+  if (!d || typeof d !== 'object') return []
+  let days = d.days_to_expiry
+  if (days == null && d.expiry_date) {
+    const t = Date.parse(d.expiry_date)
+    if (Number.isFinite(t)) {
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      days = Math.round((t - today.getTime()) / 86400000)
+    }
+  }
+  const close = d.latest_close_price ?? d.close_price
+  return [
+    { label: '市場', value: d.market || null },
+    { label: '類型', value: d.warrant_type || null },
+    {
+      label: '標的',
+      value: [d.underlying_code, d.underlying_name].filter(Boolean).join(' ') || null,
+    },
+    { label: '收盤', value: warrantFmtNum(close, 2) },
+    { label: '履約價', value: warrantFmtNum(d.latest_exercise_price, 2) },
+    { label: '行使比', value: warrantFmtNum(d.latest_exercise_ratio, 4) },
+    { label: '到期天數', value: days != null ? String(days) : null },
+    { label: '到期日', value: d.expiry_date || null },
+    {
+      label: '發行量',
+      value: warrantFmtNum(
+        d.issuance_units_thousand ?? d.accumulated_issuance ?? d.issuance,
+      ),
+    },
+    {
+      label: '發行日',
+      value: d.issue_date || d.listed_date || d.exercise_start_date || null,
+    },
+  ].filter((c) => c.value != null && c.value !== '')
+})
+
+const warrantFsTitle = computed(() => {
+  const d = props.warrantInfo
+  if (!d) return ''
+  return [d.warrant_code, d.warrant_name].filter(Boolean).join(' · ')
+})
 
 const { user } = useAuth()
 
@@ -12394,6 +12451,24 @@ onUnmounted(() => {
           </div>
         </div>
       </template>
+
+      <!-- 權證雷達：基本資料必須在全螢幕元素內，否則 Teleport 到 body 會看不到 -->
+      <div
+        v-if="isFullscreen && warrantFsChips.length"
+        class="warrant-fs-info"
+      >
+        <div class="warrant-fs-info__title" v-if="warrantFsTitle">{{ warrantFsTitle }}</div>
+        <div class="warrant-fs-info__chips">
+          <div
+            v-for="chip in warrantFsChips"
+            :key="chip.label"
+            class="warrant-fs-chip"
+          >
+            <span class="warrant-fs-chip__label">{{ chip.label }}</span>
+            <span class="warrant-fs-chip__value">{{ chip.value }}</span>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div
@@ -14084,6 +14159,54 @@ onUnmounted(() => {
 
 /* CSS-first fullscreen: applied immediately by applyCssFullscreen().
    Override the transparent background so the overlay is opaque. */
+.warrant-fs-info {
+  width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.4rem 0.55rem 0.45rem;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 212, 255, 0.28);
+  background: rgba(8, 14, 22, 0.72);
+  display: grid;
+  gap: 0.35rem;
+}
+.warrant-fs-info__title {
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: #e8f7ff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.warrant-fs-info__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.warrant-fs-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.28rem;
+  padding: 0.18rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 183, 205, 0.22);
+  background: rgba(2, 8, 14, 0.45);
+  max-width: 100%;
+}
+.warrant-fs-chip__label {
+  font-size: 0.68rem;
+  color: #9bb0c0;
+  flex-shrink: 0;
+}
+.warrant-fs-chip__value {
+  font-size: 0.78rem;
+  font-weight: 650;
+  color: #eef5f8;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .stock-chart.is-fullscreen {
   background: #0b1220 !important;
 }

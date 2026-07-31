@@ -62,14 +62,10 @@ const filters = reactive({
   expiryTo: '',
   closeMin: '',
   closeMax: '',
-  volumeMin: '',
-  volumeMax: '',
   exerciseMin: '',
   exerciseMax: '',
   daysMin: '',
   daysMax: '',
-  ratioMin: '',
-  ratioMax: '',
   sort: 'expiry',
   sortDir: 'asc',
   page: 1,
@@ -128,14 +124,10 @@ async function loadMaster() {
       expiryTo: filters.expiryTo || undefined,
       closeMin: numOrUndef(filters.closeMin),
       closeMax: numOrUndef(filters.closeMax),
-      volumeMin: numOrUndef(filters.volumeMin),
-      volumeMax: numOrUndef(filters.volumeMax),
       exerciseMin: numOrUndef(filters.exerciseMin),
       exerciseMax: numOrUndef(filters.exerciseMax),
       daysMin: numOrUndef(filters.daysMin),
       daysMax: numOrUndef(filters.daysMax),
-      ratioMin: numOrUndef(filters.ratioMin),
-      ratioMax: numOrUndef(filters.ratioMax),
       sort: filters.sort,
       sortDir: filters.sortDir,
       page: filters.page,
@@ -261,7 +253,21 @@ async function selectWarrant(row) {
       latest_exercise_price: row.latest_exercise_price,
       latest_exercise_ratio: row.latest_exercise_ratio,
       expiry_date: row.expiry_date,
+      days_to_expiry: row.days_to_expiry,
       issuance: row.issuance,
+      close_price: row.close_price,
+      latest_close_price: row.close_price,
+      volume: row.volume,
+    }
+    // 主檔列表已有的行情欄位併入詳情，供全螢幕基本資料列顯示
+    if (detail.value && row) {
+      detail.value = {
+        ...detail.value,
+        close_price: detail.value.close_price ?? row.close_price,
+        latest_close_price: detail.value.latest_close_price ?? row.close_price,
+        days_to_expiry: detail.value.days_to_expiry ?? row.days_to_expiry,
+        volume: detail.value.volume ?? row.volume,
+      }
     }
     await nextTick()
     // 技術分析需登入；指標權限比照主站 Pro／Lite
@@ -298,14 +304,10 @@ function clearFundamentalFilters() {
   filters.expiryTo = ''
   filters.closeMin = ''
   filters.closeMax = ''
-  filters.volumeMin = ''
-  filters.volumeMax = ''
   filters.exerciseMin = ''
   filters.exerciseMax = ''
   filters.daysMin = ''
   filters.daysMax = ''
-  filters.ratioMin = ''
-  filters.ratioMax = ''
   filters.page = 1
   loadMaster()
 }
@@ -480,7 +482,7 @@ onMounted(async () => {
       <div class="fund-block">
         <div class="fund-head">
           <h3>基本面條件</h3>
-          <span class="muted">依收盤、成交量、履約價、到期天數、行使比、到期日區間篩選</span>
+          <span class="muted">依收盤、履約價、到期天數、到期日區間篩選</span>
         </div>
         <div class="fund-grid">
           <div class="range-field">
@@ -489,14 +491,6 @@ onMounted(async () => {
               <input v-model="filters.closeMin" type="number" step="any" min="0" placeholder="最低" />
               <span>–</span>
               <input v-model="filters.closeMax" type="number" step="any" min="0" placeholder="最高" />
-            </div>
-          </div>
-          <div class="range-field">
-            <label>成交量</label>
-            <div class="range-inputs">
-              <input v-model="filters.volumeMin" type="number" step="1" min="0" placeholder="最低" />
-              <span>–</span>
-              <input v-model="filters.volumeMax" type="number" step="1" min="0" placeholder="最高" />
             </div>
           </div>
           <div class="range-field">
@@ -513,14 +507,6 @@ onMounted(async () => {
               <input v-model="filters.daysMin" type="number" step="1" min="0" placeholder="最低" />
               <span>–</span>
               <input v-model="filters.daysMax" type="number" step="1" min="0" placeholder="最高" />
-            </div>
-          </div>
-          <div class="range-field">
-            <label>行使比</label>
-            <div class="range-inputs">
-              <input v-model="filters.ratioMin" type="number" step="any" min="0" placeholder="最低" />
-              <span>–</span>
-              <input v-model="filters.ratioMax" type="number" step="any" min="0" placeholder="最高" />
             </div>
           </div>
           <div class="range-field">
@@ -564,17 +550,6 @@ onMounted(async () => {
           @page="onPage"
           @sort="onMasterSort"
         />
-
-        <Teleport to="body">
-          <WarrantDetail
-            v-if="chartFullscreen && (detail || loadingDetail)"
-            :detail="detail"
-            :loading="loadingDetail"
-            overlay
-            @close="closeDetail"
-            @open-chart="openTechChart"
-          />
-        </Teleport>
 
         <WarrantDetail
           v-if="!chartFullscreen && (detail || loadingDetail)"
@@ -634,6 +609,7 @@ onMounted(async () => {
               class="warrant-stock-chart"
               :symbol="selected?.warrant_code || ''"
               :stock-name="selected?.warrant_name || ''"
+              :warrant-info="detail"
               period="1D"
               :fullscreen-search-enabled="false"
               @fullscreen-change="onChartFullscreenChange"
@@ -840,7 +816,7 @@ onMounted(async () => {
 }
 .fund-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.75rem;
 }
 .range-field label {
