@@ -60,6 +60,16 @@ const filters = reactive({
   type: '',
   expiryFrom: '',
   expiryTo: '',
+  closeMin: '',
+  closeMax: '',
+  volumeMin: '',
+  volumeMax: '',
+  exerciseMin: '',
+  exerciseMax: '',
+  daysMin: '',
+  daysMax: '',
+  ratioMin: '',
+  ratioMax: '',
   sort: 'expiry',
   sortDir: 'asc',
   page: 1,
@@ -101,6 +111,12 @@ const latestTradeDate = computed(() => {
   return a || b || '—'
 })
 
+function numOrUndef(v) {
+  if (v === '' || v == null) return undefined
+  const n = Number(v)
+  return Number.isFinite(n) ? n : undefined
+}
+
 async function loadMaster() {
   loadingMaster.value = true
   try {
@@ -110,6 +126,16 @@ async function loadMaster() {
       type: filters.type || undefined,
       expiryFrom: filters.expiryFrom || undefined,
       expiryTo: filters.expiryTo || undefined,
+      closeMin: numOrUndef(filters.closeMin),
+      closeMax: numOrUndef(filters.closeMax),
+      volumeMin: numOrUndef(filters.volumeMin),
+      volumeMax: numOrUndef(filters.volumeMax),
+      exerciseMin: numOrUndef(filters.exerciseMin),
+      exerciseMax: numOrUndef(filters.exerciseMax),
+      daysMin: numOrUndef(filters.daysMin),
+      daysMax: numOrUndef(filters.daysMax),
+      ratioMin: numOrUndef(filters.ratioMin),
+      ratioMax: numOrUndef(filters.ratioMax),
       sort: filters.sort,
       sortDir: filters.sortDir,
       page: filters.page,
@@ -267,6 +293,23 @@ function onSearch() {
   loadMaster()
 }
 
+function clearFundamentalFilters() {
+  filters.expiryFrom = ''
+  filters.expiryTo = ''
+  filters.closeMin = ''
+  filters.closeMax = ''
+  filters.volumeMin = ''
+  filters.volumeMax = ''
+  filters.exerciseMin = ''
+  filters.exerciseMax = ''
+  filters.daysMin = ''
+  filters.daysMax = ''
+  filters.ratioMin = ''
+  filters.ratioMax = ''
+  filters.page = 1
+  loadMaster()
+}
+
 function onPage(p) {
   filters.page = p
   loadMaster()
@@ -410,14 +453,6 @@ onMounted(async () => {
           </select>
         </div>
         <div>
-          <label>到期起</label>
-          <input type="date" v-model="filters.expiryFrom" />
-        </div>
-        <div>
-          <label>到期迄</label>
-          <input type="date" v-model="filters.expiryTo" />
-        </div>
-        <div>
           <label>排序</label>
           <select v-model="filters.sort">
             <option value="expiry">到期日</option>
@@ -441,8 +476,67 @@ onMounted(async () => {
           </select>
         </div>
       </div>
+
+      <div class="fund-block">
+        <div class="fund-head">
+          <h3>基本面條件</h3>
+          <span class="muted">依收盤、成交量、履約價、到期天數、行使比、到期日區間篩選</span>
+        </div>
+        <div class="fund-grid">
+          <div class="range-field">
+            <label>收盤</label>
+            <div class="range-inputs">
+              <input v-model="filters.closeMin" type="number" step="any" min="0" placeholder="最低" />
+              <span>–</span>
+              <input v-model="filters.closeMax" type="number" step="any" min="0" placeholder="最高" />
+            </div>
+          </div>
+          <div class="range-field">
+            <label>成交量</label>
+            <div class="range-inputs">
+              <input v-model="filters.volumeMin" type="number" step="1" min="0" placeholder="最低" />
+              <span>–</span>
+              <input v-model="filters.volumeMax" type="number" step="1" min="0" placeholder="最高" />
+            </div>
+          </div>
+          <div class="range-field">
+            <label>履約價</label>
+            <div class="range-inputs">
+              <input v-model="filters.exerciseMin" type="number" step="any" min="0" placeholder="最低" />
+              <span>–</span>
+              <input v-model="filters.exerciseMax" type="number" step="any" min="0" placeholder="最高" />
+            </div>
+          </div>
+          <div class="range-field">
+            <label>到期天數</label>
+            <div class="range-inputs">
+              <input v-model="filters.daysMin" type="number" step="1" min="0" placeholder="最低" />
+              <span>–</span>
+              <input v-model="filters.daysMax" type="number" step="1" min="0" placeholder="最高" />
+            </div>
+          </div>
+          <div class="range-field">
+            <label>行使比</label>
+            <div class="range-inputs">
+              <input v-model="filters.ratioMin" type="number" step="any" min="0" placeholder="最低" />
+              <span>–</span>
+              <input v-model="filters.ratioMax" type="number" step="any" min="0" placeholder="最高" />
+            </div>
+          </div>
+          <div class="range-field">
+            <label>到期日</label>
+            <div class="range-inputs">
+              <input v-model="filters.expiryFrom" type="date" />
+              <span>–</span>
+              <input v-model="filters.expiryTo" type="date" />
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="actions">
         <button class="primary" @click="onSearch">搜尋主檔</button>
+        <button type="button" @click="clearFundamentalFilters">清除基本面條件</button>
         <button
           v-if="isAdmin"
           :disabled="importing"
@@ -723,8 +817,51 @@ onMounted(async () => {
 }
 .filters {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.75rem;
+}
+.fund-block {
+  border-top: 1px solid rgba(148, 183, 205, 0.14);
+  padding-top: 0.85rem;
+  display: grid;
+  gap: 0.65rem;
+}
+.fund-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.55rem 0.85rem;
+}
+.fund-head h3 {
+  margin: 0;
+  font-size: 0.92rem;
+  font-weight: 650;
+  color: #e8f4ff;
+}
+.fund-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+.range-field label {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+.range-inputs {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 0.35rem;
+  align-items: center;
+}
+.range-inputs span {
+  color: #8fa3b3;
+  font-size: 0.8rem;
+  text-align: center;
+}
+.range-inputs input {
+  min-width: 0;
 }
 .actions {
   display: flex;
@@ -820,8 +957,15 @@ onMounted(async () => {
   .workspace,
   .heat-grid,
   .filters,
+  .fund-grid,
   .heat-controls {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 1100px) and (min-width: 721px) {
+  .fund-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 </style>

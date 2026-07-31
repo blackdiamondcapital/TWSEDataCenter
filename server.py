@@ -9679,6 +9679,26 @@ def warrants_portal_stats():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _portal_opt_float(name: str):
+    raw = request.args.get(name)
+    if raw is None or str(raw).strip() == '':
+        return None
+    try:
+        return float(str(raw).strip().replace(',', ''))
+    except Exception:
+        return None
+
+
+def _portal_opt_int(name: str):
+    raw = request.args.get(name)
+    if raw is None or str(raw).strip() == '':
+        return None
+    try:
+        return int(float(str(raw).strip().replace(',', '')))
+    except Exception:
+        return None
+
+
 @app.route('/api/warrants/portal/master', methods=['GET'])
 def warrants_portal_master_search():
     """全市場權證主檔篩選（TWSE ∪ TPEX）。"""
@@ -9688,6 +9708,16 @@ def warrants_portal_master_search():
         wtype = (request.args.get('type') or '').strip()
         expiry_from = (request.args.get('expiryFrom') or '').strip() or None
         expiry_to = (request.args.get('expiryTo') or '').strip() or None
+        exercise_min = _portal_opt_float('exerciseMin')
+        exercise_max = _portal_opt_float('exerciseMax')
+        ratio_min = _portal_opt_float('ratioMin')
+        ratio_max = _portal_opt_float('ratioMax')
+        days_min = _portal_opt_int('daysMin')
+        days_max = _portal_opt_int('daysMax')
+        close_min = _portal_opt_float('closeMin')
+        close_max = _portal_opt_float('closeMax')
+        volume_min = _portal_opt_int('volumeMin')
+        volume_max = _portal_opt_int('volumeMax')
         sort = (request.args.get('sort') or 'expiry').strip().lower()
         sort_dir = (request.args.get('sortDir') or request.args.get('order') or 'asc').strip().lower()
         if sort_dir not in ('asc', 'desc'):
@@ -9724,6 +9754,24 @@ def warrants_portal_master_search():
                 if expiry_to:
                     where.append('expiry_date <= %s::date')
                     params_local.append(expiry_to)
+                if exercise_min is not None:
+                    where.append('latest_exercise_price >= %s')
+                    params_local.append(exercise_min)
+                if exercise_max is not None:
+                    where.append('latest_exercise_price <= %s')
+                    params_local.append(exercise_max)
+                if ratio_min is not None:
+                    where.append('latest_exercise_ratio >= %s')
+                    params_local.append(ratio_min)
+                if ratio_max is not None:
+                    where.append('latest_exercise_ratio <= %s')
+                    params_local.append(ratio_max)
+                if days_min is not None:
+                    where.append('(expiry_date - CURRENT_DATE) >= %s')
+                    params_local.append(days_min)
+                if days_max is not None:
+                    where.append('(expiry_date - CURRENT_DATE) <= %s')
+                    params_local.append(days_max)
                 where_sql = ' WHERE ' + ' AND '.join(where)
                 return f'{from_sql}{where_sql}', params_local
 
@@ -9797,7 +9845,6 @@ def warrants_portal_master_search():
                     f'underlying_name {direction} {nulls}, warrant_code ASC'
                 )
             elif sort == 'close':
-                # 以最新收盤價排序（TWSE / TPEX 取較新交易日價）
                 order_sql = f'ORDER BY close_price {direction} {nulls}, warrant_code ASC'
             elif sort == 'volume':
                 order_sql = f'ORDER BY volume {direction} {nulls}, warrant_code ASC'
@@ -9806,36 +9853,66 @@ def warrants_portal_master_search():
             else:
                 order_sql = f'ORDER BY expiry_date {direction} {nulls}, warrant_code ASC'
 
-            cur.execute(f'SELECT COUNT(*) AS cnt FROM ({base}) c', params)
-            total = int((cur.fetchone() or {}).get('cnt') or 0)
+            need_px = (
+                sort in ('close', 'volume', 'turnover')
+                or close_min is not None
+                or close_max is not None
+                or volume_min is not None
+                or volume_max is not None
+            )
 
-            need_px_join = sort in ('close', 'volume', 'turnover')
-            if need_px_join:
+            px_join_sql = f"""
+                SELECT m.*,
+                       COALESCE(twpx.close_price, tppx.close_price) AS close_price,
+                       COALESCE(twpx.trade_date, tppx.trade_date) AS _px_trade_date,
+                       COALESCE(twpx.turnover, tppx.trade_value) AS turnover,
+                       COALESCE(twpx.volume, tppx.trade_volume) AS volume
+                FROM ({base}) m
+                LEFT JOIN (
+                    SELECT DISTINCT ON (warrant_code)
+                        warrant_code, trade_date, close_price, turnover, volume
+                    FROM tw_warrant_trade
+                    ORDER BY warrant_code, trade_date DESC
+                ) twpx ON twpx.warrant_code = m.warrant_code
+                LEFT JOIN (
+                    SELECT DISTINCT ON (warrant_code)
+                        warrant_code, trade_date, close_price, trade_value, trade_volume
+                    FROM tpex_warrant_daily_quotes
+                    ORDER BY warrant_code, trade_date DESC
+                ) tppx ON tppx.warrant_code = m.warrant_code
+            """
+
+            outer_where = []
+            outer_params: list = []
+            if close_min is not None:
+                outer_where.append('close_price >= %s')
+                outer_params.append(close_min)
+            if close_max is not None:
+                outer_where.append('close_price <= %s')
+                outer_params.append(close_max)
+            if volume_min is not None:
+                outer_where.append('COALESCE(volume, 0) >= %s')
+                outer_params.append(volume_min)
+            if volume_max is not None:
+                outer_where.append('COALESCE(volume, 0) <= %s')
+                outer_params.append(volume_max)
+            outer_where_sql = (' WHERE ' + ' AND '.join(outer_where)) if outer_where else ''
+
+            if need_px:
+                count_sql = f'SELECT COUNT(*) AS cnt FROM ({px_join_sql}) px {outer_where_sql}'
+                cur.execute(count_sql, params + outer_params)
+                total = int((cur.fetchone() or {}).get('cnt') or 0)
                 list_sql = f"""
-                    SELECT m.*,
-                           COALESCE(twpx.close_price, tppx.close_price) AS close_price,
-                           COALESCE(twpx.trade_date, tppx.trade_date) AS _px_trade_date,
-                           COALESCE(twpx.turnover, tppx.trade_value) AS turnover,
-                           COALESCE(twpx.volume, tppx.trade_volume) AS volume
-                    FROM ({base}) m
-                    LEFT JOIN (
-                        SELECT DISTINCT ON (warrant_code)
-                            warrant_code, trade_date, close_price, turnover, volume
-                        FROM tw_warrant_trade
-                        ORDER BY warrant_code, trade_date DESC
-                    ) twpx ON twpx.warrant_code = m.warrant_code
-                    LEFT JOIN (
-                        SELECT DISTINCT ON (warrant_code)
-                            warrant_code, trade_date, close_price, trade_value, trade_volume
-                        FROM tpex_warrant_daily_quotes
-                        ORDER BY warrant_code, trade_date DESC
-                    ) tppx ON tppx.warrant_code = m.warrant_code
+                    SELECT * FROM ({px_join_sql}) px
+                    {outer_where_sql}
                     {order_sql}
                     LIMIT %s OFFSET %s
                 """
-                cur.execute(list_sql, params + [page_size, offset])
+                cur.execute(list_sql, params + outer_params + [page_size, offset])
                 rows = cur.fetchall() or []
             else:
+                cur.execute(f'SELECT COUNT(*) AS cnt FROM ({base}) c', params)
+                total = int((cur.fetchone() or {}).get('cnt') or 0)
                 cur.execute(
                     f'SELECT * FROM ({base}) m {order_sql} LIMIT %s OFFSET %s',
                     params + [page_size, offset],
@@ -9844,8 +9921,7 @@ def warrants_portal_master_search():
 
             # 補上最近一筆收盤價（TWSE trade / TPEX daily）
             price_map: dict[str, dict] = {}
-            # 若已依行情欄位排序並帶出價格，先填入
-            if need_px_join:
+            if need_px:
                 for r in rows:
                     code = r.get('warrant_code')
                     if not code:
@@ -9858,7 +9934,7 @@ def warrants_portal_master_search():
                     }
 
             codes = [r.get('warrant_code') for r in rows if r.get('warrant_code')]
-            if codes and not need_px_join:
+            if codes and not need_px:
                 cur.execute(
                     """
                     SELECT DISTINCT ON (warrant_code)
@@ -9888,7 +9964,6 @@ def warrants_portal_master_search():
                 )
                 for r in cur.fetchall() or []:
                     code = r.get('warrant_code')
-                    # TPEX 有價則覆蓋；若 TWSE 無 close 也可補
                     prev = price_map.get(code) or {}
                     close = _warrant_row_num(r.get('close_price'))
                     if close is not None or code not in price_map:
@@ -9939,6 +10014,20 @@ def warrants_portal_master_search():
             'excludeExpired': True,
             'sort': sort,
             'sortDir': sort_dir,
+            'filters': {
+                'expiryFrom': expiry_from,
+                'expiryTo': expiry_to,
+                'exerciseMin': exercise_min,
+                'exerciseMax': exercise_max,
+                'ratioMin': ratio_min,
+                'ratioMax': ratio_max,
+                'daysMin': days_min,
+                'daysMax': days_max,
+                'closeMin': close_min,
+                'closeMax': close_max,
+                'volumeMin': volume_min,
+                'volumeMax': volume_max,
+            },
         })
     except Exception as e:
         logger.exception('權證 portal master 搜尋失敗')
