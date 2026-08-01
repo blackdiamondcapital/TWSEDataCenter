@@ -10103,7 +10103,7 @@ def warrants_portal_ta_screen():
         if sort_dir not in ('asc', 'desc'):
             sort_dir = 'desc'
         page = max(1, int(arg('page') or 1))
-        page_size = max(10, min(200, int(arg('pageSize') or 50)))
+        page_size = max(10, min(5000, int(arg('pageSize') or 50)))
         offset = (page - 1) * page_size
 
         db_manager = DatabaseManager.from_request_args(request.args)
