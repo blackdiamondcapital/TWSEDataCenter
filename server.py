@@ -8128,19 +8128,30 @@ tpex_warrant_daily_import_status = {
 
 
 def _parse_roc_date_text(text: str | None):
+    """解析權證日期：支援民國 7 碼（1150731）與西元 8 碼（20261105）。
+
+    上櫃 OpenAPI 的 ListedDate／ExpiryDate 多為西元 YYYYMMDD；
+    若只吃民國格式會整批變成 null，portal 主檔搜尋會被未到期條件濾光。
+    """
     if not text:
         return None
-    s = str(text).strip()
-    if not s.isdigit() or len(s) != 7:
+    s = str(text).strip().replace('/', '').replace('-', '')
+    if not s.isdigit():
         return None
     try:
-        roc_year = int(s[:3])
-        month = int(s[3:5])
-        day = int(s[5:7])
-        year = roc_year + 1911
-        return date(year, month, day)
+        if len(s) == 7:
+            roc_year = int(s[:3])
+            month = int(s[3:5])
+            day = int(s[5:7])
+            return date(roc_year + 1911, month, day)
+        if len(s) == 8:
+            year = int(s[:4])
+            month = int(s[4:6])
+            day = int(s[6:8])
+            return date(year, month, day)
     except Exception:
         return None
+    return None
 
 
 def _to_decimal_or_none(val):
@@ -8285,42 +8296,69 @@ def _backfill_tw_warrant_underlying_codes(cursor) -> int:
 
 
 def _portal_master_search_clause(q: str) -> tuple[str, list]:
-    """主檔關鍵字：權證代號／名稱、標的名稱、股票代號（含 2330.TW）。"""
+    """主檔關鍵字：權證代號／名稱、標的名稱、股票代號（含 2330.TW）。
+
+    代號類查詢（如 5274、2330.TW）採精確／前綴比對，避免「5274」誤中「052745」。
+    名稱類查詢仍用模糊比對。
+    """
     q = (q or '').strip()
     if not q:
         return '', []
     q_norm = _normalize_stock_code_query(q)
-    pats = [f'%{q}%'] * 4
-    params: list = list(pats)
-    clause = (
-        '(warrant_code ILIKE %s OR warrant_name ILIKE %s'
-        ' OR COALESCE(underlying_code, \'\') ILIKE %s'
-        ' OR COALESCE(underlying_name, \'\') ILIKE %s'
+    has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in q)
+    code_body = (q_norm or '').replace('.', '')
+    is_code_query = (
+        bool(code_body)
+        and code_body.isalnum()
+        and any(ch.isdigit() for ch in code_body)
+        and not has_cjk
     )
-    if q_norm and q_norm != q:
-        clause += ' OR COALESCE(underlying_code, \'\') ILIKE %s OR warrant_code ILIKE %s'
-        params.extend([f'%{q_norm}%', f'%{q_norm}%'])
-    # 純數字／代號：再對照 stock_symbols，把簡稱對回尚未回填的標的名稱
-    if q_norm and q_norm.replace('.', '').isalnum() and any(ch.isdigit() for ch in q_norm):
-        clause += (
+
+    # 正規化後的標的代號欄位（去掉 .TW / .TWO / .TAI）
+    underlying_norm_sql = (
+        "UPPER(REPLACE(REPLACE(REPLACE(COALESCE(underlying_code, ''), '.TW', ''), '.TWO', ''), '.TAI', ''))"
+    )
+    symbol_norm_sql = (
+        "REPLACE(REPLACE(REPLACE(UPPER(symbol), '.TW', ''), '.TWO', ''), '.TAI', '')"
+    )
+
+    if is_code_query:
+        # 權證代號：完全相等或前綴（輸入 05274 → 052745）；標的代號：完全相等
+        clause = (
+            '('
+            ' UPPER(warrant_code) = UPPER(%s)'
+            ' OR warrant_code ILIKE %s'
+            f' OR {underlying_norm_sql} = UPPER(%s)'
             ' OR COALESCE(underlying_name, \'\') IN ('
             '   SELECT DISTINCT COALESCE(NULLIF(TRIM(short_name), \'\'), name)'
             '   FROM stock_symbols'
-            '   WHERE REPLACE(REPLACE(REPLACE(UPPER(symbol), \'.TW\', \'\'), \'.TWO\', \'\'), \'.TAI\', \'\')'
-            '         ILIKE %s'
-            '      OR UPPER(symbol) ILIKE %s'
+            f'   WHERE {symbol_norm_sql} = UPPER(%s)'
+            '      OR UPPER(symbol) = UPPER(%s)'
             ' )'
-            ' OR COALESCE(underlying_code, \'\') IN ('
-            '   SELECT DISTINCT REPLACE(REPLACE(REPLACE(UPPER(symbol), \'.TW\', \'\'), \'.TWO\', \'\'), \'.TAI\', \'\')'
+            f' OR {underlying_norm_sql} IN ('
+            f'   SELECT DISTINCT {symbol_norm_sql}'
             '   FROM stock_symbols'
-            '   WHERE REPLACE(REPLACE(REPLACE(UPPER(symbol), \'.TW\', \'\'), \'.TWO\', \'\'), \'.TAI\', \'\')'
-            '         ILIKE %s'
-            '      OR UPPER(symbol) ILIKE %s'
+            f'   WHERE {symbol_norm_sql} = UPPER(%s)'
+            '      OR UPPER(symbol) = UPPER(%s)'
             ' )'
+            ')'
         )
-        code_pat = f'%{q_norm}%'
-        params.extend([code_pat, code_pat, code_pat, code_pat])
-    clause += ')'
+        prefix = f'{q_norm}%'
+        params = [q_norm, prefix, q_norm, q_norm, q_norm, q_norm, q_norm]
+        return clause, params
+
+    # 名稱／自由文字：名稱模糊；代號仍只做精確比對，避免誤中
+    name_pat = f'%{q}%'
+    clause = (
+        '('
+        ' warrant_name ILIKE %s'
+        ' OR COALESCE(underlying_name, \'\') ILIKE %s'
+        ' OR UPPER(warrant_code) = UPPER(%s)'
+        f' OR {underlying_norm_sql} = UPPER(%s)'
+        ')'
+    )
+    code_key = q_norm or q
+    params = [name_pat, name_pat, code_key, code_key]
     return clause, params
 
 
