@@ -10034,6 +10034,356 @@ def warrants_portal_master_search():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/warrants/portal/ta-screen', methods=['GET', 'POST'])
+def warrants_portal_ta_screen():
+    """全市場／條件範圍技術面批次篩選（一次 SQL 取近端日線，避免前端逐檔 timeseries）。"""
+    try:
+        from warrant_ta_screen import (
+            chunked,
+            fetch_recent_bars_by_code,
+            filter_codes_by_ta,
+            truthy_flag,
+        )
+
+        src = request.get_json(silent=True) if request.method == 'POST' else None
+        if not isinstance(src, dict):
+            src = {}
+
+        def arg(name, default=None):
+            if name in src and src.get(name) is not None:
+                return src.get(name)
+            return request.args.get(name, default)
+
+        market = str(arg('market') or 'both').strip().lower()
+        q = str(arg('q') or arg('keyword') or '').strip()
+        wtype = str(arg('type') or '').strip()
+        expiry_from = (str(arg('expiryFrom') or '').strip() or None)
+        expiry_to = (str(arg('expiryTo') or '').strip() or None)
+        exercise_min = _portal_opt_float('exerciseMin') if 'exerciseMin' not in src else (
+            float(src['exerciseMin']) if src.get('exerciseMin') not in (None, '') else None
+        )
+        exercise_max = _portal_opt_float('exerciseMax') if 'exerciseMax' not in src else (
+            float(src['exerciseMax']) if src.get('exerciseMax') not in (None, '') else None
+        )
+        ratio_min = _portal_opt_float('ratioMin') if 'ratioMin' not in src else (
+            float(src['ratioMin']) if src.get('ratioMin') not in (None, '') else None
+        )
+        ratio_max = _portal_opt_float('ratioMax') if 'ratioMax' not in src else (
+            float(src['ratioMax']) if src.get('ratioMax') not in (None, '') else None
+        )
+        days_min = _portal_opt_int('daysMin') if 'daysMin' not in src else (
+            int(src['daysMin']) if src.get('daysMin') not in (None, '') else None
+        )
+        days_max = _portal_opt_int('daysMax') if 'daysMax' not in src else (
+            int(src['daysMax']) if src.get('daysMax') not in (None, '') else None
+        )
+        close_min = _portal_opt_float('closeMin') if 'closeMin' not in src else (
+            float(src['closeMin']) if src.get('closeMin') not in (None, '') else None
+        )
+        close_max = _portal_opt_float('closeMax') if 'closeMax' not in src else (
+            float(src['closeMax']) if src.get('closeMax') not in (None, '') else None
+        )
+        volume_min = _portal_opt_int('volumeMin') if 'volumeMin' not in src else (
+            int(src['volumeMin']) if src.get('volumeMin') not in (None, '') else None
+        )
+        volume_max = _portal_opt_int('volumeMax') if 'volumeMax' not in src else (
+            int(src['volumeMax']) if src.get('volumeMax') not in (None, '') else None
+        )
+
+        ta_flags = {
+            'ma5gtMa10': truthy_flag(arg('ma5gtMa10')),
+            'heikinFirstRed': truthy_flag(arg('heikinFirstRed')),
+            'reversalFirstRed': truthy_flag(arg('reversalFirstRed')),
+        }
+        if not any(ta_flags.values()):
+            return jsonify({'success': False, 'error': '請至少指定一個技術條件'}), 400
+
+        sort = str(arg('sort') or 'volume').strip().lower()
+        sort_dir = str(arg('sortDir') or arg('order') or 'desc').strip().lower()
+        if sort_dir not in ('asc', 'desc'):
+            sort_dir = 'desc'
+        page = max(1, int(arg('page') or 1))
+        page_size = max(10, min(200, int(arg('pageSize') or 50)))
+        offset = (page - 1) * page_size
+
+        db_manager = DatabaseManager.from_request_args(request.args)
+        if not db_manager.connect():
+            return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
+
+        t0 = time.time()
+        try:
+            cur = db_manager.connection.cursor()
+
+            def build_branch(from_sql: str):
+                where = [
+                    'expiry_date IS NOT NULL',
+                    'expiry_date >= CURRENT_DATE',
+                ]
+                params_local: list = []
+                if q:
+                    q_clause, q_params = _portal_master_search_clause(q)
+                    where.append(q_clause)
+                    params_local.extend(q_params)
+                if wtype in ('認購', '認售'):
+                    where.append('warrant_type = %s')
+                    params_local.append(wtype)
+                if expiry_from:
+                    where.append('expiry_date >= %s::date')
+                    params_local.append(expiry_from)
+                if expiry_to:
+                    where.append('expiry_date <= %s::date')
+                    params_local.append(expiry_to)
+                if exercise_min is not None:
+                    where.append('latest_exercise_price >= %s')
+                    params_local.append(exercise_min)
+                if exercise_max is not None:
+                    where.append('latest_exercise_price <= %s')
+                    params_local.append(exercise_max)
+                if ratio_min is not None:
+                    where.append('latest_exercise_ratio >= %s')
+                    params_local.append(ratio_min)
+                if ratio_max is not None:
+                    where.append('latest_exercise_ratio <= %s')
+                    params_local.append(ratio_max)
+                if days_min is not None:
+                    where.append('(expiry_date - CURRENT_DATE) >= %s')
+                    params_local.append(days_min)
+                if days_max is not None:
+                    where.append('(expiry_date - CURRENT_DATE) <= %s')
+                    params_local.append(days_max)
+                where_sql = ' WHERE ' + ' AND '.join(where)
+                return f'{from_sql}{where_sql}', params_local
+
+            tw_from = """
+                SELECT
+                    'TWSE'::text AS market,
+                    warrant_code,
+                    warrant_name,
+                    warrant_type,
+                    warrant_category,
+                    underlying_code,
+                    underlying_name,
+                    expiry_date,
+                    last_trade_date,
+                    latest_exercise_price,
+                    latest_exercise_ratio,
+                    issuance_units_thousand AS issuance,
+                    exercise_start_date,
+                    report_date,
+                    (expiry_date - CURRENT_DATE) AS days_to_expiry
+                FROM tw_warrant_master
+            """
+            tpex_from = """
+                SELECT
+                    'TPEX'::text AS market,
+                    warrant_code,
+                    warrant_name,
+                    warrant_type,
+                    NULL::varchar AS warrant_category,
+                    underlying_code,
+                    underlying_name,
+                    expiry_date,
+                    NULL::date AS last_trade_date,
+                    latest_exercise_price,
+                    latest_exercise_ratio,
+                    accumulated_issuance AS issuance,
+                    listed_date AS exercise_start_date,
+                    report_date,
+                    (expiry_date - CURRENT_DATE) AS days_to_expiry
+                FROM tpex_warrant_master
+            """
+
+            params: list = []
+            if market == 'twse':
+                base, params = build_branch(tw_from)
+            elif market == 'tpex':
+                base, params = build_branch(tpex_from)
+            else:
+                tw_part, tw_params = build_branch(tw_from)
+                tpex_part, tpex_params = build_branch(tpex_from)
+                base = f'({tw_part}) UNION ALL ({tpex_part})'
+                params = tw_params + tpex_params
+
+            need_px = (
+                close_min is not None
+                or close_max is not None
+                or volume_min is not None
+                or volume_max is not None
+            )
+            if need_px:
+                px_join_sql = f"""
+                    SELECT m.*,
+                           COALESCE(twpx.close_price, tppx.close_price) AS close_price,
+                           COALESCE(twpx.trade_date, tppx.trade_date) AS _px_trade_date,
+                           COALESCE(twpx.turnover, tppx.trade_value) AS turnover,
+                           COALESCE(twpx.volume, tppx.trade_volume) AS volume
+                    FROM ({base}) m
+                    LEFT JOIN (
+                        SELECT DISTINCT ON (warrant_code)
+                            warrant_code, trade_date, close_price, turnover, volume
+                        FROM tw_warrant_trade
+                        ORDER BY warrant_code, trade_date DESC
+                    ) twpx ON twpx.warrant_code = m.warrant_code
+                    LEFT JOIN (
+                        SELECT DISTINCT ON (warrant_code)
+                            warrant_code, trade_date, close_price, trade_value, trade_volume
+                        FROM tpex_warrant_daily_quotes
+                        ORDER BY warrant_code, trade_date DESC
+                    ) tppx ON tppx.warrant_code = m.warrant_code
+                """
+                outer_where = []
+                outer_params: list = []
+                if close_min is not None:
+                    outer_where.append('close_price >= %s')
+                    outer_params.append(close_min)
+                if close_max is not None:
+                    outer_where.append('close_price <= %s')
+                    outer_params.append(close_max)
+                if volume_min is not None:
+                    outer_where.append('COALESCE(volume, 0) >= %s')
+                    outer_params.append(volume_min)
+                if volume_max is not None:
+                    outer_where.append('COALESCE(volume, 0) <= %s')
+                    outer_params.append(volume_max)
+                outer_where_sql = (' WHERE ' + ' AND '.join(outer_where)) if outer_where else ''
+                list_sql = f'SELECT * FROM ({px_join_sql}) px {outer_where_sql}'
+                cur.execute(list_sql, params + outer_params)
+            else:
+                cur.execute(f'SELECT * FROM ({base}) m', params)
+
+            candidates = cur.fetchall() or []
+            by_code = {}
+            for row in candidates:
+                code = row.get('warrant_code')
+                if code and code not in by_code:
+                    by_code[code] = dict(row)
+            candidate_codes = list(by_code.keys())
+
+            # 技術計算：分批取近端日線
+            need_deep = ta_flags['heikinFirstRed'] or ta_flags['reversalFirstRed']
+            bar_limit = 80 if need_deep else 16
+            matched_codes: list[str] = []
+            for batch in chunked(candidate_codes, 4000):
+                bars_map = fetch_recent_bars_by_code(cur, batch, limit_bars=bar_limit)
+                matched_codes.extend(filter_codes_by_ta(bars_map, ta_flags))
+
+            matched_rows = [by_code[c] for c in matched_codes if c in by_code]
+
+            # 對符合檔補最新價量（量遠小於全市場候選），再排序分頁
+            if matched_rows and (not need_px or sort in ('close', 'volume', 'turnover')):
+                m_codes = [r.get('warrant_code') for r in matched_rows if r.get('warrant_code')]
+                price_map: dict[str, dict] = {}
+                for batch in chunked(m_codes, 5000):
+                    cur.execute(
+                        """
+                        SELECT DISTINCT ON (warrant_code)
+                            warrant_code, trade_date, close_price, turnover, volume
+                        FROM tw_warrant_trade
+                        WHERE warrant_code = ANY(%s)
+                        ORDER BY warrant_code, trade_date DESC
+                        """,
+                        (batch,),
+                    )
+                    for r in cur.fetchall() or []:
+                        price_map[r.get('warrant_code')] = r
+                    cur.execute(
+                        """
+                        SELECT DISTINCT ON (warrant_code)
+                            warrant_code, trade_date, close_price,
+                            trade_value AS turnover, trade_volume AS volume
+                        FROM tpex_warrant_daily_quotes
+                        WHERE warrant_code = ANY(%s)
+                        ORDER BY warrant_code, trade_date DESC
+                        """,
+                        (batch,),
+                    )
+                    for r in cur.fetchall() or []:
+                        code = r.get('warrant_code')
+                        if code and (code not in price_map or price_map[code].get('close_price') is None):
+                            price_map[code] = r
+                for row in matched_rows:
+                    px = price_map.get(row.get('warrant_code')) or {}
+                    if px:
+                        row['close_price'] = px.get('close_price')
+                        row['_px_trade_date'] = px.get('trade_date')
+                        row['turnover'] = px.get('turnover')
+                        row['volume'] = px.get('volume')
+
+            direction = 1 if sort_dir == 'asc' else -1
+
+            def sort_key(row):
+                if sort == 'code':
+                    return (row.get('warrant_code') or '',)
+                if sort == 'exercise':
+                    return (row.get('latest_exercise_price') is None, row.get('latest_exercise_price') or 0, row.get('warrant_code') or '')
+                if sort == 'ratio':
+                    return (row.get('latest_exercise_ratio') is None, row.get('latest_exercise_ratio') or 0, row.get('warrant_code') or '')
+                if sort == 'name':
+                    return (row.get('warrant_name') or '', row.get('warrant_code') or '')
+                if sort == 'days':
+                    return (row.get('days_to_expiry') is None, row.get('days_to_expiry') or 0, row.get('warrant_code') or '')
+                if sort == 'close':
+                    return (row.get('close_price') is None, row.get('close_price') or 0, row.get('warrant_code') or '')
+                if sort == 'turnover':
+                    return (row.get('turnover') is None, row.get('turnover') or 0, row.get('warrant_code') or '')
+                if sort == 'expiry':
+                    return (row.get('expiry_date') is None, str(row.get('expiry_date') or ''), row.get('warrant_code') or '')
+                # default volume
+                return (row.get('volume') is None, row.get('volume') or 0, row.get('warrant_code') or '')
+
+            matched_rows.sort(key=sort_key, reverse=(direction < 0))
+            total = len(matched_rows)
+            page_rows = matched_rows[offset: offset + page_size]
+
+            data = []
+            for row in page_rows:
+                data.append({
+                    'market': row.get('market'),
+                    'warrant_code': row.get('warrant_code'),
+                    'warrant_name': row.get('warrant_name'),
+                    'warrant_type': row.get('warrant_type'),
+                    'warrant_category': row.get('warrant_category'),
+                    'underlying_code': row.get('underlying_code'),
+                    'underlying_name': row.get('underlying_name'),
+                    'expiry_date': _warrant_row_date(row.get('expiry_date')),
+                    'days_to_expiry': _warrant_row_int(row.get('days_to_expiry')),
+                    'last_trade_date': _warrant_row_date(row.get('last_trade_date')),
+                    'latest_exercise_price': _warrant_row_num(row.get('latest_exercise_price')),
+                    'latest_exercise_ratio': _warrant_row_num(row.get('latest_exercise_ratio')),
+                    'issuance': _warrant_row_int(row.get('issuance')),
+                    'exercise_start_date': _warrant_row_date(row.get('exercise_start_date')),
+                    'report_date': _warrant_row_date(row.get('report_date')),
+                    'close_price': _warrant_row_num(row.get('close_price')),
+                    'latest_trade_date': _warrant_row_date(row.get('_px_trade_date')),
+                    'turnover': _warrant_row_num(row.get('turnover')),
+                    'volume': _warrant_row_int(row.get('volume')),
+                })
+
+            elapsed_ms = int((time.time() - t0) * 1000)
+            return jsonify({
+                'success': True,
+                'data': data,
+                'total': total,
+                'page': page,
+                'pageSize': page_size,
+                'market': market,
+                'q': q or None,
+                'type': wtype or None,
+                'candidates': len(candidate_codes),
+                'matched': total,
+                'elapsedMs': elapsed_ms,
+                'taFilters': ta_flags,
+                'sort': sort,
+                'sortDir': sort_dir,
+                'source': 'batch-ohlc',
+            })
+        finally:
+            db_manager.disconnect()
+    except Exception as e:
+        logger.exception('權證 portal ta-screen 失敗')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/warrants/portal/master/<code>', methods=['GET'])
 def warrants_portal_master_detail(code: str):
     """單檔權證主檔詳情（先 TWSE 再 TPEX）。"""
