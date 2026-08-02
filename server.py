@@ -8126,6 +8126,21 @@ tpex_warrant_daily_import_status = {
     'error': None,
 }
 
+tpex_warrant_daily_backfill_status = {
+    'running': False,
+    'startedAt': None,
+    'finishedAt': None,
+    'start': None,
+    'end': None,
+    'totalDays': None,
+    'processedDays': 0,
+    'importedDays': 0,
+    'skippedDays': 0,
+    'importedCount': 0,
+    'currentDate': None,
+    'error': None,
+}
+
 
 def _parse_roc_date_text(text: str | None):
     """解析權證日期：支援民國 7 碼（1150731）與西元 8 碼（20261105）。
@@ -8646,6 +8661,138 @@ def _import_tpex_warrant_daily_rows(cursor, data: list) -> tuple[int, str | None
         )
         affected += len(rows)
     return affected, trade_date_str
+
+
+def _fetch_tpex_warrant_daily_csv_for_date(trade_date_obj: date, retries: int = 4) -> list[dict]:
+    """抓取櫃買「上櫃權證收盤行情日報表」CSV（可指定歷史日），轉成 OpenAPI 欄位格式。
+
+    非交易日通常回空表。d 參數需用斜線日期（YYYY/MM/DD 或 ROC YYY/MM/DD）。
+    """
+    if not isinstance(trade_date_obj, date):
+        return []
+    d_param = trade_date_obj.strftime('%Y/%m/%d')
+    url = (
+        'https://www.tpex.org.tw/web/extend/warrant/dailyQ/wntQuts_result.php'
+        f'?l=zh-tw&t=D&o=data&d={d_param}'
+    )
+    last_err = None
+    for attempt in range(1, max(1, int(retries)) + 1):
+        try:
+            resp = requests.get(url, timeout=90, headers={'User-Agent': 'Mozilla/5.0'})
+            if resp.status_code != 200:
+                raise RuntimeError(f'TPEX warrant daily CSV HTTP {resp.status_code} ({d_param})')
+            text = resp.content.decode('utf-8-sig', errors='replace').strip()
+            if not text:
+                return []
+            reader = csv.DictReader(io.StringIO(text))
+            out: list[dict] = []
+            for row in reader:
+                if not isinstance(row, dict):
+                    continue
+                raw_date = (row.get('資料日期') or '').strip()
+                code = (row.get('代號') or '').strip()
+                if not raw_date or not code:
+                    continue
+                parsed = _parse_roc_date_text(raw_date)
+                # 防呆：若站台忽略 d 參數回傳其他日，略過
+                if parsed is not None and parsed != trade_date_obj:
+                    continue
+                out.append({
+                    'Date': raw_date,
+                    'Code': code,
+                    'Name': (row.get('名稱') or '').strip(),
+                    'Open': row.get('開市價'),
+                    'High': row.get('最高價'),
+                    'Low': row.get('最低價'),
+                    'Close': row.get('收市價'),
+                    'Change': row.get('漲跌'),
+                    'TradeVol.': row.get('成交量'),
+                    'No.OfTransactions': row.get('筆數'),
+                    'TradeValue': row.get('成交金額'),
+                    'UnderlyingStockCode': (row.get('標的代號') or '').strip(),
+                    'UnderlyingStock': (row.get('證券') or '').strip(),
+                    'UnderlyingStockClosePrice': row.get('標的或指數收盤'),
+                    'UnderlyingStock PriceChange': row.get('標的或指數漲跌'),
+                })
+            return out
+        except Exception as e:
+            last_err = e
+            if attempt >= retries:
+                break
+            time.sleep(1.2 * attempt)
+    raise RuntimeError(f'TPEX warrant daily CSV fetch failed {d_param}: {last_err}')
+
+
+def _backfill_tpex_warrant_daily_range(
+    db_manager,
+    start_date: date,
+    end_date: date,
+    *,
+    sleep_sec: float = 0.35,
+    status: dict | None = None,
+) -> dict:
+    """逐日回補 tpex_warrant_daily_quotes，回傳統計。"""
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    st = status if isinstance(status, dict) else {}
+    total_days = (end_date - start_date).days + 1
+    st.update({
+        'running': True,
+        'startedAt': st.get('startedAt') or datetime.utcnow().isoformat(),
+        'finishedAt': None,
+        'start': start_date.isoformat(),
+        'end': end_date.isoformat(),
+        'totalDays': total_days,
+        'processedDays': 0,
+        'importedDays': 0,
+        'skippedDays': 0,
+        'importedCount': 0,
+        'currentDate': None,
+        'error': None,
+    })
+
+    cursor = db_manager.connection.cursor()
+    cur = start_date
+    while cur <= end_date:
+        st['currentDate'] = cur.isoformat()
+        try:
+            data = _fetch_tpex_warrant_daily_csv_for_date(cur)
+            if not data:
+                st['skippedDays'] = int(st.get('skippedDays') or 0) + 1
+            else:
+                cursor.execute('BEGIN')
+                try:
+                    affected, _ = _import_tpex_warrant_daily_rows(cursor, data)
+                    db_manager.connection.commit()
+                except Exception:
+                    try:
+                        db_manager.connection.rollback()
+                    except Exception:
+                        pass
+                    raise
+                st['importedDays'] = int(st.get('importedDays') or 0) + 1
+                st['importedCount'] = int(st.get('importedCount') or 0) + int(affected or 0)
+        except Exception as e:
+            st['error'] = f'{cur.isoformat()}: {e}'
+            logger.exception('TPEX 權證日線回補失敗 %s', cur.isoformat())
+            raise
+        finally:
+            st['processedDays'] = int(st.get('processedDays') or 0) + 1
+        if sleep_sec and sleep_sec > 0 and cur < end_date:
+            time.sleep(sleep_sec)
+        cur += timedelta(days=1)
+
+    st['running'] = False
+    st['finishedAt'] = datetime.utcnow().isoformat()
+    st['currentDate'] = None
+    return {
+        'start': start_date.isoformat(),
+        'end': end_date.isoformat(),
+        'processedDays': st.get('processedDays'),
+        'importedDays': st.get('importedDays'),
+        'skippedDays': st.get('skippedDays'),
+        'importedCount': st.get('importedCount'),
+    }
 
 
 def _fetch_twse_warrant_stock_day(code: str, year: int, month: int) -> list[dict]:
@@ -9390,10 +9537,120 @@ def get_tpex_warrant_import_status_api():
             'success': True,
             'master': tpex_warrant_master_import_status,
             'daily': tpex_warrant_daily_import_status,
+            'backfill': tpex_warrant_daily_backfill_status,
         })
     except Exception as e:
         logger.exception('取得 TPEX 權證匯入狀態失敗')
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/warrants/tpex/backfill-daily', methods=['POST'])
+def backfill_tpex_warrant_daily():
+    """以櫃買歷史日報表 CSV 回補上櫃權證日線（預設背景執行）。
+
+    JSON／query：
+      - start: YYYY-MM-DD（預設 end 往前 180 天）
+      - end: YYYY-MM-DD（預設今天）
+      - sleepSec: 每日間隔秒數（預設 0.35）
+      - sync: true 則同步執行（適合本機；Vercel 易逾時）
+    """
+    denied = _require_quantgems_admin()
+    if denied is not None:
+        return denied
+
+    global tpex_warrant_daily_backfill_status
+    if tpex_warrant_daily_backfill_status.get('running'):
+        return jsonify({
+            'success': False,
+            'error': '回補進行中',
+            'status': tpex_warrant_daily_backfill_status,
+        }), 409
+
+    body = request.get_json(silent=True) or {}
+    end_raw = (request.args.get('end') or body.get('end') or '').strip()
+    start_raw = (request.args.get('start') or body.get('start') or '').strip()
+    sleep_raw = request.args.get('sleepSec', body.get('sleepSec', 0.35))
+    sync = str(request.args.get('sync') or body.get('sync') or '').lower() in ('1', 'true', 'yes')
+
+    try:
+        end_date = date.fromisoformat(end_raw) if end_raw else date.today()
+    except Exception:
+        return jsonify({'success': False, 'error': 'end 日期格式須為 YYYY-MM-DD'}), 400
+    try:
+        start_date = (
+            date.fromisoformat(start_raw)
+            if start_raw
+            else (end_date - timedelta(days=180))
+        )
+    except Exception:
+        return jsonify({'success': False, 'error': 'start 日期格式須為 YYYY-MM-DD'}), 400
+    try:
+        sleep_sec = float(sleep_raw)
+    except Exception:
+        sleep_sec = 0.35
+    sleep_sec = max(0.0, min(5.0, sleep_sec))
+
+    # 單次最多 400 曆日，避免誤觸超長任務
+    if (end_date - start_date).days > 400:
+        return jsonify({'success': False, 'error': '單次回補區間不可超過 400 天'}), 400
+
+    tpex_warrant_daily_backfill_status = {
+        'running': True,
+        'startedAt': datetime.utcnow().isoformat(),
+        'finishedAt': None,
+        'start': start_date.isoformat(),
+        'end': end_date.isoformat(),
+        'totalDays': (end_date - start_date).days + 1,
+        'processedDays': 0,
+        'importedDays': 0,
+        'skippedDays': 0,
+        'importedCount': 0,
+        'currentDate': None,
+        'error': None,
+    }
+
+    use_local_db = request.args.get('use_local_db') or body.get('use_local_db')
+
+    def _job():
+        global tpex_warrant_daily_backfill_status
+        db_manager = DatabaseManager.from_request_args({'use_local_db': use_local_db})
+        if not db_manager.connect():
+            tpex_warrant_daily_backfill_status['running'] = False
+            tpex_warrant_daily_backfill_status['finishedAt'] = datetime.utcnow().isoformat()
+            tpex_warrant_daily_backfill_status['error'] = '資料庫連接失敗'
+            return
+        try:
+            db_manager.create_tables()
+            _backfill_tpex_warrant_daily_range(
+                db_manager,
+                start_date,
+                end_date,
+                sleep_sec=sleep_sec,
+                status=tpex_warrant_daily_backfill_status,
+            )
+        except Exception as e:
+            tpex_warrant_daily_backfill_status['running'] = False
+            tpex_warrant_daily_backfill_status['finishedAt'] = datetime.utcnow().isoformat()
+            tpex_warrant_daily_backfill_status['error'] = str(e)
+            logger.exception('TPEX 權證日線回補任務失敗')
+        finally:
+            db_manager.disconnect()
+
+    if sync:
+        _job()
+        ok = not tpex_warrant_daily_backfill_status.get('error')
+        return jsonify({
+            'success': ok,
+            'message': 'TPEX 權證日線回補完成' if ok else 'TPEX 權證日線回補失敗',
+            'status': tpex_warrant_daily_backfill_status,
+        }), (200 if ok else 500)
+
+    threading.Thread(target=_job, daemon=True).start()
+    return jsonify({
+        'success': True,
+        'message': 'TPEX 權證日線回補已開始（背景）',
+        'status': tpex_warrant_daily_backfill_status,
+    })
 
 
 @app.route('/api/warrants/tpex/dates', methods=['GET'])
