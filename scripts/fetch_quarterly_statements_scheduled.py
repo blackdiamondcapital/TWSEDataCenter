@@ -11,10 +11,14 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Callable
 
 _PERIOD_RE = re.compile(r"^(\d{4})[Qq]([1-4])$")
+
+# 上市／上櫃公司季報／年報法定申報截止日（含當日截止）
+# 「公布前五日」= 截止日前 5 個日曆日（不含截止日當天）
+PRE_FILING_WINDOW_DAYS = 5
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -49,16 +53,65 @@ class StatementSpec:
     upsert_method: str
 
 
-def resolve_quarter(today: date | None = None) -> tuple[int, int]:
-    """Return the latest quarter whose statutory filing deadline has passed."""
+def filing_deadline(year: int, season: int) -> date:
+    """Return the statutory filing deadline date for a quarter."""
+    if season == 1:
+        return date(year, 5, 15)
+    if season == 2:
+        return date(year, 8, 14)
+    if season == 3:
+        return date(year, 11, 14)
+    if season == 4:
+        return date(year + 1, 3, 31)
+    raise ValueError(f"season 必須為 1-4：{season}")
+
+
+def pre_filing_window(year: int, season: int) -> tuple[date, date]:
+    """Return [start, end) window: 5 calendar days before the filing deadline."""
+    deadline = filing_deadline(year, season)
+    start = deadline - timedelta(days=PRE_FILING_WINDOW_DAYS)
+    return start, deadline
+
+
+def iter_nearby_quarters(today: date) -> list[tuple[int, int]]:
+    """Candidate quarters that may have an active pre-filing window around today."""
+    return [
+        (today.year - 1, 4),
+        (today.year, 1),
+        (today.year, 2),
+        (today.year, 3),
+        (today.year, 4),
+        (today.year + 1, 1),
+    ]
+
+
+def find_active_pre_filing_quarter(today: date | None = None) -> tuple[int, int] | None:
+    """If today falls in a quarter's pre-filing window, return that (year, season)."""
     current = today or date.today()
-    if current.month >= 11:
+    for year, season in iter_nearby_quarters(current):
+        start, end = pre_filing_window(year, season)
+        if start <= current < end:
+            return year, season
+    return None
+
+
+def resolve_quarter(today: date | None = None) -> tuple[int, int]:
+    """Prefer active pre-filing window; else latest quarter whose deadline has passed."""
+    current = today or date.today()
+    active = find_active_pre_filing_quarter(current)
+    if active:
+        return active
+
+    # 截止日後：取最近已過截止的一季
+    if current >= date(current.year, 11, 14):
         return current.year, 3
-    if current.month >= 8:
+    if current >= date(current.year, 8, 14):
         return current.year, 2
-    if current.month >= 5:
+    if current >= date(current.year, 5, 15):
         return current.year, 1
-    return current.year - 1, 4
+    if current >= date(current.year, 3, 31):
+        return current.year - 1, 4
+    return current.year - 1, 3
 
 
 def _parse_single_period(token: str) -> tuple[int, int]:
@@ -125,6 +178,19 @@ def resolve_periods(args: argparse.Namespace) -> list[tuple[int, int]]:
             raise ValueError("year 與 season 必須同時提供或同時省略")
         return [(args.year, args.season)]
     return [resolve_quarter()]
+
+
+def describe_pre_filing_windows(today: date | None = None) -> str:
+    current = today or date.today()
+    lines = []
+    for year, season in iter_nearby_quarters(current):
+        start, end = pre_filing_window(year, season)
+        deadline = filing_deadline(year, season)
+        lines.append(
+            f"{year}Q{season}: {start.isoformat()}～{(end - timedelta(days=1)).isoformat()} "
+            f"（截止 {deadline.isoformat()}）"
+        )
+    return "; ".join(lines)
 
 
 def _statement_specs() -> dict[str, StatementSpec]:
@@ -335,6 +401,28 @@ class StatementRunner:
 
 
 def run(args: argparse.Namespace) -> int:
+    today = date.today()
+    if args.require_pre_window:
+        active = find_active_pre_filing_quarter(today)
+        if not active:
+            logger.info("=" * 72)
+            logger.info("今日 %s 不在任一季報「截止前五日」窗口，略過排程", today.isoformat())
+            logger.info("參考窗口：%s", describe_pre_filing_windows(today))
+            logger.info("=" * 72)
+            return 0
+        year, season = active
+        start, end = pre_filing_window(year, season)
+        logger.info(
+            "命中預抓窗口：%dQ%d（%s～%s，法定截止 %s）",
+            year,
+            season,
+            start.isoformat(),
+            (end - timedelta(days=1)).isoformat(),
+            filing_deadline(year, season).isoformat(),
+        )
+        if not args.periods and args.year is None and args.season is None:
+            args.periods = f"{year}Q{season}"
+
     periods = resolve_periods(args)
 
     db_url = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
@@ -418,6 +506,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-wait-minutes", type=float, default=5.0, help="封鎖等待分鐘")
     parser.add_argument("--flush-every", type=int, default=10, help="每 N 筆寫入一次 Neon")
     parser.add_argument("--no-write-db", action="store_true", help="只抓取驗證，不寫資料庫")
+    parser.add_argument(
+        "--require-pre-window",
+        action="store_true",
+        help="僅在法定申報截止前五日窗口內執行；否則成功結束（供每日排程）",
+    )
     parser.add_argument(
         "--continue-on-error",
         action=argparse.BooleanOptionalAction,

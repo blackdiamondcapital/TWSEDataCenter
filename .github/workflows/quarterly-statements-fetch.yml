@@ -1,17 +1,20 @@
 name: Quarterly Financial Statements Fetch
 
+# 三大財務報表（損益／資產負債／現金流量）
+# 排程：各季法定申報截止「前五日」每天台北 00:00
+#   Q1 截止 5/15 → 5/10～5/14
+#   Q2 截止 8/14 → 8/9～8/13
+#   Q3 截止 11/14 → 11/9～11/13
+#   Q4 截止次年 3/31 → 3/26～3/30
+# GitHub cron 為 UTC：台北 00:00 = UTC 前一日 16:00
 on:
   schedule:
-    # 台北 09:00（UTC 01:00），各季法定申報截止日後執行
-    - cron: '0 1 16 5 *'   # Q1：5 月 16 日
-    - cron: '0 1 15 8 *'   # Q2：8 月 15 日
-    - cron: '0 1 15 11 *'  # Q3：11 月 15 日
-    - cron: '0 1 1 4 *'    # Q4：隔年 4 月 1 日
+    - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
       periods:
-        description: '期間（單期 2025Q1、多期 2024Q1,2024Q2 或區間 2024Q1-2024Q4）'
-        required: true
+        description: '期間（單期 2025Q1、多期 2024Q1,2024Q2 或區間 2024Q1-2024Q4；排程可留空）'
+        required: false
         type: string
       statement:
         description: '報表'
@@ -51,6 +54,11 @@ on:
         required: true
         default: '5'
         type: string
+      force:
+        description: '略過「截止前五日」窗口檢查（手動強制）'
+        required: false
+        default: true
+        type: boolean
 
 env:
   TZ: Asia/Taipei
@@ -61,8 +69,65 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  scheduled-shards:
+  gate:
     if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      period: ${{ steps.check.outputs.period }}
+    steps:
+      - name: Check pre-filing window
+        id: check
+        run: |
+          python3 <<'PY'
+          import os
+          from datetime import date, timedelta
+
+          PRE_DAYS = 5
+
+          def deadline(year: int, season: int) -> date:
+              if season == 1:
+                  return date(year, 5, 15)
+              if season == 2:
+                  return date(year, 8, 14)
+              if season == 3:
+                  return date(year, 11, 14)
+              return date(year + 1, 3, 31)
+
+          today = date.today()
+          print(f"台北日期：{today.isoformat()}")
+          candidates = [
+              (today.year - 1, 4),
+              (today.year, 1),
+              (today.year, 2),
+              (today.year, 3),
+              (today.year, 4),
+              (today.year + 1, 1),
+          ]
+          active = None
+          for year, season in candidates:
+              end = deadline(year, season)
+              start = end - timedelta(days=PRE_DAYS)
+              print(f"  {year}Q{season}: {start}～{end - timedelta(days=1)}（截止 {end}）")
+              if start <= today < end:
+                  active = (year, season)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              if active:
+                  period = f"{active[0]}Q{active[1]}"
+                  print(f"命中窗口：{period}")
+                  fh.write("should_run=true\n")
+                  fh.write(f"period={period}\n")
+              else:
+                  print("非截止前五日窗口，略過")
+                  fh.write("should_run=false\n")
+                  fh.write("period=\n")
+          PY
+
+  scheduled-shards:
+    needs: gate
+    if: github.event_name == 'schedule' && needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
@@ -105,7 +170,9 @@ jobs:
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
           QUARTERLY_STATEMENTS_LOG: quarterly-statements-${{ matrix.shard }}.log
         run: |
+          echo "抓取期間：${{ needs.gate.outputs.period }}"
           python scripts/fetch_quarterly_statements_scheduled.py \
+            --periods "${{ needs.gate.outputs.period }}" \
             --statement all \
             --code-from "${{ matrix.code_from }}" \
             --code-to "${{ matrix.code_to }}" \
@@ -159,9 +226,9 @@ jobs:
           INPUT_PAUSE_MINUTES: ${{ inputs.pause_minutes }}
           INPUT_RETRY_MAX: ${{ inputs.retry_max }}
           INPUT_RETRY_WAIT_MINUTES: ${{ inputs.retry_wait_minutes }}
+          INPUT_FORCE: ${{ inputs.force }}
         run: |
           args=(
-            --periods "$INPUT_PERIODS"
             --statement "$INPUT_STATEMENT"
             --pause-every "$INPUT_PAUSE_EVERY"
             --pause-minutes "$INPUT_PAUSE_MINUTES"
@@ -170,11 +237,17 @@ jobs:
             --delay 0.8
             --flush-every 10
           )
+          if [ -n "$INPUT_PERIODS" ]; then
+            args+=(--periods "$INPUT_PERIODS")
+          fi
           if [ -n "$INPUT_CODE_FROM" ]; then
             args+=(--code-from "$INPUT_CODE_FROM")
           fi
           if [ -n "$INPUT_CODE_TO" ]; then
             args+=(--code-to "$INPUT_CODE_TO")
+          fi
+          if [ "$INPUT_FORCE" != "true" ] && [ -z "$INPUT_PERIODS" ]; then
+            args+=(--require-pre-window)
           fi
           python scripts/fetch_quarterly_statements_scheduled.py "${args[@]}"
 
