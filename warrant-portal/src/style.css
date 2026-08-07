@@ -1,0 +1,172 @@
+/* QuantGems Black Diamond Tech — warrant portal */
+:root {
+  --brand-primary: #00d4ff;
+  --brand-secondary: #6366f1;
+  --brand-tertiary: #a78bfa;
+  --brand-gradient: linear-gradient(135deg, #00d4ff 0%, #6366f1 100%);
+  --btn-gradient: linear-gradient(135deg, #38bdf8, #818cf8);
+
+  --bg-deep: #06121e;
+  --bg-panel: rgba(7, 11, 20, 0.82);
+  --bg-elevated: #121b2c;
+  --bg-surface: #0d1420;
+  --line: rgba(0, 212, 255, 0.12);
+  --line-strong: rgba(0, 212, 255, 0.28);
+  --text: #f0f4ff;
+  --text-dim: #8896aa;
+  --cyan: #00d4ff;
+  --cyan-bright: #38bdf8;
+  --amber: #60a5fa;
+  --call: #f87171;
+  --put: #4ade80;
+  --shadow: 0 4px 20px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(0, 212, 255, 0.06);
+  --shadow-glow: 0 0 24px rgba(0, 212, 255, 0.18);
+  --chart-fs-bg: #0b1220;
+
+  font-family: 'Inter', 'Noto Sans TC', 'PingFang TC', 'Microsoft JhengHei', system-ui, sans-serif;
+  color: var(--text);
+  background: var(--bg-deep);
+  line-height: 1.45;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { margin: 0; min-height: 100%; }
+body {
+  min-height: 100vh;
+  background:
+    radial-gradient(900px 480px at 12% -10%, rgba(0, 212, 255, 0.14), transparent 55%),
+    radial-gradient(700px 420px at 95% 0%, rgba(99, 102, 241, 0.10), transparent 50%),
+    linear-gradient(180deg, #06121e 0%, #0a1220 55%, #070d18 100%);
+}
+
+button, input, select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: 1px solid var(--line);
+  background: rgba(0, 212, 255, 0.04);
+  border-radius: 8px;
+  padding: 0.55rem 0.9rem;
+  transition: border-color 0.2s, transform 0.15s, background 0.2s, box-shadow 0.2s;
+}
+button:hover:not(:disabled):not(.active) {
+  border-color: var(--line-strong);
+  background: rgba(0, 212, 255, 0.08);
+}
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+button.primary {
+  background: var(--btn-gradient);
+  color: #0f172a;
+  border-color: transparent;
+  font-weight: 600;
+  box-shadow: 0 8px 20px rgba(56, 189, 248, 0.22);
+}
+button.primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-glow);
+}
+button.active {
+  border-color: var(--cyan);
+  color: var(--cyan);
+  background: rgba(0, 212, 255, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(0, 212, 255, 0.35);
+}
+
+input, select {
+  width: 100%;
+  background: rgba(6, 10, 18, 0.9);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  outline: none;
+}
+input:focus, select:focus {
+  border-color: rgba(0, 212, 255, 0.65);
+  box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.12);
+}
+
+.panel {
+  background: linear-gradient(160deg, rgba(18, 27, 44, 0.94), rgba(7, 11, 20, 0.9));
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+}
+
+.muted { color: var(--text-dim); }
+.mono { font-variant-numeric: tabular-nums; }
+
+html.warrant-ta-fs,
+html.warrant-ta-fs body {
+  overflow: hidden !important;
+  overscroll-behavior: none;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+.tag.call {
+  color: var(--call);
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.28);
+}
+.tag.put {
+  color: var(--put);
+  background: rgba(74, 222, 128, 0.1);
+  border-color: rgba(74, 222, 128, 0.25);
+}
+.tag.market {
+  color: var(--cyan-bright);
+  background: rgba(0, 212, 255, 0.1);
+  border-color: rgba(0, 212, 255, 0.25);
+}
+
+.table-wrap {
+  overflow: auto;
+  max-height: min(62vh, 640px);
+}
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+table.data th,
+table.data td {
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.08);
+  text-align: left;
+  white-space: nowrap;
+}
+table.data th {
+  position: sticky;
+  top: 0;
+  background: #152033;
+  color: #d7e6f5;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  z-index: 1;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.22);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+table.data tbody tr {
+  cursor: pointer;
+  transition: background 0.15s;
+}
+table.data tbody tr:hover,
+table.data tbody tr.selected {
+  background: rgba(0, 212, 255, 0.08);
+}
+table.data td.num { text-align: right; }

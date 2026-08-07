@@ -597,7 +597,7 @@
                                 </div>
                                 <div class="date-input-wrapper" style="max-width:260px;">
                                     <label>遇到封鎖最多暫停次數</label>
-                                    <input type="number" id="incomeRetryMax" class="date-input" min="0" max="10" step="1" value="1" placeholder="例如 1">
+                                    <input type="number" id="incomeRetryMax" class="date-input" min="0" max="99" step="1" value="20" placeholder="例如 20">
                                 </div>
                                 <div class="date-input-wrapper" style="max-width:260px;">
                                     <label>遇到封鎖每次等待（分鐘）</label>
@@ -666,7 +666,7 @@
                             </div>
                             <div class="date-inputs-row" style="margin-top:0.75rem;">
                                 <div class="date-input-wrapper" style="flex:1; color:#64748b; font-size:0.85rem;">
-                                    <p style="margin:0;">會使用上方設定的年度與季別，只針對輸入的股票代號抓取合併損益表。</p>
+                                    <p style="margin:0;">會使用上方設定的年度與季別，只針對輸入的股票代號抓取合併損益表。勾選「抓取時直接寫入資料庫」後，單一股票抓取也會同步匯入。</p>
                                 </div>
                             </div>
                         </div>
@@ -1017,7 +1017,7 @@
                                 <div class="date-input-wrapper"><label>股票代號結束（選填）</label><input type="text" id="cashflowCodeTo" class="date-input" placeholder="例如 2899"></div>
                                 <div class="date-input-wrapper"><label>每批抓取檔數</label><input type="number" id="cashflowBatchSize" class="date-input" min="1" placeholder="例如 100"></div>
                                 <div class="date-input-wrapper"><label>每批休息（分鐘）</label><input type="number" id="cashflowBatchRestMinutes" class="date-input" min="0" step="1" placeholder="例如 5"></div>
-                                <div class="date-input-wrapper"><label>封鎖重試次數</label><input type="number" id="cashflowRetryMax" class="date-input" min="0" value="1"></div>
+                                <div class="date-input-wrapper"><label>封鎖重試次數</label><input type="number" id="cashflowRetryMax" class="date-input" min="0" max="99" value="99"></div>
                                 <div class="date-input-wrapper"><label>每次等待（分鐘）</label><input type="number" id="cashflowRetryWaitMinutes" class="date-input" min="1" value="5"></div>
                             </div>
                             <div class="date-inputs-row" style="margin-top:.75rem;">
@@ -1095,7 +1095,7 @@
                             <div class="section-icon"><i class="fas fa-file-contract"></i></div>
                             <div class="section-info">
                                 <h3 class="section-title">權證資料</h3>
-                                <p class="section-subtitle">查詢 TWSE / TPEX 權證資料，並可匯入 TPEX 主檔與日行情</p>
+                                <p class="section-subtitle">查詢 TWSE / TPEX 權證資料，並可匯入上市／上櫃主檔與日行情</p>
                             </div>
                             <div class="section-badge">查詢</div>
                         </div>
@@ -1126,6 +1126,9 @@
                                 <div class="date-input-wrapper" style="flex:1; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
                                     <button id="warrantsImportBtn" class="btn btn-outline">
                                         <i class="fas fa-download"></i> 匯入 TWSE 最新成交
+                                    </button>
+                                    <button id="warrantsTwseMasterImportBtn" class="btn btn-outline">
+                                        <i class="fas fa-database"></i> 匯入 TWSE 主檔
                                     </button>
                                     <button id="warrantsTpexMasterImportBtn" class="btn btn-outline">
                                         <i class="fas fa-database"></i> 匯入 TPEX 主檔
