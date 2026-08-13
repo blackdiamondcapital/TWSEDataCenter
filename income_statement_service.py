@@ -22,6 +22,7 @@ from typing import List, Callable, Optional
 import logging
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 from lxml import etree
 
 
@@ -411,6 +412,55 @@ def _apply_scale(row):
         return v
 
 
+def _append_missing_eps_facts(results, raw_content):
+    """Recover EPS iXBRL facts that lxml's HTML parser can silently drop.
+
+    Some MOPS pages place the final EPS rows in markup that ``etree.HTMLParser``
+    repairs by discarding the custom ``ix:nonFraction`` elements.  Python's
+    built-in HTML parser preserves those elements, so use it only as a targeted
+    fallback when the primary parse did not find an EPS concept.
+    """
+
+    eps_concepts = {
+        "BasicEarningsLossPerShareTotal": "ifrs-full:BasicEarningsLossPerShare",
+        "DilutedEarningsLossPerShareTotal": "ifrs-full:DilutedEarningsLossPerShare",
+    }
+    existing_targets = {str(item.get("target") or "") for item in results}
+    missing = {
+        target: concept
+        for target, concept in eps_concepts.items()
+        if target not in existing_targets
+    }
+    if not missing:
+        return
+
+    try:
+        soup = BeautifulSoup(raw_content, "html.parser")
+    except Exception:
+        return
+
+    for target, concept in missing.items():
+        nodes = soup.find_all(
+            lambda tag: getattr(tag, "name", None)
+            and tag.name.lower() in ("ix:nonfraction", "nonfraction")
+            and str(tag.get("name") or "") == concept
+        )
+        for node in nodes:
+            results.append(
+                {
+                    "target": target,
+                    "name_attr": str(node.get("name") or ""),
+                    "value_text": node.get_text(strip=True),
+                    "contextref": node.get("contextref"),
+                    "period": node.get("contextref"),
+                    "unitref": node.get("unitref"),
+                    "scale": node.get("scale"),
+                    "decimals": node.get("decimals"),
+                    "sign": node.get("sign"),
+                }
+            )
+
+
 def fetch_income_row(co_id: str, year: str, season: str) -> pd.DataFrame:
     """Fetch a single company's income-statement row in wide format.
 
@@ -587,6 +637,8 @@ def fetch_income_row(co_id: str, year: str, season: str) -> pd.DataFrame:
             }
         )
 
+    _append_missing_eps_facts(results, resp.content)
+
     df = pd.DataFrame(results)
     if df.empty:
         try:
@@ -622,13 +674,18 @@ def fetch_income_row(co_id: str, year: str, season: str) -> pd.DataFrame:
 
     df["target"] = pd.Categorical(df["target"], categories=TARGET_ORDER, ordered=True)
     df = df.sort_values(["target", "period"]).reset_index(drop=True)
-    # observed=False 保持與目前預設行為一致，並避免 pandas FutureWarning
+    # MOPS 欄位順序以當季、去年同期、年初累計、去年同期累計排列。
+    # 保留第一筆，讓 EPS 與營收、淨利等欄位維持相同的單季口徑。
     df = df.groupby("target", observed=False).head(1).reset_index(drop=True)
 
     # wide format
     stock_code = co_id
     pivot = df.pivot_table(
-        index=["period"], columns="target", values="scaled_value", aggfunc="first"
+        index=["period"],
+        columns="target",
+        values="scaled_value",
+        aggfunc="first",
+        observed=False,
     ).reset_index()
     pivot.columns.name = None
     pivot.insert(0, "股票代號", stock_code)
