@@ -1,11 +1,11 @@
 name: Quarterly Financial Statements Fetch
 
 # 三大財務報表（損益／資產負債／現金流量）
-# 排程：各季法定申報截止「前五日」每天台北 00:00
-#   Q1 截止 5/15 → 5/10～5/14
-#   Q2 截止 8/14 → 8/9～8/13
-#   Q3 截止 11/14 → 11/9～11/13
-#   Q4 截止次年 3/31 → 3/26～3/30
+# 排程：各季法定申報截止「前五日～後五日」每天台北 00:00
+#   Q1 截止 5/15 → 5/10～5/20
+#   Q2 截止 8/14 → 8/9～8/19
+#   Q3 截止 11/14 → 11/9～11/19
+#   Q4 截止次年 3/31 → 3/26～4/5
 # GitHub cron 為 UTC：台北 00:00 = UTC 前一日 16:00
 on:
   schedule:
@@ -55,7 +55,7 @@ on:
         default: '5'
         type: string
       force:
-        description: '略過「截止前五日」窗口檢查（手動強制）'
+        description: '略過「截止前五日至後五日」窗口檢查（手動強制）'
         required: false
         default: true
         type: boolean
@@ -77,7 +77,7 @@ jobs:
       should_run: ${{ steps.check.outputs.should_run }}
       period: ${{ steps.check.outputs.period }}
     steps:
-      - name: Check pre-filing window
+      - name: Check filing-window range
         id: check
         run: |
           python3 <<'PY'
@@ -85,6 +85,7 @@ jobs:
           from datetime import date, timedelta
 
           PRE_DAYS = 5
+          POST_DAYS = 5
 
           def deadline(year: int, season: int) -> date:
               if season == 1:
@@ -107,10 +108,11 @@ jobs:
           ]
           active = None
           for year, season in candidates:
-              end = deadline(year, season)
-              start = end - timedelta(days=PRE_DAYS)
-              print(f"  {year}Q{season}: {start}～{end - timedelta(days=1)}（截止 {end}）")
-              if start <= today < end:
+              filing_deadline = deadline(year, season)
+              start = filing_deadline - timedelta(days=PRE_DAYS)
+              finish = filing_deadline + timedelta(days=POST_DAYS)
+              print(f"  {year}Q{season}: {start}～{finish}（截止 {filing_deadline}）")
+              if start <= today <= finish:
                   active = (year, season)
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
@@ -120,7 +122,7 @@ jobs:
                   fh.write("should_run=true\n")
                   fh.write(f"period={period}\n")
               else:
-                  print("非截止前五日窗口，略過")
+                  print("非截止前五日至後五日窗口，略過")
                   fh.write("should_run=false\n")
                   fh.write("period=\n")
           PY
