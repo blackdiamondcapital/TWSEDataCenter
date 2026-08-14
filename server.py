@@ -61,6 +61,11 @@ from cash_flow_service import (
     MopsBlockedError as CashFlowMopsBlockedError,
     TARGET_ORDER as CASH_FLOW_TARGET_ORDER,
 )
+from financial_ratios_service import (
+    FINANCIAL_RATIO_COLS,
+    compute_records_from_connection,
+    fetch_symbol_codes,
+)
 
 from table_config import (
     resolve_use_neon,
@@ -99,25 +104,6 @@ db_table_lock = threading.Lock()
 # 全局更新鎖，避免並行 /api/update 造成重複抓取
 update_lock = threading.Lock()
 db_sync_lock = threading.Lock()
-
-FINANCIAL_RATIO_COLS = [
-    # 方案 B：以 Neon 既有格式為準（snake_case）
-    "assets",
-    "equity",
-    "revenue",
-    "gross_profit",
-    "op_profit",
-    "net_profit",
-    "gross_margin",
-    "op_margin",
-    "net_margin",
-    "roa",
-    "roe",
-    "debt_ratio",
-    "current_ratio",
-    "quick_ratio",
-]
-
 
 def _safe_div(n, d):
     try:
@@ -5098,6 +5084,66 @@ def api_financial_ratios():
     try:
         if not db.create_tables():
             return jsonify({'error': '資料庫初始化失敗'}), 500
+
+        requested_code = str(code or '').strip().replace('.TWO', '').replace('.TW', '')
+        codes = fetch_symbol_codes(
+            db.connection,
+            period=period_label,
+            income_table=db.table_income,
+            code_from=requested_code or (str(code_from).strip() if code_from else None),
+            code_to=requested_code or (str(code_to).strip() if code_to else None),
+        )
+        financial_ratios_status['total'] = len(codes)
+        financial_ratios_status['phase'] = 'computing'
+        out = []
+        missing_count = 0
+        not_applicable_count = 0
+        error_count = 0
+        batches = 0
+        batch_size = 100
+        for start in range(0, len(codes), batch_size):
+            code_batch = codes[start:start + batch_size]
+            records, stats = compute_records_from_connection(
+                db.connection,
+                period=period_label,
+                codes=code_batch,
+                income_table=db.table_income,
+                balance_table=db.table_balance,
+                cash_flow_table=db.table_cash_flow,
+            )
+            out.extend(records)
+            missing_count += stats['missing']
+            not_applicable_count += stats['not_applicable']
+            error_count += stats['errors']
+            financial_ratios_status['processed'] = min(start + len(code_batch), len(codes))
+            financial_ratios_status['current_code'] = code_batch[-1] if code_batch else None
+            financial_ratios_status['success_count'] = len(out)
+            financial_ratios_status['error_count'] = error_count
+            if write_to_db and records:
+                inserted += stock_api.upsert_financial_ratios(records, db_manager=db)
+                batches += 1
+                financial_ratios_status['db_inserted_rows'] = inserted
+                financial_ratios_status['db_batches'] = batches
+                financial_ratios_status['db_last_commit_at'] = _dt.utcnow().isoformat()
+
+        financial_ratios_status['running'] = False
+        financial_ratios_status['finishedAt'] = _dt.utcnow().isoformat()
+        financial_ratios_status['phase'] = 'done'
+        return jsonify({
+            'meta': {
+                'year': str(year),
+                'season': str(season),
+                'period': period_label,
+                'rows': len(out),
+                'write_to_db': bool(write_to_db),
+                'inserted': int(inserted),
+                'batches': int(batches),
+                'missing_data': int(missing_count),
+                'not_applicable': int(not_applicable_count),
+                'errors': int(error_count),
+            },
+            'data': out,
+        })
 
         where = ["i.period = %s", "b.period = %s", "i.\"股票代號\" = b.\"股票代號\""]
         params = [period_label, period_label]
