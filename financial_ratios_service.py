@@ -32,6 +32,7 @@ EXTENDED_RATIO_COLS = [
 ]
 
 FINANCIAL_RATIO_COLS = LEGACY_RATIO_COLS + EXTENDED_RATIO_COLS
+AMOUNT_RATIO_COLS = {"operating_cash_flow", "free_cash_flow"}
 
 INCOME_FLOW_FIELDS = [
     "Revenue", "GrossProfitFromOperations", "ProfitLossFromOperatingActivities",

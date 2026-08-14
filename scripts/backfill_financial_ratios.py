@@ -18,6 +18,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from financial_ratios_service import (  # noqa: E402
+    AMOUNT_RATIO_COLS,
     FINANCIAL_RATIO_COLS,
     compute_records_from_connection,
     fetch_symbol_codes,
@@ -60,9 +61,20 @@ def ensure_contract(connection, table: str) -> None:
             """
         )
         for column in FINANCIAL_RATIO_COLS:
+            column_type = (
+                "NUMERIC(30,2)" if column in AMOUNT_RATIO_COLS else "NUMERIC(20,10)"
+            )
             cursor.execute(
                 f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "
-                f"{column} NUMERIC(20,10)"
+                f"{column} {column_type}"
+            )
+        # 舊版首次 migration 已將現金流總額建成 NUMERIC(20,10)，整數只能到
+        # 100 億；台灣大型公司單季現金流會溢位，需升級既有欄位。
+        for column in AMOUNT_RATIO_COLS:
+            cursor.execute(
+                f"ALTER TABLE {table} ALTER COLUMN {column} "
+                "TYPE NUMERIC(30,2) USING "
+                f"{column}::NUMERIC(30,2)"
             )
     connection.commit()
 

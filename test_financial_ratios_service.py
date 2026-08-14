@@ -8,6 +8,7 @@ from financial_ratios_service import (
     quarterly_income_flows,
     required_periods,
 )
+from scripts.backfill_financial_ratios import ensure_contract
 
 
 def _history(*, financial=False, negative_base=False):
@@ -180,3 +181,33 @@ def test_missing_current_statement_is_reported():
     income, balance, cash = _history()
     with pytest.raises(ValueError, match="missing current"):
         compute_financial_ratios("202404", income[:-1], balance, cash)
+
+
+def test_schema_uses_wide_numeric_for_cash_flow_amounts():
+    statements = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, sql):
+            statements.append(" ".join(sql.split()))
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            statements.append("COMMIT")
+
+    ensure_contract(Connection(), "tw_financial_ratios")
+    sql = "\n".join(statements)
+    assert "operating_cash_flow NUMERIC(30,2)" in sql
+    assert "free_cash_flow NUMERIC(30,2)" in sql
+    assert (
+        "ALTER COLUMN operating_cash_flow TYPE NUMERIC(30,2)"
+        in sql
+    )
