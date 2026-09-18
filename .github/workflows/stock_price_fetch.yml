@@ -12,7 +12,7 @@ env:
 jobs:
   fetch-stock-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code
@@ -238,6 +238,63 @@ jobs:
 
               return None
 
+          def fetch_tpex_all_stocks_single_day(target_date, symbol_set):
+              """上櫃：單次 API 取得當日全部 OTC 報價（避免每檔重複請求）"""
+              year = target_date.year
+              month = target_date.month
+              day = target_date.day
+              roc_date = f"{year-1911}/{month:02d}/{day:02d}"
+              headers = {"User-Agent": "Mozilla/5.0"}
+              url = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php"
+              params = {"l": "zh-tw", "d": roc_date, "se": "AL"}
+
+              print(f"📥 上櫃單次抓取當日行情（{roc_date}）...", flush=True)
+              try:
+                  response = requests.get(url, params=params, headers=headers, timeout=120)
+                  if response.status_code != 200:
+                      print(f"⚠️ 上櫃行情 HTTP {response.status_code}", flush=True)
+                      return []
+
+                  data = response.json()
+                  if not data.get("tables"):
+                      print("⚠️ 上櫃行情無 tables 資料", flush=True)
+                      return []
+
+                  table_data = data["tables"][0].get("data", [])
+                  records = []
+                  for row in table_data:
+                      try:
+                          stock_symbol = row[0].strip()
+                          if stock_symbol not in symbol_set:
+                              continue
+
+                          close_price = float(row[2].replace(",", "")) if row[2] not in ["-", "----", ""] else None
+                          open_price = float(row[4].replace(",", "")) if row[4] not in ["-", "----", ""] else None
+                          high_price = float(row[5].replace(",", "")) if row[5] not in ["-", "----", ""] else None
+                          low_price = float(row[6].replace(",", "")) if row[6] not in ["-", "----", ""] else None
+                          volume = int(row[7].replace(",", "")) if row[7] not in ["-", "0", ""] else 0
+
+                          if close_price and 0 < close_price < 30000:
+                              records.append(
+                                  (
+                                      f"{stock_symbol}.TWO",
+                                      target_date,
+                                      open_price,
+                                      high_price,
+                                      low_price,
+                                      close_price,
+                                      volume,
+                                  )
+                              )
+                      except (ValueError, IndexError):
+                          continue
+
+                  print(f"✅ 上櫃單次解析完成：{len(records)} / {len(symbol_set)} 檔", flush=True)
+                  return records
+              except Exception as e:
+                  print(f"⚠️ 上櫃單次抓取失敗: {e}", flush=True)
+                  return []
+
           # ========================================
           # 函數：抓取 ^TWII（yfinance）
           # ========================================
@@ -349,22 +406,10 @@ jobs:
 
               print(f"✅ 上市股票完成：{success_count} / {len(twse_symbols)} 檔", flush=True)
 
-              twse_count = success_count
-              success_count = 0
-
-              print("\n📥 使用併發抓取上櫃股票（10 併發）...", flush=True)
-              with ThreadPoolExecutor(max_workers=10) as executor:
-                  futures = {executor.submit(fetch_and_collect, symbol, False): symbol for symbol in tpex_symbols}
-
-                  for i, future in enumerate(as_completed(futures), 1):
-                      if future.result():
-                          success_count += 1
-
-                      if i % 50 == 0 or i == len(tpex_symbols):
-                          print(f"  進度: {i}/{len(tpex_symbols)}, 成功: {success_count}", flush=True)
-                          sys.stdout.flush()
-
-              print(f"✅ 上櫃股票完成：{success_count} / {len(tpex_symbols)} 檔", flush=True)
+              tpex_set = set(tpex_symbols)
+              tpex_records = fetch_tpex_all_stocks_single_day(today, tpex_set)
+              all_records.extend(tpex_records)
+              print(f"✅ 上櫃股票完成：{len(tpex_records)} / {len(tpex_symbols)} 檔", flush=True)
               print(f"\n📦 總計抓取：{len(all_records)} 筆資料", flush=True)
 
               # 3. 加入台灣加權指數 (^TWII)
