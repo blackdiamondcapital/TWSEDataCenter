@@ -37,6 +37,7 @@ jobs:
         run: |
           python3 -u << 'PYTHON_SCRIPT'
           import os
+          import re
           import sys
           import time
           import requests
@@ -47,6 +48,9 @@ jobs:
           from concurrent.futures import ThreadPoolExecutor, as_completed
           import threading
           import yfinance as yf  # 使用 yfinance 抓 ^TWII
+
+          ESB_REFERER = "https://www.tpex.org.tw/zh-tw/esb/trading/info/stock-pricing.html"
+          ESB_LATEST_URL = "https://www.tpex.org.tw/openapi/v1/tpex_esb_latest_statistics"
 
           # 強制即時輸出
           sys.stdout.flush()
@@ -295,6 +299,150 @@ jobs:
                   print(f"⚠️ 上櫃單次抓取失敗: {e}", flush=True)
                   return []
 
+          def parse_number(value):
+              if value is None:
+                  return None
+              text = str(value).strip()
+              if text in {"", "--", "-", "----", "X0.00"}:
+                  return None
+              text = text.replace(",", "")
+              try:
+                  number = float(text)
+                  if number != number:
+                      return None
+                  return number
+              except ValueError:
+                  return None
+
+          def parse_volume(value):
+              number = parse_number(value)
+              if number is None:
+                  return 0
+              return int(number)
+
+          def is_esb_stock_code(code):
+              return bool(re.fullmatch(r"\d{4,5}", str(code or "").strip()))
+
+          def parse_tpex_compact_roc_date(raw):
+              text = re.sub(r"\D", "", str(raw or "").strip())
+              if len(text) != 7:
+                  return None
+              try:
+                  roc_year = int(text[:3])
+                  month = int(text[3:5])
+                  day = int(text[5:7])
+                  return date(roc_year + 1911, month, day)
+              except ValueError:
+                  return None
+
+          def fetch_esb_all_stocks_single_day(target_date):
+              """興櫃：TPEx Open API 單次取得當日全部 ESB 成交（symbol 為 {code}.TWO）"""
+              print("📥 批量抓取興櫃收盤行情（TPEx Open API）...", flush=True)
+              headers = {
+                  "User-Agent": "Mozilla/5.0",
+                  "Accept": "application/json,text/plain,*/*",
+                  "Referer": ESB_REFERER,
+              }
+              records = []
+              try:
+                  response = requests.get(ESB_LATEST_URL, headers=headers, timeout=60)
+                  if response.status_code != 200:
+                      print(f"⚠️ 興櫃行情 HTTP {response.status_code}", flush=True)
+                      return []
+
+                  rows = response.json()
+                  if not isinstance(rows, list):
+                      print("⚠️ 興櫃 bulk API 回傳格式異常", flush=True)
+                      return []
+
+                  for row in rows:
+                      try:
+                          code = str(row.get("SecuritiesCompanyCode") or "").strip()
+                          if not is_esb_stock_code(code):
+                              continue
+
+                          trade_date = parse_tpex_compact_roc_date(row.get("Date"))
+                          if trade_date != target_date:
+                              continue
+
+                          volume = parse_volume(row.get("TransactionVolume"))
+                          if volume <= 0:
+                              continue
+
+                          high_price = parse_number(row.get("Highest"))
+                          low_price = parse_number(row.get("Lowest"))
+                          close_price = parse_number(row.get("Average")) or parse_number(
+                              row.get("LatestPrice")
+                          )
+                          if not close_price or not (0 < close_price < 30000):
+                              continue
+                          if not high_price or not low_price:
+                              continue
+
+                          open_price = close_price
+                          records.append(
+                              (
+                                  f"{code}.TWO",
+                                  target_date,
+                                  open_price,
+                                  high_price,
+                                  low_price,
+                                  close_price,
+                                  volume,
+                              )
+                          )
+                      except (TypeError, ValueError):
+                          continue
+
+                  if records:
+                      print(f"✅ 興櫃單次解析完成：{len(records)} 檔", flush=True)
+                  else:
+                      print(
+                          "⚠️ 興櫃：今日無成交資料（可能非交易日或 API 日期不符）",
+                          flush=True,
+                      )
+                  return records
+              except Exception as e:
+                  print(f"⚠️ 興櫃 bulk API 不可用: {e}", flush=True)
+                  return []
+
+          FILL_ESB_FLAT_SQL = """
+          INSERT INTO tw_stock_prices
+              (symbol, date, open_price, high_price, low_price, close_price, volume)
+          SELECT
+              s.symbol,
+              %s::date,
+              prev.close_price,
+              prev.close_price,
+              prev.close_price,
+              prev.close_price,
+              0
+          FROM tw_stock_symbols s
+          INNER JOIN LATERAL (
+              SELECT p.close_price
+              FROM tw_stock_prices p
+              WHERE p.symbol = s.symbol AND p.date < %s::date
+              ORDER BY p.date DESC
+              LIMIT 1
+          ) prev ON prev.close_price IS NOT NULL AND prev.close_price > 0
+          WHERE lower(trim(coalesce(s.market, ''))) = 'esb'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM tw_stock_prices x
+              WHERE x.symbol = s.symbol AND x.date = %s::date
+            )
+          """
+
+          def fill_esb_flat_for_date(conn, target_date):
+              """興櫃當日無成交者：以前收補 flat K（量 0）。"""
+              with conn.cursor() as flat_cur:
+                  flat_cur.execute(FILL_ESB_FLAT_SQL, (target_date, target_date, target_date))
+                  inserted = flat_cur.rowcount
+              conn.commit()
+              if inserted > 0:
+                  print(f"📎 興櫃無成交補 K：{inserted} 檔（沿用前收、量 0）", flush=True)
+              return inserted
+
           # ========================================
           # 函數：抓取 ^TWII（yfinance）
           # ========================================
@@ -410,6 +558,12 @@ jobs:
               tpex_records = fetch_tpex_all_stocks_single_day(today, tpex_set)
               all_records.extend(tpex_records)
               print(f"✅ 上櫃股票完成：{len(tpex_records)} / {len(tpex_symbols)} 檔", flush=True)
+
+              esb_records = fetch_esb_all_stocks_single_day(today)
+              all_records.extend(esb_records)
+              print(f"✅ 興櫃股票完成：{len(esb_records)} 檔", flush=True)
+
+              market_open = success_count > 0 or len(tpex_records) > 0 or len(esb_records) > 0
               print(f"\n📦 總計抓取：{len(all_records)} 筆資料", flush=True)
 
               # 3. 加入台灣加權指數 (^TWII)
@@ -504,6 +658,13 @@ jobs:
                       conn.rollback()
 
               print(f"✅ 成功同步 {total_inserted} 筆資料到 tw_stock_prices", flush=True)
+
+              if market_open:
+                  try:
+                      fill_esb_flat_for_date(conn, today)
+                  except Exception as e:
+                      print(f"⚠️ 興櫃無成交補 K 失敗: {e}", flush=True)
+                      conn.rollback()
 
               # 6. 建立/更新 tw_stock_returns 並計算今日報酬率
               try:
