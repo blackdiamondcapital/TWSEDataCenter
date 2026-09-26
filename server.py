@@ -1072,6 +1072,20 @@ class StockAPI:
     TWSE_MARGIN_URL = "https://www.twse.com.tw/exchangeReport/MI_MARGN"
     TPEX_MARGIN_URL = "https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php"
 
+    # 上市：一般 4–6 碼；槓桿/反向 ETF 常為 00631L、00632R 等
+    _TWSE_LISTING_CODE_RE = re.compile(r'^(?:\d{4,6}|\d{4,5}[A-Z])$')
+    _TPEX_LISTING_CODE_RE = re.compile(r'^\d{4,6}$')
+
+    @classmethod
+    def is_twse_listing_code(cls, code) -> bool:
+        s = str(code or '').strip().upper()
+        return bool(s and cls._TWSE_LISTING_CODE_RE.fullmatch(s))
+
+    @classmethod
+    def is_tpex_listing_code(cls, code) -> bool:
+        s = str(code or '').strip().upper()
+        return bool(s and cls._TPEX_LISTING_CODE_RE.fullmatch(s))
+
     def __init__(self):
         self.symbols_cache = None
         self.cache_time = None
@@ -1215,9 +1229,10 @@ class StockAPI:
                 cols = row.find_all('td')
                 if len(cols) > 1 and cols[0].text.strip():
                     code_name = cols[0].text.strip().split()
-                    if len(code_name) >= 2 and code_name[0].isdigit():
+                    code_raw = code_name[0].strip().upper()
+                    if len(code_name) >= 2 and self.is_twse_listing_code(code_raw):
                         symbols.append({
-                            'symbol': code_name[0] + '.TW', 
+                            'symbol': code_raw + '.TW',
                             'name': code_name[1],
                             'market': '上市'
                         })
@@ -1254,9 +1269,10 @@ class StockAPI:
                 cols = row.find_all('td')
                 if len(cols) > 1 and cols[0].text.strip():
                     code_name = cols[0].text.strip().split()
-                    if len(code_name) >= 2 and code_name[0].isdigit():
+                    code_raw = code_name[0].strip().upper()
+                    if len(code_name) >= 2 and self.is_tpex_listing_code(code_raw):
                         symbols.append({
-                            'symbol': code_name[0] + '.TWO', 
+                            'symbol': code_raw + '.TWO',
                             'name': code_name[1],
                             'market': '上櫃'
                         })
@@ -1448,11 +1464,13 @@ class StockAPI:
                 stock_code = symbol
                 market_suffix = None
 
-            # 僅在單檔抓取路徑限制：只處理 4 碼純數字股票代號（避免 020001.TWO 這類 5/6 碼）
-            if market_suffix in ('TW', 'TWO') and str(stock_code).isdigit() and len(str(stock_code)) != 4:
-                logger.info(f"跳過非四碼股票代號: {symbol}")
+            if market_suffix == 'TW' and not self.is_twse_listing_code(stock_code):
+                logger.info(f"跳過非上市可交易代號: {symbol}")
                 return None
-            
+            if market_suffix == 'TWO' and not self.is_tpex_listing_code(stock_code):
+                logger.info(f"跳過非上櫃可交易代號: {symbol}")
+                return None
+
             # 判斷是上市還是上櫃股票：優先使用代碼後綴判斷
             if market_suffix == 'TWO':
                 # 明確為上櫃
@@ -1577,8 +1595,8 @@ class StockAPI:
                         if len(row) < 9:
                             continue
                         
-                        stock_code = row[0].strip()
-                        if not stock_code or not stock_code.isdigit():
+                        stock_code = row[0].strip().upper()
+                        if not self.is_twse_listing_code(stock_code):
                             continue
                         
                         # 解析價格和成交量
@@ -1619,8 +1637,8 @@ class StockAPI:
                                 if len(row) < 9:
                                     continue
                                 
-                                stock_code = row[0].strip()
-                                if not stock_code or not stock_code.isdigit():
+                                stock_code = row[0].strip().upper()
+                                if not self.is_twse_listing_code(stock_code):
                                     continue
                                 
                                 # 解析價格和成交量 (舊格式欄位順序相同)
@@ -1763,8 +1781,8 @@ class StockAPI:
                         if not (isinstance(row, list) and len(row) >= 8):
                             continue
 
-                        stock_code = str(row[0]).strip()
-                        if not stock_code or not stock_code.isdigit():
+                        stock_code = str(row[0]).strip().upper()
+                        if not self.is_tpex_listing_code(stock_code):
                             continue
 
                         close_str = str(row[2]).replace(',', '').strip()
@@ -3650,19 +3668,139 @@ class StockAPI:
         logger.info(f"TPEX 月營收 HTML {roc_year:03d}{m:02d} 抓取 {len(results)} 筆")
         return results
 
+    def fetch_esb_monthly_revenue_html(self, year: int, month: int) -> list[dict]:
+        """MOPS HTML 抓取興櫃指定年月月營收（t21/rotc/t21sc03_*）。"""
+        try:
+            y = int(year)
+            m = int(month)
+            if m < 1 or m > 12:
+                raise ValueError
+        except Exception:
+            raise ValueError("year / month 參數格式錯誤，需為有效西元年與月份")
+
+        roc_year = y - 1911 if y > 1990 else y
+        if roc_year <= 0:
+            raise ValueError("year 轉民國後需大於 0")
+
+        if roc_year <= 98:
+            url = f"https://mopsov.twse.com.tw/nas/t21/rotc/t21sc03_{roc_year}_{m}.html"
+        else:
+            url = f"https://mopsov.twse.com.tw/nas/t21/rotc/t21sc03_{roc_year}_{m}_0.html"
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36'
+        }
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            resp.encoding = 'big5'
+        except Exception as exc:
+            logger.warning(f"ESB 月營收 HTML 抓取失敗: {exc}")
+            return []
+
+        try:
+            dfs = pd.read_html(io.StringIO(resp.text))
+        except Exception as exc:
+            logger.warning(f"ESB 月營收 HTML 解析失敗: {exc}")
+            return []
+
+        tables = [df for df in dfs if 5 < df.shape[1] <= 15]
+        if not tables:
+            logger.info("ESB 月營收 HTML 無符合欄位數的資料表")
+            return []
+
+        df = pd.concat(tables, ignore_index=True)
+
+        def _norm_cell(v):
+            try:
+                s = '' if v is None else str(v)
+            except Exception:
+                s = ''
+            return s.replace('\u3000', ' ').strip()
+
+        def _compact_ws(s: str) -> str:
+            return ''.join(str(s).split())
+
+        def _norm_columns(frame: pd.DataFrame) -> list[str]:
+            cols: list[str] = []
+            for c in list(frame.columns):
+                if isinstance(c, tuple):
+                    parts = [_norm_cell(p) for p in c if _norm_cell(p) and _norm_cell(p).lower() != 'nan']
+                    cols.append(''.join(parts).strip())
+                else:
+                    cols.append(_norm_cell(c))
+            return cols
+
+        def _find_col(cols: list[str], keywords: list[str]) -> str | None:
+            cols_norm = [_compact_ws(_norm_cell(c)) for c in cols]
+            keywords_norm = [_compact_ws(_norm_cell(k)) for k in keywords]
+            for idx, c_norm in enumerate(cols_norm):
+                for k_norm in keywords_norm:
+                    if k_norm and (k_norm == c_norm or k_norm in c_norm):
+                        return cols[idx]
+            return None
+
+        df.columns = _norm_columns(df)
+        code_col = _find_col(list(df.columns), ['公司代號'])
+        name_col = _find_col(list(df.columns), ['公司名稱'])
+        industry_col = _find_col(list(df.columns), ['產業別'])
+        month_rev_col = _find_col(list(df.columns), ['當月營收'])
+        last_month_col = _find_col(list(df.columns), ['上月營收'])
+        last_year_col = _find_col(list(df.columns), ['去年當月營收'])
+        mom_col = _find_col(list(df.columns), ['上月比較增減(%)', '上月比較增減'])
+        yoy_col = _find_col(list(df.columns), ['去年同月增減(%)', '去年同月增減'])
+        acc_col = _find_col(list(df.columns), ['當月累計營收', '本年累計營收'])
+        last_acc_col = _find_col(list(df.columns), ['去年累計營收'])
+        acc_chg_col = _find_col(list(df.columns), ['前期比較增減(%)', '前期比較增減'])
+        note_col = _find_col(list(df.columns), ['備註'])
+
+        if not code_col or not month_rev_col:
+            logger.warning("ESB 月營收 HTML 缺少必要欄位")
+            return []
+
+        revenue_month = date(y, m, 1).isoformat()
+        results: list[dict] = []
+        for _, row in df.iterrows():
+            stock_no = str(row.get(code_col) or '').strip()
+            if not stock_no or stock_no == '合計':
+                continue
+            results.append({
+                'revenue_month': revenue_month,
+                'market': 'ESB',
+                'stock_no': stock_no,
+                'stock_name': row.get(name_col) if name_col else None,
+                'industry': row.get(industry_col) if industry_col else None,
+                'report_date': None,
+                'month_revenue': self._t86_parse_int(row.get(month_rev_col)),
+                'last_month_revenue': self._t86_parse_int(row.get(last_month_col)) if last_month_col else 0,
+                'last_year_month_revenue': self._t86_parse_int(row.get(last_year_col)) if last_year_col else 0,
+                'mom_change_pct': self._parse_decimal(row.get(mom_col)) if mom_col else None,
+                'yoy_change_pct': self._parse_decimal(row.get(yoy_col)) if yoy_col else None,
+                'acc_revenue': self._t86_parse_int(row.get(acc_col)) if acc_col else 0,
+                'last_year_acc_revenue': self._t86_parse_int(row.get(last_acc_col)) if last_acc_col else 0,
+                'acc_change_pct': self._parse_decimal(row.get(acc_chg_col)) if acc_chg_col else None,
+                'note': row.get(note_col) if note_col else None,
+            })
+
+        logger.info(f"ESB 月營收 HTML {roc_year:03d}{m:02d} 抓取 {len(results)} 筆")
+        return results
+
     def fetch_monthly_revenue_html(self, year: int, month: int, market: str = 'both'):
-        """使用 HTML 報表抓取指定年月的上市/上櫃月營收，用於歷史批次抓取。
+        """使用 HTML 報表抓取指定年月的上市/上櫃/興櫃月營收，用於歷史批次抓取。
 
         這不影響現有 JSON 版 fetch_monthly_revenue，僅供 /api/revenue/fetch_range 使用。
         """
         market_key = (market or 'both').lower()
-        if market_key not in {'twse', 'tpex', 'both'}:
-            raise ValueError("market 必須為 'twse'、'tpex' 或 'both'")
+        if market_key not in {'twse', 'tpex', 'esb', 'both', 'all'}:
+            raise ValueError("market 必須為 'twse'、'tpex'、'esb'、'both' 或 'all'")
 
-        markets = {'twse', 'tpex'} if market_key == 'both' else {market_key}
+        if market_key in {'both', 'all'}:
+            markets = {'twse', 'tpex', 'esb'}
+        else:
+            markets = {market_key}
 
         results: list[dict] = []
-        per_market = {'TWSE': 0, 'TPEX': 0}
+        per_market = {'TWSE': 0, 'TPEX': 0, 'ESB': 0}
 
         if 'twse' in markets:
             try:
@@ -3681,6 +3819,15 @@ class StockAPI:
                 tpex_records = []
             results.extend(tpex_records)
             per_market['TPEX'] = len(tpex_records)
+
+        if 'esb' in markets:
+            try:
+                esb_records = self.fetch_esb_monthly_revenue_html(year, month)
+            except Exception as exc:
+                logger.warning(f"ESB 月營收 HTML 抓取 {year}-{month:02d} 失敗: {exc}")
+                esb_records = []
+            results.extend(esb_records)
+            per_market['ESB'] = len(esb_records)
 
         roc_year = int(year) - 1911
         roc_yyyymm = f"{roc_year:03d}{int(month):02d}"

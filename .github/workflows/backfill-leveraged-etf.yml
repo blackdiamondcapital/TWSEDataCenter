@@ -1,0 +1,77 @@
+name: Backfill Leveraged ETF Prices
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 回補模式
+        type: choice
+        options:
+          - leveraged
+          - etf
+        default: leveraged
+      start_date:
+        description: 起始日 YYYY-MM-DD
+        type: string
+        default: '2010-01-01'
+      batch_size:
+        description: 每批標的數（矩陣各 job 處理一批）
+        type: number
+        default: 100
+      min_records:
+        description: 現有 K 線低於此筆數才回補
+        type: number
+        default: 200
+
+env:
+  TZ: Asia/Taipei
+  PYTHONUNBUFFERED: '1'
+  CLOUD_DEPLOYMENT: '1'
+  ENABLE_YFINANCE_FALLBACK: '1'
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        batch_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Backfill ETF daily prices (batch ${{ matrix.batch_index }})
+        env:
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        run: |
+          python3 scripts/backfill_leveraged_etf_prices.py \
+            --mode "${{ inputs.mode }}" \
+            --start "${{ inputs.start_date }}" \
+            --min-records "${{ inputs.min_records }}" \
+            --batch-index "${{ matrix.batch_index }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            --sleep 0.35 2>&1 | tee "backfill-batch-${{ matrix.batch_index }}.log"
+
+      - name: Upload batch log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-etf-batch-${{ matrix.batch_index }}-${{ github.run_number }}
+          path: backfill-batch-*.log
+          if-no-files-found: ignore
+          retention-days: 14
