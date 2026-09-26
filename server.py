@@ -4487,24 +4487,32 @@ class StockAPI:
                                         low_price = float(row[5].replace(',', '')) if row[5] != '--' else None
                                         close_price = float(row[6].replace(',', '')) if row[6] != '--' else None
                                         
-                                        # 驗證所有價格都小於30000
-                                        if (close_price is not None and close_price > 0 and
-                                            (open_price is None or open_price < 30000) and 
-                                            (high_price is None or high_price < 30000) and 
-                                            (low_price is None or low_price < 30000) and 
-                                            close_price < 30000):
-                                            result.append({
-                                                'ticker': f"{stock_code}.TW",
-                                                'Date': trade_date.strftime('%Y-%m-%d'),
-                                                'Open': round(open_price, 2) if open_price is not None else None,
-                                                'High': round(high_price, 2) if high_price is not None else None,
-                                                'Low': round(low_price, 2) if low_price is not None else None,
-                                                'Close': round(close_price, 2),
-                                                'Volume': volume
-                                            })
-                                        else:
-                                            logger.warning(f"價格超過30000，跳過 {trade_date.strftime('%Y-%m-%d')}: "
-                                                          f"O:{open_price}, H:{high_price}, L:{low_price}, C:{close_price}")
+                                        if close_price is None or close_price <= 0:
+                                            continue
+                                        if close_price >= 30000:
+                                            logger.warning(
+                                                f"收盤價異常跳過 {trade_date.strftime('%Y-%m-%d')}: "
+                                                f"close={close_price}"
+                                            )
+                                            continue
+                                        if any(
+                                            p is not None and p >= 30000
+                                            for p in (open_price, high_price, low_price)
+                                        ):
+                                            logger.warning(
+                                                f"OHLC 異常跳過 {trade_date.strftime('%Y-%m-%d')}: "
+                                                f"O:{open_price}, H:{high_price}, L:{low_price}, C:{close_price}"
+                                            )
+                                            continue
+                                        result.append({
+                                            'ticker': f"{stock_code}.TW",
+                                            'Date': trade_date.strftime('%Y-%m-%d'),
+                                            'Open': round(open_price, 2) if open_price is not None else None,
+                                            'High': round(high_price, 2) if high_price is not None else None,
+                                            'Low': round(low_price, 2) if low_price is not None else None,
+                                            'Close': round(close_price, 2),
+                                            'Volume': volume
+                                        })
                             except (ValueError, IndexError) as e:
                                 logger.warning(f"解析數據行失敗: {row}, 錯誤: {e}")
                                 continue
