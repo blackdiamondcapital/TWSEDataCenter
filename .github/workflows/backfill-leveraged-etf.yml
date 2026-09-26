@@ -17,7 +17,7 @@ on:
       batch_size:
         description: 每批標的數（矩陣各 job 處理一批）
         type: number
-        default: 100
+        default: 50
       min_records:
         description: 現有 K 線低於此筆數才回補
         type: number
@@ -35,8 +35,9 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
-        batch_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        batch_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 
     steps:
       - name: Checkout
@@ -59,6 +60,7 @@ jobs:
           DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
         run: |
+          set -o pipefail
           python3 scripts/backfill_leveraged_etf_prices.py \
             --mode "${{ inputs.mode }}" \
             --start "${{ inputs.start_date }}" \
@@ -66,6 +68,7 @@ jobs:
             --batch-index "${{ matrix.batch_index }}" \
             --batch-size "${{ inputs.batch_size }}" \
             --sleep 0.35 2>&1 | tee "backfill-batch-${{ matrix.batch_index }}.log"
+          exit "${PIPESTATUS[0]}"
 
       - name: Upload batch log
         if: always()

@@ -218,6 +218,25 @@ def df_to_records(df) -> list[dict]:
     return records
 
 
+def reconnect_db(db: DatabaseManager) -> None:
+    """長時間打 TWSE 後 Neon 常斷線，寫入前重連。"""
+    try:
+        db.disconnect()
+    except Exception:
+        pass
+    if not db.connect():
+        raise RuntimeError("資料庫重新連線失敗")
+    db.create_tables()
+
+
+def safe_rollback(db: DatabaseManager) -> None:
+    try:
+        if db.connection and not db.connection.closed:
+            db.connection.rollback()
+    except Exception:
+        pass
+
+
 def upsert_symbol_meta(cur, symbol: str, name: str) -> None:
     cur.execute(
         """
@@ -310,8 +329,12 @@ def main() -> int:
         db.disconnect()
         return 0
 
-    cursor = db.connection.cursor()
-    cursor.table_prices = db.table_prices
+    if not targets:
+        db.disconnect()
+        log("ℹ️  本批無待回補標的")
+        return 0
+
+    db.disconnect()
     ok = 0
     fail = 0
     inserted_total = 0
@@ -320,29 +343,41 @@ def main() -> int:
         sym = item["symbol"]
         name = item.get("name") or ""
         log(f"\n[{idx}/{len(targets)}] 抓取 {sym} …")
+        cursor = None
         try:
-            upsert_symbol_meta(cursor, sym, name)
             df = api.fetch_stock_data(sym, args.start, end_date)
             records = df_to_records(df)
             if not records:
-                log(f"   ⚠️ 無資料")
+                log("   ⚠️ 無資料")
                 fail += 1
-                db.connection.commit()
                 time.sleep(args.sleep)
                 continue
+
+            reconnect_db(db)
+            cursor = db.connection.cursor()
+            cursor.table_prices = db.table_prices
+            upsert_symbol_meta(cursor, sym, name)
             n = _upsert_prices(cursor, sym, records, prices_table=db.table_prices)
             db.connection.commit()
             inserted_total += n
             ok += 1
             log(f"   ✅ 寫入 {n} 筆（區間 {args.start} ~ {end_date}）")
         except Exception as exc:
-            db.connection.rollback()
+            safe_rollback(db)
             fail += 1
             log(f"   ❌ 失敗: {exc}")
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            try:
+                db.disconnect()
+            except Exception:
+                pass
         time.sleep(args.sleep)
 
-    cursor.close()
-    db.disconnect()
     log(f"\n完成：成功 {ok} 檔、失敗 {fail} 檔，本次 upsert 列數約 {inserted_total}")
     return 0 if fail == 0 else 2
 
