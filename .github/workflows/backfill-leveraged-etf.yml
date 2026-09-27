@@ -1,5 +1,8 @@
 name: Backfill Leveraged ETF Prices
 
+# 每 job 上限 360 分鐘；單檔約 6–10 分鐘 → batch_size 建議 ≤12。
+# 重跑同一 workflow 即可續補（min_records 會跳過 K 線已足夠的標的）。
+
 on:
   workflow_dispatch:
     inputs:
@@ -15,11 +18,11 @@ on:
         type: string
         default: '2010-01-01'
       batch_size:
-        description: 每批標的數（矩陣各 job 處理一批）
+        description: 每批標的數（建議 10–12，勿超過 15）
         type: number
-        default: 50
+        default: 12
       min_records:
-        description: 現有 K 線低於此筆數才回補
+        description: 現有 K 線低於此筆數才回補（續跑時維持 200）
         type: number
         default: 200
 
@@ -35,9 +38,67 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 6
       matrix:
-        batch_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        batch_index:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+          - 16
+          - 17
+          - 18
+          - 19
+          - 20
+          - 21
+          - 22
+          - 23
+          - 24
+          - 25
+          - 26
+          - 27
+          - 28
+          - 29
+          - 30
+          - 31
+          - 32
+          - 33
+          - 34
+          - 35
+          - 36
+          - 37
+          - 38
+          - 39
+          - 40
+          - 41
+          - 42
+          - 43
+          - 44
+          - 45
+          - 46
+          - 47
+          - 48
+          - 49
+          - 50
+          - 51
+          - 52
+          - 53
+          - 54
+          - 55
+          - 56
+          - 57
 
     steps:
       - name: Checkout
@@ -75,6 +136,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backfill-etf-batch-${{ matrix.batch_index }}-${{ github.run_number }}
-          path: backfill-batch-*.log
+          path: backfill-batch-${{ matrix.batch_index }}.log
           if-no-files-found: ignore
           retention-days: 14
