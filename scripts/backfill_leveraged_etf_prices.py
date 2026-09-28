@@ -36,7 +36,12 @@ from server import (  # noqa: E402
 
 _SUFFIX_RE = re.compile(r"\.(TW|TWO|TPEX|TSE)$", re.I)
 _NAME_ETF_HINT = re.compile(r"ETF|指數股票型|正\d|反\d|槓桿|反向|2倍|2X|3倍|3X", re.I)
-_LEVERAGED_CODE = re.compile(r"^\d{4,5}[LRK]$")
+_NAME_EXCLUDE = re.compile(r"購|售|認購|認售|牛熊|權證|受益憑證")
+# 真實槓桿/反向/期信 ETF：幾乎都是 00xxxx + L/R/K/U（排除權證等 048096）
+_LEVERAGED_CODE = re.compile(r"^00\d{2,4}[LRK]$")
+_FUTURES_ETF_CODE = re.compile(r"^00\d{2,4}U$")
+_PLAIN_ETF_CODE = re.compile(r"^00\d{2,4}$")
+_ACTIVE_ETF_CODE = re.compile(r"^00\d{2,4}A$")
 
 
 def log(msg: str) -> None:
@@ -52,16 +57,22 @@ def tw_symbol(base: str) -> str:
     return b if b.endswith(".TW") else f"{b}.TW"
 
 
+def is_excluded_derivative_name(name: str) -> bool:
+    return bool(_NAME_EXCLUDE.search(str(name or "")))
+
+
 def is_leveraged_candidate(base: str, name: str = "") -> bool:
     if not StockAPI.is_twse_listing_code(base):
+        return False
+    if is_excluded_derivative_name(name):
         return False
     if _LEVERAGED_CODE.fullmatch(base):
         return True
     label = str(name or "")
-    if re.search(r"正\d|反\d|槓桿|反向", label):
+    if _FUTURES_ETF_CODE.fullmatch(base) and ("期" in label or re.search(r"正\d|反\d|槓桿|反向", label)):
         return True
-    # 期信/結構型：00635U 等，名稱常含「期」
-    if re.fullmatch(r"^\d{4,5}[U]$", base) and "期" in label:
+    # 名稱含正2/反1 等：限 00 開頭，避免權證／受益證券誤入
+    if base.startswith("00") and re.search(r"正\d|反\d|槓桿|反向", label):
         return True
     return False
 
@@ -69,12 +80,14 @@ def is_leveraged_candidate(base: str, name: str = "") -> bool:
 def is_etf_candidate(base: str, name: str = "") -> bool:
     if not StockAPI.is_twse_listing_code(base):
         return False
-    label = str(name or "")
+    if is_excluded_derivative_name(name):
+        return False
     if is_leveraged_candidate(base, name):
         return True
-    if _NAME_ETF_HINT.search(label):
+    if _PLAIN_ETF_CODE.fullmatch(base) or _ACTIVE_ETF_CODE.fullmatch(base):
         return True
-    if base.startswith("00") and re.fullmatch(r"\d{4,6}", base):
+    label = str(name or "")
+    if base.startswith("00") and _NAME_ETF_HINT.search(label):
         return True
     return False
 
@@ -336,7 +349,8 @@ def main() -> int:
 
     db.disconnect()
     ok = 0
-    fail = 0
+    skipped = 0
+    hard_fail = 0
     inserted_total = 0
 
     for idx, item in enumerate(targets, start=1):
@@ -348,8 +362,8 @@ def main() -> int:
             df = api.fetch_stock_data(sym, args.start, end_date)
             records = df_to_records(df)
             if not records:
-                log("   ⚠️ 無資料")
-                fail += 1
+                log("   ⚠️ 無資料（略過，不計失敗）")
+                skipped += 1
                 time.sleep(args.sleep)
                 continue
 
@@ -364,7 +378,7 @@ def main() -> int:
             log(f"   ✅ 寫入 {n} 筆（區間 {args.start} ~ {end_date}）")
         except Exception as exc:
             safe_rollback(db)
-            fail += 1
+            hard_fail += 1
             log(f"   ❌ 失敗: {exc}")
         finally:
             if cursor is not None:
@@ -378,8 +392,11 @@ def main() -> int:
                 pass
         time.sleep(args.sleep)
 
-    log(f"\n完成：成功 {ok} 檔、失敗 {fail} 檔，本次 upsert 列數約 {inserted_total}")
-    return 0 if fail == 0 else 2
+    log(
+        f"\n完成：成功 {ok} 檔、略過 {skipped} 檔、失敗 {hard_fail} 檔，"
+        f"本次 upsert 列數約 {inserted_total}"
+    )
+    return 0 if hard_fail == 0 else 2
 
 
 if __name__ == "__main__":
