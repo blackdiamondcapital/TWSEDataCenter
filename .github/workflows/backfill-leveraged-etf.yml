@@ -25,6 +25,10 @@ on:
         description: 現有 K 線低於此筆數才回補（續跑時維持 200）
         type: number
         default: 200
+      refresh_stale:
+        description: 一併續補「最新日 < 市場最新交易日」的標的
+        type: boolean
+        default: true
 
 env:
   TZ: Asia/Taipei
@@ -122,10 +126,15 @@ jobs:
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
         run: |
           set -o pipefail
+          REFRESH_FLAG=""
+          if [ "${{ inputs.refresh_stale }}" = "true" ]; then
+            REFRESH_FLAG="--refresh-stale"
+          fi
           python3 scripts/backfill_leveraged_etf_prices.py \
             --mode "${{ inputs.mode }}" \
             --start "${{ inputs.start_date }}" \
             --min-records "${{ inputs.min_records }}" \
+            $REFRESH_FLAG \
             --batch-index "${{ matrix.batch_index }}" \
             --batch-size "${{ inputs.batch_size }}" \
             --sleep 0.35 2>&1 | tee "backfill-batch-${{ matrix.batch_index }}.log"

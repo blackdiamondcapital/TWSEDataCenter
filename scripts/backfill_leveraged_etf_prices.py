@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""回補上市槓桿/反向 ETF 與缺 K 線之 ETF（00631L、00632R、006208 等）。
+"""回補上市 ETF 日 K（槓桿／反向／債券／主動型等 00xxxx）。
 
-依 TWSE STOCK_DAY 逐月抓取，寫入 tw_stock_prices（預設使用 .env 的 DATABASE_URL / NEON）。
+依 TWSE STOCK_DAY 逐月抓取，寫入 tw_stock_prices（.env 的 DATABASE_URL / NEON）。
 
 用法：
-  cd 台股數據資料抓取＿桌機
-  python3 scripts/backfill_leveraged_etf_prices.py
-  python3 scripts/backfill_leveraged_etf_prices.py --dry-run
-  python3 scripts/backfill_leveraged_etf_prices.py --symbols 00631L,00632R
+  python3 scripts/backfill_leveraged_etf_prices.py --mode etf --dry-run
+  python3 scripts/backfill_leveraged_etf_prices.py --mode etf --refresh-stale
+  python3 scripts/backfill_leveraged_etf_prices.py --symbols 00631L,00710B
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -37,11 +36,9 @@ from server import (  # noqa: E402
 _SUFFIX_RE = re.compile(r"\.(TW|TWO|TPEX|TSE)$", re.I)
 _NAME_ETF_HINT = re.compile(r"ETF|指數股票型|正\d|反\d|槓桿|反向|2倍|2X|3倍|3X", re.I)
 _NAME_EXCLUDE = re.compile(r"購|售|認購|認售|牛熊|權證|受益憑證")
-# 真實槓桿/反向/期信 ETF：幾乎都是 00xxxx + L/R/K/U（排除權證等 048096）
 _LEVERAGED_CODE = re.compile(r"^00\d{2,4}[LRK]$")
 _FUTURES_ETF_CODE = re.compile(r"^00\d{2,4}U$")
 _PLAIN_ETF_CODE = re.compile(r"^00\d{2,4}$")
-# 主動 A、債券 B、配息 D、平衡 T、槓桿 L/R/K、期信 U 等
 _LETTER_ETF_CODE = re.compile(r"^00\d{2,4}[A-Z]$")
 
 
@@ -72,7 +69,6 @@ def is_leveraged_candidate(base: str, name: str = "") -> bool:
     label = str(name or "")
     if _FUTURES_ETF_CODE.fullmatch(base) and ("期" in label or re.search(r"正\d|反\d|槓桿|反向", label)):
         return True
-    # 名稱含正2/反1 等：限 00 開頭，避免權證／受益證券誤入
     if base.startswith("00") and re.search(r"正\d|反\d|槓桿|反向", label):
         return True
     return False
@@ -85,7 +81,6 @@ def is_etf_candidate(base: str, name: str = "") -> bool:
         return False
     if is_leveraged_candidate(base, name):
         return True
-    # 所有 00xxxx / 00xxxxX 上市 ETF（含債券 B、主動 A、00982T 等）
     if _PLAIN_ETF_CODE.fullmatch(base) or _LETTER_ETF_CODE.fullmatch(base):
         return True
     label = str(name or "")
@@ -94,11 +89,11 @@ def is_etf_candidate(base: str, name: str = "") -> bool:
     return False
 
 
-def load_price_counts(conn, bases: list[str]) -> dict[str, int]:
+def load_price_meta(conn, bases: list[str]) -> dict[str, dict]:
     if not bases:
         return {}
     bases = sorted(set(bases))
-    out: dict[str, int] = {b: 0 for b in bases}
+    out: dict[str, dict] = {b: {"cnt": 0, "latest": None} for b in bases}
     chunk = 400
     with conn.cursor() as cur:
         for i in range(0, len(bases), chunk):
@@ -106,7 +101,8 @@ def load_price_counts(conn, bases: list[str]) -> dict[str, int]:
             cur.execute(
                 """
                 SELECT regexp_replace(upper(trim(symbol)), '\\.(TW|TWO|TPEX|TSE)$', '', 'i') AS base,
-                       COUNT(*)::int AS cnt
+                       COUNT(*)::int AS cnt,
+                       MAX(date)::date AS latest
                 FROM tw_stock_prices
                 WHERE regexp_replace(upper(trim(symbol)), '\\.(TW|TWO|TPEX|TSE)$', '', 'i') = ANY(%s)
                 GROUP BY 1
@@ -115,12 +111,26 @@ def load_price_counts(conn, bases: list[str]) -> dict[str, int]:
             )
             for row in cur.fetchall():
                 if isinstance(row, dict):
-                    base = row.get("base")
-                    cnt = row.get("cnt")
+                    base, cnt, latest = row.get("base"), row.get("cnt"), row.get("latest")
                 else:
-                    base, cnt = row[0], row[1]
-                out[str(base).upper()] = int(cnt or 0)
+                    base, cnt, latest = row[0], row[1], row[2]
+                out[str(base).upper()] = {
+                    "cnt": int(cnt or 0),
+                    "latest": latest.isoformat() if hasattr(latest, "isoformat") else (str(latest)[:10] if latest else None),
+                }
     return out
+
+
+def market_latest_date(conn) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(date)::date AS d FROM tw_stock_prices")
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = row["d"] if isinstance(row, dict) else row[0]
+        if not d:
+            return None
+        return d.isoformat() if hasattr(d, "isoformat") else str(d)[:10]
 
 
 def discover_from_isin(api: StockAPI, mode: str = "leveraged") -> list[dict]:
@@ -146,16 +156,9 @@ def discover_from_isin(api: StockAPI, mode: str = "leveraged") -> list[dict]:
 
 def discover_from_db(conn) -> list[dict]:
     sql = """
-        WITH priced AS (
-          SELECT symbol, COUNT(*)::int AS cnt
-          FROM tw_stock_prices
-          GROUP BY symbol
-        )
         SELECT s.symbol,
-               COALESCE(s.short_name, s.name, '') AS name,
-               COALESCE(p.cnt, 0) AS price_cnt
+               COALESCE(s.short_name, s.name, '') AS name
         FROM tw_stock_symbols s
-        LEFT JOIN priced p ON p.symbol = s.symbol
         WHERE lower(trim(COALESCE(s.market, ''))) IN (
           'listed', 'twse', 'tse', '上市', 'etf'
         )
@@ -168,32 +171,27 @@ def discover_from_db(conn) -> list[dict]:
             if isinstance(row, dict):
                 symbol = row.get("symbol")
                 name = row.get("name")
-                price_cnt = row.get("price_cnt")
             else:
-                symbol, name, price_cnt = row[0], row[1], row[2]
+                symbol, name = row[0], row[1]
             base = base_code(symbol)
             if base in seen:
                 continue
             if not is_etf_candidate(base, name):
                 continue
             seen.add(base)
-            out.append(
-                {
-                    "symbol": tw_symbol(base),
-                    "name": name,
-                    "price_cnt": int(price_cnt or 0),
-                    "source": "db",
-                }
-            )
+            out.append({"symbol": tw_symbol(base), "name": name, "source": "db"})
     return out
 
 
 def merge_targets(
     isin_rows: list[dict],
     db_rows: list[dict],
-    price_counts: dict[str, int],
+    price_meta: dict[str, dict],
     min_records: int,
     mode: str,
+    *,
+    refresh_stale: bool = False,
+    market_as_of: str | None = None,
 ) -> list[dict]:
     by_base: dict[str, dict] = {}
     for row in isin_rows + db_rows:
@@ -204,15 +202,39 @@ def merge_targets(
             continue
         if mode == "etf" and not is_etf_candidate(base, name):
             continue
+        meta = price_meta.get(base) or {"cnt": 0, "latest": None}
         prev = by_base.get(base)
         by_base[base] = {
             "symbol": sym,
             "name": name or (prev or {}).get("name") or "",
-            "price_cnt": int(price_counts.get(base, 0)),
+            "price_cnt": int(meta.get("cnt") or 0),
+            "latest": meta.get("latest"),
         }
-    targets = [v for v in by_base.values() if v["price_cnt"] < min_records]
-    targets.sort(key=lambda x: (x["price_cnt"], x["symbol"]))
+
+    targets = []
+    for v in by_base.values():
+        need = v["price_cnt"] < min_records
+        if refresh_stale and market_as_of:
+            latest = v.get("latest")
+            if latest is None or str(latest)[:10] < market_as_of:
+                need = True
+        if need:
+            targets.append(v)
+    targets.sort(key=lambda x: (0 if not x.get("latest") else 1, x.get("latest") or "", x["price_cnt"], x["symbol"]))
     return targets
+
+
+def fetch_start_for_target(item: dict, default_start: str) -> str:
+    """已有歷史者從最新日往前幾天續抓，加快過期補齊。"""
+    latest = item.get("latest")
+    if not latest:
+        return default_start
+    try:
+        dt = datetime.strptime(str(latest)[:10], "%Y-%m-%d")
+        start = (dt - timedelta(days=7)).strftime("%Y-%m-%d")
+        return max(default_start, start) if default_start else start
+    except Exception:
+        return default_start
 
 
 def df_to_records(df) -> list[dict]:
@@ -234,7 +256,6 @@ def df_to_records(df) -> list[dict]:
 
 
 def reconnect_db(db: DatabaseManager) -> None:
-    """長時間打 TWSE 後 Neon 常斷線，寫入前重連。"""
     try:
         db.disconnect()
     except Exception:
@@ -267,31 +288,26 @@ def upsert_symbol_meta(cur, symbol: str, name: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="回補槓桿/反向與缺資料 ETF 日 K")
-    parser.add_argument("--start", default=DEFAULT_START_DATE, help="起始日 YYYY-MM-DD")
+    parser = argparse.ArgumentParser(description="回補／續補上市 ETF 日 K")
+    parser.add_argument("--start", default=DEFAULT_START_DATE, help="起始日 YYYY-MM-DD（無歷史時用）")
     parser.add_argument("--end", default=None, help="結束日，預設今天")
     parser.add_argument("--min-records", type=int, default=200, help="低於此筆數才回補")
-    parser.add_argument("--symbols", default="", help="只處理指定代號，逗號分隔（可不含 .TW）")
+    parser.add_argument(
+        "--refresh-stale",
+        action="store_true",
+        help="連同「最新日 < 市場最新交易日」的標的一併續補",
+    )
+    parser.add_argument("--symbols", default="", help="只處理指定代號，逗號分隔")
     parser.add_argument("--sleep", type=float, default=0.35, help="每檔間隔秒數")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--mode",
         choices=("leveraged", "etf", "all"),
         default="leveraged",
-        help="leveraged=槓桿/反向優先（預設）；etf=所有 00 開頭等；all=ISIN 可交易代號",
+        help="leveraged / etf / all",
     )
-    parser.add_argument(
-        "--batch-index",
-        type=int,
-        default=0,
-        help="GitHub Actions 分批：第幾批（0 起算）",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=0,
-        help="每批檔數；0 表示不分批",
-    )
+    parser.add_argument("--batch-index", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=0, help="每批檔數；0=不分批")
     args = parser.parse_args()
 
     end_date = args.end or datetime.now().strftime("%Y-%m-%d")
@@ -308,13 +324,16 @@ def main() -> int:
     merged_bases: set[str] = set()
     for row in isin_rows + db_rows:
         merged_bases.add(base_code(row["symbol"]))
-    price_counts = load_price_counts(db.connection, list(merged_bases))
+    price_meta = load_price_meta(db.connection, list(merged_bases))
+    as_of = market_latest_date(db.connection)
     targets = merge_targets(
         isin_rows,
         db_rows,
-        price_counts,
+        price_meta,
         args.min_records,
-        "all" if args.mode == "all" else args.mode,
+        mode_key,
+        refresh_stale=args.refresh_stale,
+        market_as_of=as_of,
     )
 
     if args.symbols.strip():
@@ -322,7 +341,15 @@ def main() -> int:
         targets = [t for t in targets if base_code(t["symbol"]) in allow]
         for base in sorted(allow):
             if not any(base_code(t["symbol"]) == base for t in targets):
-                targets.append({"symbol": tw_symbol(base), "name": "", "price_cnt": 0})
+                meta = price_meta.get(base) or {"cnt": 0, "latest": None}
+                targets.append(
+                    {
+                        "symbol": tw_symbol(base),
+                        "name": "",
+                        "price_cnt": int(meta.get("cnt") or 0),
+                        "latest": meta.get("latest"),
+                    }
+                )
 
     total_targets = len(targets)
     if args.batch_size and args.batch_size > 0:
@@ -334,9 +361,16 @@ def main() -> int:
         )
 
     log(f"📋 ISIN ETF 候選 {len(isin_rows)} 檔；DB 候選 {len(db_rows)} 檔")
-    log(f"🎯 待回補（現有 K 線 < {args.min_records} 筆）: {len(targets)} 檔")
+    log(f"📅 市場最新交易日：{as_of or '—'}")
+    hint = f"K 線 < {args.min_records}"
+    if args.refresh_stale:
+        hint += " 或 最新日過期"
+    log(f"🎯 待回補（{hint}）: {len(targets)} 檔")
     for t in targets[:30]:
-        log(f"   - {t['symbol']} ({t.get('name') or '—'}) 現有 {t.get('price_cnt', 0)} 筆")
+        log(
+            f"   - {t['symbol']} ({t.get('name') or '—'}) "
+            f"現有 {t.get('price_cnt', 0)} 筆 latest={t.get('latest') or '—'}"
+        )
     if len(targets) > 30:
         log(f"   … 其餘 {len(targets) - 30} 檔")
 
@@ -358,10 +392,11 @@ def main() -> int:
     for idx, item in enumerate(targets, start=1):
         sym = item["symbol"]
         name = item.get("name") or ""
-        log(f"\n[{idx}/{len(targets)}] 抓取 {sym} …")
+        range_start = fetch_start_for_target(item, args.start)
+        log(f"\n[{idx}/{len(targets)}] 抓取 {sym} （{range_start} ~ {end_date}）…")
         cursor = None
         try:
-            df = api.fetch_stock_data(sym, args.start, end_date)
+            df = api.fetch_stock_data(sym, range_start, end_date)
             records = df_to_records(df)
             if not records:
                 log("   ⚠️ 無資料（略過，不計失敗）")
@@ -377,7 +412,7 @@ def main() -> int:
             db.connection.commit()
             inserted_total += n
             ok += 1
-            log(f"   ✅ 寫入 {n} 筆（區間 {args.start} ~ {end_date}）")
+            log(f"   ✅ 寫入 {n} 筆（區間 {range_start} ~ {end_date}）")
         except Exception as exc:
             safe_rollback(db)
             hard_fail += 1
