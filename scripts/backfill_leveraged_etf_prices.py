@@ -41,7 +41,8 @@ _NAME_EXCLUDE = re.compile(r"購|售|認購|認售|牛熊|權證|受益憑證")
 _LEVERAGED_CODE = re.compile(r"^00\d{2,4}[LRK]$")
 _FUTURES_ETF_CODE = re.compile(r"^00\d{2,4}U$")
 _PLAIN_ETF_CODE = re.compile(r"^00\d{2,4}$")
-_ACTIVE_ETF_CODE = re.compile(r"^00\d{2,4}A$")
+# 主動 A、債券 B、配息 D、平衡 T、槓桿 L/R/K、期信 U 等
+_LETTER_ETF_CODE = re.compile(r"^00\d{2,4}[A-Z]$")
 
 
 def log(msg: str) -> None:
@@ -84,7 +85,8 @@ def is_etf_candidate(base: str, name: str = "") -> bool:
         return False
     if is_leveraged_candidate(base, name):
         return True
-    if _PLAIN_ETF_CODE.fullmatch(base) or _ACTIVE_ETF_CODE.fullmatch(base):
+    # 所有 00xxxx / 00xxxxX 上市 ETF（含債券 B、主動 A、00982T 等）
+    if _PLAIN_ETF_CODE.fullmatch(base) or _LETTER_ETF_CODE.fullmatch(base):
         return True
     label = str(name or "")
     if base.startswith("00") and _NAME_ETF_HINT.search(label):
