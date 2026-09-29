@@ -220,8 +220,48 @@ def merge_targets(
                 need = True
         if need:
             targets.append(v)
-    targets.sort(key=lambda x: (0 if not x.get("latest") else 1, x.get("latest") or "", x["price_cnt"], x["symbol"]))
+    # 預設依代號排序，讓並行 batch 切片穩定（避免邊寫 DB 邊重排漏檔）
+    targets.sort(key=lambda x: x["symbol"])
     return targets
+
+
+def build_universe(
+    isin_rows: list[dict],
+    db_rows: list[dict],
+    price_meta: dict[str, dict],
+    mode: str,
+) -> list[dict]:
+    """模式內全部候選（不論是否需回補），供並行 batch 固定切片。"""
+    by_base: dict[str, dict] = {}
+    for row in isin_rows + db_rows:
+        sym = tw_symbol(row["symbol"])
+        base = base_code(sym)
+        name = str(row.get("name") or "")
+        if mode == "leveraged" and not is_leveraged_candidate(base, name):
+            continue
+        if mode == "etf" and not is_etf_candidate(base, name):
+            continue
+        meta = price_meta.get(base) or {"cnt": 0, "latest": None}
+        prev = by_base.get(base)
+        by_base[base] = {
+            "symbol": sym,
+            "name": name or (prev or {}).get("name") or "",
+            "price_cnt": int(meta.get("cnt") or 0),
+            "latest": meta.get("latest"),
+        }
+    out = list(by_base.values())
+    out.sort(key=lambda x: x["symbol"])
+    return out
+
+
+def needs_backfill(item: dict, min_records: int, refresh_stale: bool, market_as_of: str | None) -> bool:
+    if int(item.get("price_cnt") or 0) < min_records:
+        return True
+    if refresh_stale and market_as_of:
+        latest = item.get("latest")
+        if latest is None or str(latest)[:10] < market_as_of:
+            return True
+    return False
 
 
 def fetch_start_for_target(item: dict, default_start: str) -> str:
@@ -326,39 +366,55 @@ def main() -> int:
         merged_bases.add(base_code(row["symbol"]))
     price_meta = load_price_meta(db.connection, list(merged_bases))
     as_of = market_latest_date(db.connection)
-    targets = merge_targets(
-        isin_rows,
-        db_rows,
-        price_meta,
-        args.min_records,
-        mode_key,
-        refresh_stale=args.refresh_stale,
-        market_as_of=as_of,
-    )
 
-    if args.symbols.strip():
-        allow = {base_code(s) for s in args.symbols.split(",") if s.strip()}
-        targets = [t for t in targets if base_code(t["symbol"]) in allow]
-        for base in sorted(allow):
-            if not any(base_code(t["symbol"]) == base for t in targets):
-                meta = price_meta.get(base) or {"cnt": 0, "latest": None}
-                targets.append(
-                    {
-                        "symbol": tw_symbol(base),
-                        "name": "",
-                        "price_cnt": int(meta.get("cnt") or 0),
-                        "latest": meta.get("latest"),
-                    }
-                )
-
-    total_targets = len(targets)
-    if args.batch_size and args.batch_size > 0:
+    # 並行 batch：對「全體候選」依代號固定切片，避免邊寫入邊重排漏檔
+    if args.batch_size and args.batch_size > 0 and not args.symbols.strip():
+        universe = build_universe(isin_rows, db_rows, price_meta, mode_key)
+        total_universe = len(universe)
         start_i = max(0, args.batch_index) * args.batch_size
-        targets = targets[start_i : start_i + args.batch_size]
+        slice_rows = universe[start_i : start_i + args.batch_size]
+        targets = [
+            t
+            for t in slice_rows
+            if needs_backfill(t, args.min_records, args.refresh_stale, as_of)
+        ]
         log(
             f"📦 分批 batch_index={args.batch_index} batch_size={args.batch_size} "
-            f"→ 本批 {len(targets)} 檔（全體 {total_targets} 檔）"
+            f"→ 切片 {len(slice_rows)} 檔、待回補 {len(targets)} 檔（全體候選 {total_universe}）"
         )
+    else:
+        targets = merge_targets(
+            isin_rows,
+            db_rows,
+            price_meta,
+            args.min_records,
+            mode_key,
+            refresh_stale=args.refresh_stale,
+            market_as_of=as_of,
+        )
+        if args.symbols.strip():
+            allow = {base_code(s) for s in args.symbols.split(",") if s.strip()}
+            targets = [t for t in targets if base_code(t["symbol"]) in allow]
+            for base in sorted(allow):
+                if not any(base_code(t["symbol"]) == base for t in targets):
+                    meta = price_meta.get(base) or {"cnt": 0, "latest": None}
+                    targets.append(
+                        {
+                            "symbol": tw_symbol(base),
+                            "name": "",
+                            "price_cnt": int(meta.get("cnt") or 0),
+                            "latest": meta.get("latest"),
+                        }
+                    )
+            targets.sort(key=lambda x: x["symbol"])
+        if args.batch_size and args.batch_size > 0:
+            total_targets = len(targets)
+            start_i = max(0, args.batch_index) * args.batch_size
+            targets = targets[start_i : start_i + args.batch_size]
+            log(
+                f"📦 分批 batch_index={args.batch_index} batch_size={args.batch_size} "
+                f"→ 本批 {len(targets)} 檔（全體 {total_targets} 檔）"
+            )
 
     log(f"📋 ISIN ETF 候選 {len(isin_rows)} 檔；DB 候選 {len(db_rows)} 檔")
     log(f"📅 市場最新交易日：{as_of or '—'}")
