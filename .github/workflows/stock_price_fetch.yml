@@ -371,8 +371,9 @@ jobs:
 
                           high_price = parse_number(row.get("Highest"))
                           low_price = parse_number(row.get("Lowest"))
-                          close_price = parse_number(row.get("Average")) or parse_number(
-                              row.get("LatestPrice")
+                          # 興櫃收盤以「最後成交價」為準，勿用成交均價（Average）
+                          close_price = parse_number(row.get("LatestPrice")) or parse_number(
+                              row.get("Average")
                           )
                           if not close_price or not (0 < close_price < 30000):
                               continue
