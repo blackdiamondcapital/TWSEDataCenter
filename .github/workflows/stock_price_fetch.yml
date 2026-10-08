@@ -80,11 +80,20 @@ jobs:
               print(f"❌ 資料庫連線失敗：{e}", flush=True)
               sys.exit(1)
 
+          def is_tw_price_code(code):
+              """上市／上櫃日 K：4 碼普通股 + ETF／ETN（0050、00878、006208、00631L）。"""
+              text = str(code or "").strip().upper()
+              if re.fullmatch(r"\d{4}", text):
+                  return True
+              if text.startswith("00") and re.fullmatch(r"00\d{2,4}[A-Z]?", text):
+                  return True
+              return False
+
           # ========================================
           # 函數：取得股票清單
           # ========================================
           def get_stock_symbols():
-              """取得上市上櫃股票清單"""
+              """取得上市上櫃股票清單（含 ETF）"""
               print("📋 取得股票清單...", flush=True)
               headers = {"User-Agent": "Mozilla/5.0"}
 
@@ -103,8 +112,8 @@ jobs:
                           code_name = cols[0].text.strip()
                           if "\u3000" in code_name:
                               parts = code_name.split("\u3000")
-                              if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
-                                  twse_symbols.append(parts[0])
+                              if len(parts) == 2 and is_tw_price_code(parts[0]):
+                                  twse_symbols.append(parts[0].strip().upper())
                   print(f"✅ 上市股票：{len(twse_symbols)} 檔", flush=True)
               except Exception as e:
                   print(f"⚠️  無法取得上市清單: {e}", flush=True)
@@ -123,14 +132,14 @@ jobs:
                           code_name = cols[0].text.strip()
                           security_type = cols[1].text.strip() if len(cols) > 1 else ""
 
-                          # 只取股票，排除 ETF、權證、債券等
-                          exclude_keywords = ["ETF", "DR", "TDR", "認購", "認售", "債券", "受益證券", "基金"]
+                          # 排除權證、債券等；ETF／指數股票型要進日 K
+                          exclude_keywords = ["DR", "TDR", "認購", "認售", "債券", "受益證券"]
                           is_excluded = any(keyword in security_type for keyword in exclude_keywords)
 
                           if "\u3000" in code_name and not is_excluded:
                               parts = code_name.split("\u3000")
-                              if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 4:
-                                  tpex_symbols.append(parts[0])
+                              if len(parts) == 2 and is_tw_price_code(parts[0]):
+                                  tpex_symbols.append(parts[0].strip().upper())
                   print(f"✅ 上櫃股票：{len(tpex_symbols)} 檔", flush=True)
               except Exception as e:
                   print(f"⚠️  無法取得上櫃清單: {e}", flush=True)
