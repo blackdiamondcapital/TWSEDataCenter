@@ -81,13 +81,21 @@ jobs:
               sys.exit(1)
 
           def is_tw_price_code(code):
-              """上市／上櫃日 K：4 碼普通股 + ETF／ETN（0050、00878、006208、00631L）。"""
+              """上市／上櫃日 K：4 碼普通股 + ETF（0050、00878、006208、00631L）。不含 02* ETN。"""
               text = str(code or "").strip().upper()
+              if text.startswith("02"):
+                  return False
               if re.fullmatch(r"\d{4}", text):
                   return True
               if text.startswith("00") and re.fullmatch(r"00\d{2,4}[A-Z]?", text):
                   return True
               return False
+
+          def is_etf_code(code):
+              text = str(code or "").strip().upper()
+              if text.startswith("02"):
+                  return False
+              return bool(re.fullmatch(r"00\d{2,4}[A-Z]?", text))
 
           # ========================================
           # 函數：取得股票清單
@@ -307,6 +315,74 @@ jobs:
               except Exception as e:
                   print(f"⚠️ 上櫃單次抓取失敗: {e}", flush=True)
                   return []
+
+          def fetch_tpex_etf_from_mainboard(target_date):
+              """櫃買主機板報價含債券／股票 ETF；otc_quotes_no1430 常漏這些 00* 檔。不含 ETN。"""
+              print("📥 補抓上櫃 ETF 收盤行情（tpex_mainboard_quotes）...", flush=True)
+              headers = {
+                  "User-Agent": "Mozilla/5.0",
+                  "Accept": "application/json,text/plain,*/*",
+                  "Referer": "https://www.tpex.org.tw/",
+              }
+              try:
+                  response = requests.get(
+                      "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+                      headers=headers,
+                      timeout=60,
+                  )
+                  if response.status_code != 200:
+                      print(f"⚠️ 上櫃 ETF mainboard HTTP {response.status_code}", flush=True)
+                      return []
+                  rows = response.json()
+              except Exception as e:
+                  print(f"⚠️ 上櫃 ETF mainboard 不可用: {e}", flush=True)
+                  return []
+
+              if not isinstance(rows, list):
+                  print("⚠️ 上櫃 ETF mainboard 回傳格式異常", flush=True)
+                  return []
+
+              records = []
+              seen = set()
+              for row in rows:
+                  try:
+                      code = str(row.get("SecuritiesCompanyCode") or "").strip().upper()
+                      if not is_etf_code(code) or code in seen:
+                          continue
+                      trade_date = parse_tpex_compact_roc_date(row.get("Date"))
+                      if trade_date != target_date:
+                          continue
+                      close_price = parse_number(row.get("Close"))
+                      if not close_price or not (0 < close_price < 30000):
+                          continue
+                      open_price = parse_number(row.get("Open")) or close_price
+                      high_price = parse_number(row.get("High")) or close_price
+                      low_price = parse_number(row.get("Low")) or close_price
+                      volume = parse_volume(
+                          row.get("TradingShares")
+                          or row.get("TradeVolume")
+                          or row.get("TransactionVolume")
+                      )
+                      seen.add(code)
+                      records.append(
+                          (
+                              f"{code}.TWO",
+                              target_date,
+                              open_price,
+                              high_price,
+                              low_price,
+                              close_price,
+                              volume,
+                          )
+                      )
+                  except (TypeError, ValueError):
+                      continue
+
+              if records:
+                  print(f"✅ 上櫃 ETF 完成：{len(records)} 檔", flush=True)
+              else:
+                  print("⚠️ 上櫃 ETF：今日無可用報價", flush=True)
+              return records
 
           def parse_number(value):
               if value is None:
@@ -565,6 +641,12 @@ jobs:
               tpex_records = fetch_tpex_all_stocks_single_day(today, tpex_set)
               all_records.extend(tpex_records)
               print(f"✅ 上櫃股票完成：{len(tpex_records)} / {len(tpex_symbols)} 檔", flush=True)
+
+              tpex_etf_records = fetch_tpex_etf_from_mainboard(today)
+              existing_two = {row[0] for row in all_records}
+              tpex_etf_new = [row for row in tpex_etf_records if row[0] not in existing_two]
+              all_records.extend(tpex_etf_new)
+              print(f"✅ 上櫃 ETF 另寫入：{len(tpex_etf_new)} 檔（mainboard 共 {len(tpex_etf_records)}）", flush=True)
 
               esb_records = fetch_esb_all_stocks_single_day(today)
               all_records.extend(esb_records)
