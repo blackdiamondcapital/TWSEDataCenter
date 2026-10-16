@@ -36,6 +36,7 @@ jobs:
           PYTHONUNBUFFERED: 1
         run: |
           python3 -u << 'PYTHON_SCRIPT'
+          import json
           import os
           import re
           import sys
@@ -46,11 +47,42 @@ jobs:
           from datetime import datetime, date, timedelta
           from bs4 import BeautifulSoup
           from concurrent.futures import ThreadPoolExecutor, as_completed
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
           import threading
           import yfinance as yf  # 使用 yfinance 抓 ^TWII
 
           ESB_REFERER = "https://www.tpex.org.tw/zh-tw/esb/trading/info/stock-pricing.html"
           ESB_LATEST_URL = "https://www.tpex.org.tw/openapi/v1/tpex_esb_latest_statistics"
+          TPEX_REFERER = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430.php"
+          TPEX_BULK_URL = (
+              "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php"
+          )
+          TPEX_BULK_HEADERS = {
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+              ),
+              "Accept": "application/json,text/plain,*/*",
+              "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+              "Referer": TPEX_REFERER,
+          }
+          TPEX_HTTP = requests.Session()
+          TPEX_HTTP.headers.update(TPEX_BULK_HEADERS)
+          TPEX_HTTP.mount(
+              "https://",
+              HTTPAdapter(
+                  max_retries=Retry(
+                      total=3,
+                      connect=3,
+                      read=3,
+                      backoff_factor=1.5,
+                      status_forcelist=(429, 500, 502, 503, 504),
+                      allowed_methods=frozenset(["GET"]),
+                      raise_on_status=False,
+                  )
+              ),
+          )
 
           # 強制即時輸出
           sys.stdout.flush()
@@ -259,95 +291,191 @@ jobs:
 
               return None
 
-          def fetch_tpex_all_stocks_single_day(target_date, symbol_set):
-              """上櫃：單次 API 取得當日全部 OTC 報價（避免每檔重複請求）"""
+          def parse_tpex_bulk_rows(table_data, target_date, symbol_set):
+              records = []
+              for row in table_data or []:
+                  try:
+                      stock_symbol = row[0].strip()
+                      if stock_symbol not in symbol_set:
+                          continue
+
+                      close_price = (
+                          float(row[2].replace(",", "")) if row[2] not in ["-", "----", ""] else None
+                      )
+                      open_price = (
+                          float(row[4].replace(",", "")) if row[4] not in ["-", "----", ""] else None
+                      )
+                      high_price = (
+                          float(row[5].replace(",", "")) if row[5] not in ["-", "----", ""] else None
+                      )
+                      low_price = (
+                          float(row[6].replace(",", "")) if row[6] not in ["-", "----", ""] else None
+                      )
+                      volume = int(row[7].replace(",", "")) if row[7] not in ["-", "0", ""] else 0
+
+                      if close_price and 0 < close_price < 30000:
+                          records.append(
+                              (
+                                  f"{stock_symbol}.TWO",
+                                  target_date,
+                                  open_price,
+                                  high_price,
+                                  low_price,
+                                  close_price,
+                                  volume,
+                              )
+                          )
+                  except (ValueError, IndexError):
+                      continue
+              return records
+
+          def fetch_tpex_bulk_once(target_date, symbol_set, roc_date):
+              params = {"l": "zh-tw", "d": roc_date, "se": "AL"}
+              response = TPEX_HTTP.get(
+                  TPEX_BULK_URL,
+                  params=params,
+                  timeout=(10, 180),
+              )
+              if response.status_code != 200:
+                  raise RuntimeError(f"HTTP {response.status_code}")
+
+              raw = response.content or b""
+              if len(raw) < 200_000:
+                  raise RuntimeError(f"回應過短（{len(raw):,} bytes），可能未完整下載")
+
+              data = json.loads(raw.decode(response.encoding or "utf-8", errors="replace"))
+              if not data.get("tables"):
+                  raise RuntimeError("無 tables 資料")
+
+              table_data = data["tables"][0].get("data", [])
+              return parse_tpex_bulk_rows(table_data, target_date, symbol_set)
+
+          def fetch_tpex_yfinance_fallback(target_date, symbols, skip_symbols=None):
+              """GHA 海外 runner 常無法穩定下載 TPEx bulk JSON，改以 yfinance 補上櫃日 K。"""
+              skip = skip_symbols or set()
+              codes = [c for c in symbols if c not in skip and not is_etf_code(c)]
+              if not codes:
+                  return []
+
+              print(
+                  f"↪ 上櫃股票：TPEx bulk 失敗，改用 yfinance 補抓（{len(codes)} 檔）...",
+                  flush=True,
+              )
+              start = target_date.isoformat()
+              end = (target_date + timedelta(days=1)).isoformat()
+              records = []
+              batch_size = 50
+
+              def yf_row(data, ticker, multi):
+                  if data is None or getattr(data, "empty", True):
+                      return None
+                  if not multi:
+                      return data.iloc[0]
+                  if ticker not in data.columns.get_level_values(0):
+                      return None
+                  subset = data[ticker].dropna(how="all")
+                  return None if subset.empty else subset.iloc[0]
+
+              for offset in range(0, len(codes), batch_size):
+                  batch = codes[offset : offset + batch_size]
+                  tickers = [f"{code}.TWO" for code in batch]
+                  try:
+                      data = yf.download(
+                          tickers,
+                          start=start,
+                          end=end,
+                          group_by="ticker",
+                          auto_adjust=False,
+                          threads=True,
+                          progress=False,
+                      )
+                  except Exception as err:
+                      print(f"  ⚠️ yfinance 批次失敗: {err}", flush=True)
+                      continue
+
+                  multi = len(batch) > 1
+                  for code in batch:
+                      ticker = f"{code}.TWO"
+                      try:
+                          row = yf_row(data, ticker, multi)
+                          if row is None:
+                              continue
+                          close_price = parse_number(row.get("Close"))
+                          if not close_price or not (0 < close_price < 30000):
+                              continue
+                          records.append(
+                              (
+                                  ticker,
+                                  target_date,
+                                  parse_number(row.get("Open")),
+                                  parse_number(row.get("High")),
+                                  parse_number(row.get("Low")),
+                                  close_price,
+                                  parse_volume(row.get("Volume")),
+                              )
+                          )
+                      except Exception:
+                          continue
+                  time.sleep(0.5)
+
+              print(f"✅ 上櫃股票（yfinance）完成：{len(records)} 檔", flush=True)
+              return records
+
+          def fetch_tpex_all_stocks_single_day(target_date, symbol_set, symbol_list=None):
+              """上櫃：舊版 bulk JSON；GHA 常被切斷，失敗後由 mainboard / yfinance 補。"""
               year = target_date.year
               month = target_date.month
               day = target_date.day
               roc_date = f"{year-1911}/{month:02d}/{day:02d}"
-              headers = {"User-Agent": "Mozilla/5.0"}
-              url = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php"
-              params = {"l": "zh-tw", "d": roc_date, "se": "AL"}
 
               print(f"📥 上櫃單次抓取當日行情（{roc_date}）...", flush=True)
+              last_err = None
+              for attempt in range(1, 5):
+                  try:
+                      if attempt > 1:
+                          wait = min(8 * attempt, 30)
+                          print(f"  🔁 上櫃 bulk 重試 {attempt}/4（等待 {wait}s）...", flush=True)
+                          time.sleep(wait)
+                      records = fetch_tpex_bulk_once(target_date, symbol_set, roc_date)
+                      print(f"✅ 上櫃單次解析完成：{len(records)} / {len(symbol_set)} 檔", flush=True)
+                      if len(records) >= max(50, len(symbol_set) // 4):
+                          return records
+                      last_err = RuntimeError(f"僅解析 {len(records)} 檔，疑似不完整")
+                      print(f"  ⚠️ {last_err}", flush=True)
+                  except Exception as e:
+                      last_err = e
+                      print(f"  ⚠️ 上櫃 bulk 第 {attempt} 次失敗: {e}", flush=True)
+
+              print(f"⚠️ 上櫃 bulk 全部重試失敗: {last_err}", flush=True)
+              return []
+
+          def fetch_tpex_from_mainboard(target_date):
+              """櫃買 Open API：一般股＋ETF。GHA 上比舊版 bulk JSON 穩定。"""
+              print("📥 補抓上櫃收盤行情（tpex_mainboard_quotes）...", flush=True)
               try:
-                  response = requests.get(url, params=params, headers=headers, timeout=120)
-                  if response.status_code != 200:
-                      print(f"⚠️ 上櫃行情 HTTP {response.status_code}", flush=True)
-                      return []
-
-                  data = response.json()
-                  if not data.get("tables"):
-                      print("⚠️ 上櫃行情無 tables 資料", flush=True)
-                      return []
-
-                  table_data = data["tables"][0].get("data", [])
-                  records = []
-                  for row in table_data:
-                      try:
-                          stock_symbol = row[0].strip()
-                          if stock_symbol not in symbol_set:
-                              continue
-
-                          close_price = float(row[2].replace(",", "")) if row[2] not in ["-", "----", ""] else None
-                          open_price = float(row[4].replace(",", "")) if row[4] not in ["-", "----", ""] else None
-                          high_price = float(row[5].replace(",", "")) if row[5] not in ["-", "----", ""] else None
-                          low_price = float(row[6].replace(",", "")) if row[6] not in ["-", "----", ""] else None
-                          volume = int(row[7].replace(",", "")) if row[7] not in ["-", "0", ""] else 0
-
-                          if close_price and 0 < close_price < 30000:
-                              records.append(
-                                  (
-                                      f"{stock_symbol}.TWO",
-                                      target_date,
-                                      open_price,
-                                      high_price,
-                                      low_price,
-                                      close_price,
-                                      volume,
-                                  )
-                              )
-                      except (ValueError, IndexError):
-                          continue
-
-                  print(f"✅ 上櫃單次解析完成：{len(records)} / {len(symbol_set)} 檔", flush=True)
-                  return records
-              except Exception as e:
-                  print(f"⚠️ 上櫃單次抓取失敗: {e}", flush=True)
-                  return []
-
-          def fetch_tpex_etf_from_mainboard(target_date):
-              """櫃買主機板報價含債券／股票 ETF；otc_quotes_no1430 常漏這些 00* 檔。不含 ETN。"""
-              print("📥 補抓上櫃 ETF 收盤行情（tpex_mainboard_quotes）...", flush=True)
-              headers = {
-                  "User-Agent": "Mozilla/5.0",
-                  "Accept": "application/json,text/plain,*/*",
-                  "Referer": "https://www.tpex.org.tw/",
-              }
-              try:
-                  response = requests.get(
+                  response = TPEX_HTTP.get(
                       "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
-                      headers=headers,
-                      timeout=60,
+                      timeout=(10, 60),
                   )
                   if response.status_code != 200:
-                      print(f"⚠️ 上櫃 ETF mainboard HTTP {response.status_code}", flush=True)
+                      print(f"⚠️ 上櫃 mainboard HTTP {response.status_code}", flush=True)
                       return []
                   rows = response.json()
               except Exception as e:
-                  print(f"⚠️ 上櫃 ETF mainboard 不可用: {e}", flush=True)
+                  print(f"⚠️ 上櫃 mainboard 不可用: {e}", flush=True)
                   return []
 
               if not isinstance(rows, list):
-                  print("⚠️ 上櫃 ETF mainboard 回傳格式異常", flush=True)
+                  print("⚠️ 上櫃 mainboard 回傳格式異常", flush=True)
                   return []
 
               records = []
               seen = set()
+              etf_count = 0
               for row in rows:
                   try:
                       code = str(row.get("SecuritiesCompanyCode") or "").strip().upper()
-                      if not is_etf_code(code) or code in seen:
+                      if not is_tw_price_code(code) or code in seen:
                           continue
                       trade_date = parse_tpex_compact_roc_date(row.get("Date"))
                       if trade_date != target_date:
@@ -375,13 +503,18 @@ jobs:
                               volume,
                           )
                       )
+                      if is_etf_code(code):
+                          etf_count += 1
                   except (TypeError, ValueError):
                       continue
 
               if records:
-                  print(f"✅ 上櫃 ETF 完成：{len(records)} 檔", flush=True)
+                  print(
+                      f"✅ 上櫃 mainboard 完成：{len(records)} 檔（其中 ETF {etf_count}）",
+                      flush=True,
+                  )
               else:
-                  print("⚠️ 上櫃 ETF：今日無可用報價", flush=True)
+                  print("⚠️ 上櫃 mainboard：今日無可用報價", flush=True)
               return records
 
           def parse_number(value):
@@ -639,14 +772,26 @@ jobs:
 
               tpex_set = set(tpex_symbols)
               tpex_records = fetch_tpex_all_stocks_single_day(today, tpex_set)
+
+              tpex_mainboard = fetch_tpex_from_mainboard(today)
+              existing_two = {row[0] for row in tpex_records}
+              tpex_fill = [row for row in tpex_mainboard if row[0] not in existing_two]
+              if tpex_fill:
+                  tpex_records.extend(tpex_fill)
+                  print(f"✅ 上櫃 mainboard 補寫：{len(tpex_fill)} 檔", flush=True)
+
+              have_codes = {row[0] for row in tpex_records}
+              missing_codes = [
+                  code
+                  for code in tpex_symbols
+                  if f"{code}.TWO" not in have_codes and not is_etf_code(code)
+              ]
+              if missing_codes:
+                  tpex_yf = fetch_tpex_yfinance_fallback(today, missing_codes)
+                  tpex_records.extend(tpex_yf)
+
               all_records.extend(tpex_records)
               print(f"✅ 上櫃股票完成：{len(tpex_records)} / {len(tpex_symbols)} 檔", flush=True)
-
-              tpex_etf_records = fetch_tpex_etf_from_mainboard(today)
-              existing_two = {row[0] for row in all_records}
-              tpex_etf_new = [row for row in tpex_etf_records if row[0] not in existing_two]
-              all_records.extend(tpex_etf_new)
-              print(f"✅ 上櫃 ETF 另寫入：{len(tpex_etf_new)} 檔（mainboard 共 {len(tpex_etf_records)}）", flush=True)
 
               esb_records = fetch_esb_all_stocks_single_day(today)
               all_records.extend(esb_records)
