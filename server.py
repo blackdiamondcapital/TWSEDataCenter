@@ -10169,6 +10169,60 @@ _TW_PRICE_CHANGE_SQL = 'COALESCE(t.close_price - twprev.prev_close, t.price_chan
 _TPEX_PRICE_CHANGE_SQL = 'COALESCE(t.close_price - tpprev.prev_close, t.price_change) AS price_change'
 
 
+def _apply_ranking_prev_close(cur, rows_raw, date_str):
+    """用前一交易日收盤回填漲跌；不依賴 price_change 欄是否有值。"""
+    if not rows_raw or not date_str:
+        return
+    twse_codes = []
+    tpex_codes = []
+    for row in rows_raw:
+        code = row.get('warrant_code')
+        if not code:
+            continue
+        market = str(row.get('market') or '').upper()
+        if market == 'TPEX':
+            tpex_codes.append(code)
+        else:
+            twse_codes.append(code)
+    prev_map = {}
+    if twse_codes:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (warrant_code) warrant_code, close_price
+            FROM tw_warrant_trade
+            WHERE warrant_code = ANY(%s)
+              AND trade_date < %s::date
+              AND close_price IS NOT NULL
+            ORDER BY warrant_code, trade_date DESC
+            """,
+            (twse_codes, date_str),
+        )
+        for row in cur.fetchall() or []:
+            prev_map[(row.get('warrant_code'), 'TWSE')] = _warrant_row_num(row.get('close_price'))
+    if tpex_codes:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (warrant_code) warrant_code, close_price
+            FROM tpex_warrant_daily_quotes
+            WHERE warrant_code = ANY(%s)
+              AND trade_date < %s::date
+              AND close_price IS NOT NULL
+            ORDER BY warrant_code, trade_date DESC
+            """,
+            (tpex_codes, date_str),
+        )
+        for row in cur.fetchall() or []:
+            prev_map[(row.get('warrant_code'), 'TPEX')] = _warrant_row_num(row.get('close_price'))
+    for row in rows_raw:
+        code = row.get('warrant_code')
+        market = str(row.get('market') or 'TWSE').upper()
+        close = _warrant_row_num(row.get('close_price'))
+        prev = prev_map.get((code, market))
+        if close is None or prev is None:
+            continue
+        row['price_change'] = close - prev
+
+
 @app.route('/api/warrants/portal/stats', methods=['GET'])
 def warrants_portal_stats():
     """權證雷達首頁統計：主檔筆數、認購認售、最新成交日。"""
@@ -11110,6 +11164,7 @@ def warrants_rankings(kind: str | None = None):
 
         try:
             cur = db_manager.connection.cursor()
+            rows_raw = []
 
             if not date_str:
                 if market == 'tpex':
@@ -11343,6 +11398,7 @@ def warrants_rankings(kind: str | None = None):
                             params,
                         )
                     rows_raw = cur.fetchall() or []
+            _apply_ranking_prev_close(cur, rows_raw, date_str)
         finally:
             db_manager.disconnect()
 
