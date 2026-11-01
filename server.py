@@ -10106,6 +10106,19 @@ def _warrant_row_int(val):
         return None
 
 
+def _warrant_price_change_from_row(close, price_change_raw):
+    """依收盤與漲跌點數推算漲跌幅（%）。"""
+    chg = _warrant_row_num(price_change_raw)
+    if chg is None:
+        return None, None
+    pct = None
+    if close is not None:
+        ref = close - chg
+        if ref is not None and abs(ref) > 1e-12:
+            pct = (chg / ref) * 100.0
+    return chg, pct
+
+
 @app.route('/api/warrants/portal/stats', methods=['GET'])
 def warrants_portal_stats():
     """權證雷達首頁統計：主檔筆數、認購認售、最新成交日。"""
@@ -11097,7 +11110,7 @@ def warrants_rankings(kind: str | None = None):
                     f"""
                     SELECT t.trade_date, t.warrant_code, t.warrant_name,
                            t.trade_value AS turnover, t.trade_volume AS volume,
-                           t.close_price,
+                           t.close_price, t.price_change,
                            COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                            COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                            m.warrant_type,
@@ -11122,7 +11135,7 @@ def warrants_rankings(kind: str | None = None):
                     f"""
                     SELECT * FROM (
                         SELECT t.trade_date, t.warrant_code, t.warrant_name,
-                               t.turnover, t.volume, t.close_price,
+                               t.turnover, t.volume, t.close_price, t.price_change,
                                m.underlying_code,
                                m.underlying_name,
                                m.warrant_type,
@@ -11133,6 +11146,7 @@ def warrants_rankings(kind: str | None = None):
                         UNION ALL
                         SELECT t.trade_date, t.warrant_code, t.warrant_name,
                                t.trade_value AS turnover, t.trade_volume AS volume, t.close_price,
+                               t.price_change,
                                COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                                m.warrant_type,
@@ -11154,7 +11168,7 @@ def warrants_rankings(kind: str | None = None):
                 cur.execute(
                     f"""
                     SELECT t.trade_date, t.warrant_code, t.warrant_name,
-                           t.turnover, t.volume, t.close_price,
+                           t.turnover, t.volume, t.close_price, t.price_change,
                            m.underlying_code,
                            m.underlying_name,
                            m.warrant_type,
@@ -11199,7 +11213,7 @@ def warrants_rankings(kind: str | None = None):
                             f"""
                             SELECT t.trade_date, t.warrant_code, t.warrant_name,
                                    t.trade_value AS turnover, t.trade_volume AS volume,
-                                   t.close_price,
+                                   t.close_price, t.price_change,
                                    COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                    COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                                    m.warrant_type,
@@ -11224,7 +11238,7 @@ def warrants_rankings(kind: str | None = None):
                             f"""
                             SELECT * FROM (
                                 SELECT t.trade_date, t.warrant_code, t.warrant_name,
-                                       t.turnover, t.volume, t.close_price,
+                                       t.turnover, t.volume, t.close_price, t.price_change,
                                        m.underlying_code,
                                        m.underlying_name,
                                        m.warrant_type,
@@ -11235,6 +11249,7 @@ def warrants_rankings(kind: str | None = None):
                                 UNION ALL
                                 SELECT t.trade_date, t.warrant_code, t.warrant_name,
                                        t.trade_value AS turnover, t.trade_volume AS volume, t.close_price,
+                                       t.price_change,
                                        COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                        COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                                        m.warrant_type,
@@ -11256,7 +11271,7 @@ def warrants_rankings(kind: str | None = None):
                         cur.execute(
                             f"""
                             SELECT t.trade_date, t.warrant_code, t.warrant_name,
-                                   t.turnover, t.volume, t.close_price,
+                                   t.turnover, t.volume, t.close_price, t.price_change,
                                    m.underlying_code,
                                    m.underlying_name,
                                    m.warrant_type,
@@ -11279,6 +11294,10 @@ def warrants_rankings(kind: str | None = None):
             row_type = row.get('warrant_type')
             if wtype and row_type and row_type != wtype:
                 continue
+            close_price = _warrant_row_num(row.get('close_price'))
+            price_change, change_pct = _warrant_price_change_from_row(
+                close_price, row.get('price_change'),
+            )
             rows.append({
                 'rank': len(rows) + 1,
                 'market': row.get('market'),
@@ -11288,7 +11307,9 @@ def warrants_rankings(kind: str | None = None):
                 'warrant_type': row_type,
                 'turnover': _warrant_row_num(row.get('turnover')),
                 'volume': _warrant_row_int(row.get('volume')),
-                'close_price': _warrant_row_num(row.get('close_price')),
+                'close_price': close_price,
+                'price_change': price_change,
+                'change_pct': change_pct,
                 'underlying_code': row.get('underlying_code'),
                 'underlying_name': row.get('underlying_name'),
             })
