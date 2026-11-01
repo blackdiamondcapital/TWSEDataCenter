@@ -10355,6 +10355,76 @@ def _portal_opt_int(name: str):
         return None
 
 
+def _portal_numeric_code_key(code):
+    digits = ''.join(ch for ch in str(code or '') if ch.isdigit())
+    return (int(digits) if digits else None, str(code or ''))
+
+
+def _portal_sort_master_rows(rows: list, sort: str, sort_dir: str) -> None:
+    """In-place sort: numeric compare, empty values always last."""
+    if not rows:
+        return
+    desc = str(sort_dir or '').lower() == 'desc'
+    key = str(sort or 'expiry').strip().lower()
+
+    def as_num(row, field):
+        try:
+            v = row.get(field)
+            if v is None or v == '':
+                return None
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def extract(row):
+        if key == 'code':
+            return _portal_numeric_code_key(row.get('warrant_code'))
+        if key == 'name':
+            return str(row.get('warrant_name') or '')
+        if key == 'underlying':
+            return (
+                *_portal_numeric_code_key(row.get('underlying_code')),
+                str(row.get('underlying_name') or ''),
+            )
+        if key == 'expiry':
+            return (str(row.get('expiry_date') or ''), str(row.get('warrant_code') or ''))
+        if key == 'volume':
+            return as_num(row, 'volume')
+        field = {
+            'exercise': 'latest_exercise_price',
+            'ratio': 'latest_exercise_ratio',
+            'days': 'days_to_expiry',
+            'close': 'close_price',
+            'turnover': 'turnover',
+            'price_change': 'price_change',
+            'change': 'price_change',
+            'change_pct': 'change_pct',
+        }.get(key, None)
+        if field:
+            return as_num(row, field)
+        return (str(row.get('expiry_date') or ''), str(row.get('warrant_code') or ''))
+
+    def is_missing(val):
+        if val is None:
+            return True
+        if isinstance(val, str):
+            return not val
+        if isinstance(val, tuple):
+            return all(is_missing(x) for x in val)
+        return False
+
+    present = []
+    missing = []
+    for row in rows:
+        val = extract(row)
+        if is_missing(val):
+            missing.append(row)
+        else:
+            present.append((val, str(row.get('warrant_code') or ''), row))
+    present.sort(key=lambda item: (item[0], item[1]), reverse=desc)
+    rows[:] = [item[2] for item in present] + missing
+
+
 @app.route('/api/warrants/portal/master', methods=['GET'])
 def warrants_portal_master_search():
     """全市場權證主檔篩選（TWSE ∪ TPEX）。"""
@@ -10385,7 +10455,8 @@ def warrants_portal_master_search():
         if sort_dir not in ('asc', 'desc'):
             sort_dir = 'asc'
         direction = 'ASC' if sort_dir == 'asc' else 'DESC'
-        nulls = 'NULLS LAST' if sort_dir == 'asc' else 'NULLS FIRST'
+        # 缺值一律放最後，避免降冪時空收盤／空成交量跑到最上面
+        nulls = 'NULLS LAST'
         page = max(1, request.args.get('page', default=1, type=int) or 1)
         page_size = max(10, min(200, request.args.get('pageSize', default=50, type=int) or 50))
         offset = (page - 1) * page_size
@@ -10493,8 +10564,17 @@ def warrants_portal_master_search():
                 base = f'({tw_part}) UNION ALL ({tpex_part})'
                 params = tw_params + tpex_params
 
+            code_num_sql = (
+                "NULLIF(regexp_replace(COALESCE(warrant_code, ''), '[^0-9]', '', 'g'), '')::numeric"
+            )
+            underlying_num_sql = (
+                "NULLIF(regexp_replace(COALESCE(underlying_code, ''), '[^0-9]', '', 'g'), '')::numeric"
+            )
             if sort == 'code':
-                order_sql = f'ORDER BY warrant_code {direction}'
+                order_sql = (
+                    f'ORDER BY {code_num_sql} {direction} {nulls}, '
+                    f'warrant_code {direction}, warrant_code ASC'
+                )
             elif sort == 'exercise':
                 order_sql = f'ORDER BY latest_exercise_price {direction} {nulls}, warrant_code ASC'
             elif sort == 'ratio':
@@ -10504,12 +10584,13 @@ def warrants_portal_master_search():
             elif sort == 'days':
                 order_sql = f'ORDER BY days_to_expiry {direction} {nulls}, warrant_code ASC'
             elif sort == 'market':
-                order_sql = f'ORDER BY market {direction}, warrant_code ASC'
+                order_sql = f'ORDER BY market {direction} {nulls}, warrant_code ASC'
             elif sort == 'type':
                 order_sql = f'ORDER BY warrant_type {direction} {nulls}, warrant_code ASC'
             elif sort == 'underlying':
                 order_sql = (
-                    f'ORDER BY underlying_code {direction} {nulls}, '
+                    f'ORDER BY {underlying_num_sql} {direction} {nulls}, '
+                    f'underlying_code {direction} {nulls}, '
                     f'underlying_name {direction} {nulls}, warrant_code ASC'
                 )
             elif sort == 'close':
@@ -11046,29 +11127,7 @@ def warrants_portal_ta_screen():
                         row['turnover'] = px.get('turnover')
                         row['volume'] = px.get('volume')
 
-            direction = 1 if sort_dir == 'asc' else -1
-
-            def sort_key(row):
-                if sort == 'code':
-                    return (row.get('warrant_code') or '',)
-                if sort == 'exercise':
-                    return (row.get('latest_exercise_price') is None, row.get('latest_exercise_price') or 0, row.get('warrant_code') or '')
-                if sort == 'ratio':
-                    return (row.get('latest_exercise_ratio') is None, row.get('latest_exercise_ratio') or 0, row.get('warrant_code') or '')
-                if sort == 'name':
-                    return (row.get('warrant_name') or '', row.get('warrant_code') or '')
-                if sort == 'days':
-                    return (row.get('days_to_expiry') is None, row.get('days_to_expiry') or 0, row.get('warrant_code') or '')
-                if sort == 'close':
-                    return (row.get('close_price') is None, row.get('close_price') or 0, row.get('warrant_code') or '')
-                if sort == 'turnover':
-                    return (row.get('turnover') is None, row.get('turnover') or 0, row.get('warrant_code') or '')
-                if sort == 'expiry':
-                    return (row.get('expiry_date') is None, str(row.get('expiry_date') or ''), row.get('warrant_code') or '')
-                # default volume
-                return (row.get('volume') is None, row.get('volume') or 0, row.get('warrant_code') or '')
-
-            matched_rows.sort(key=sort_key, reverse=(direction < 0))
+            _portal_sort_master_rows(matched_rows, sort, sort_dir)
             total = len(matched_rows)
             page_rows = matched_rows[offset: offset + page_size]
 
