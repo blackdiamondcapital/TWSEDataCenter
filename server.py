@@ -10223,6 +10223,49 @@ def _apply_ranking_prev_close(cur, rows_raw, date_str):
         row['price_change'] = close - prev
 
 
+def _apply_prev_close_by_row(cur, rows):
+    """依各列最新成交日回填漲跌（主檔列表每檔交易日可能不同）。"""
+    if not rows:
+        return
+    by_date: dict[str, list] = {}
+    for row in rows:
+        td = _warrant_row_date(row.get('latest_trade_date') or row.get('_px_trade_date'))
+        if not td:
+            continue
+        by_date.setdefault(td, []).append(row)
+    for date_str, group in by_date.items():
+        _apply_ranking_prev_close(cur, group, date_str)
+
+
+def _fill_price_map_change(cur, rows, price_map):
+    if not rows or not price_map:
+        return
+    enrich_rows = []
+    for row in rows:
+        code = row.get('warrant_code')
+        if not code:
+            continue
+        px = price_map.get(code) or {}
+        close = px.get('close_price')
+        if close is None:
+            close = _warrant_row_num(row.get('close_price'))
+        enrich_rows.append({
+            'warrant_code': code,
+            'market': row.get('market'),
+            'close_price': close,
+            'latest_trade_date': px.get('latest_trade_date') or row.get('_px_trade_date'),
+        })
+    _apply_prev_close_by_row(cur, enrich_rows)
+    for er in enrich_rows:
+        code = er.get('warrant_code')
+        if not code or code not in price_map:
+            continue
+        chg, pct = _warrant_price_change_from_row(er.get('close_price'), er.get('price_change'))
+        if chg is not None:
+            price_map[code]['price_change'] = chg
+            price_map[code]['change_pct'] = pct
+
+
 @app.route('/api/warrants/portal/stats', methods=['GET'])
 def warrants_portal_stats():
     """權證雷達首頁統計：主檔筆數、認購認售、最新成交日。"""
@@ -10586,6 +10629,8 @@ def warrants_portal_master_search():
                             'turnover': _warrant_row_num(r.get('trade_value')) if r.get('trade_value') is not None else prev.get('turnover'),
                             'volume': _warrant_row_int(r.get('trade_volume')) if r.get('trade_volume') is not None else prev.get('volume'),
                         }
+            if price_map:
+                _fill_price_map_change(cur, rows, price_map)
         finally:
             db_manager.disconnect()
 
@@ -10613,6 +10658,8 @@ def warrants_portal_master_search():
                 'latest_trade_date': px.get('latest_trade_date'),
                 'turnover': px.get('turnover'),
                 'volume': px.get('volume'),
+                'price_change': px.get('price_change'),
+                'change_pct': px.get('change_pct'),
             })
 
         return jsonify({
