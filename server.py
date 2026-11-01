@@ -10778,6 +10778,8 @@ def warrants_portal_ta_screen():
     """全市場／條件範圍技術面批次篩選（一次 SQL 取近端日線，避免前端逐檔 timeseries）。"""
     try:
         from warrant_ta_screen import (
+            LONG_LOOKBACK_KEYS,
+            TA_FLAG_KEYS,
             chunked,
             fetch_recent_bars_by_code,
             filter_codes_by_ta,
@@ -10829,11 +10831,7 @@ def warrants_portal_ta_screen():
             int(src['volumeMax']) if src.get('volumeMax') not in (None, '') else None
         )
 
-        ta_flags = {
-            'ma5gtMa10': truthy_flag(arg('ma5gtMa10')),
-            'heikinFirstRed': truthy_flag(arg('heikinFirstRed')),
-            'reversalFirstRed': truthy_flag(arg('reversalFirstRed')),
-        }
+        ta_flags = {key: truthy_flag(arg(key)) for key in TA_FLAG_KEYS}
         if not any(ta_flags.values()):
             return jsonify({'success': False, 'error': '請至少指定一個技術條件'}), 400
 
@@ -10999,8 +10997,8 @@ def warrants_portal_ta_screen():
             candidate_codes = list(by_code.keys())
 
             # 技術計算：分批取近端日線
-            need_deep = ta_flags['heikinFirstRed'] or ta_flags['reversalFirstRed']
-            bar_limit = 80 if need_deep else 16
+            need_deep = any(ta_flags.get(k) for k in LONG_LOOKBACK_KEYS)
+            bar_limit = 80 if need_deep else 24
             matched_codes: list[str] = []
             for batch in chunked(candidate_codes, 4000):
                 bars_map = fetch_recent_bars_by_code(cur, batch, limit_bars=bar_limit)
