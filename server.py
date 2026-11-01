@@ -11407,6 +11407,8 @@ def warrants_rankings(kind: str | None = None):
                            COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                            COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                            m.warrant_type,
+                           m.expiry_date,
+                           (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
                            'TPEX' AS market
                     FROM tpex_warrant_daily_quotes t
                     {tpex_join}
@@ -11433,6 +11435,8 @@ def warrants_rankings(kind: str | None = None):
                                m.underlying_code,
                                m.underlying_name,
                                m.warrant_type,
+                               m.expiry_date,
+                               (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
                                'TWSE'::text AS market
                         FROM tw_warrant_trade t
                         {tw_join}
@@ -11445,6 +11449,8 @@ def warrants_rankings(kind: str | None = None):
                                COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                                m.warrant_type,
+                               m.expiry_date,
+                               (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
                                'TPEX'::text AS market
                         FROM tpex_warrant_daily_quotes t
                         {tpex_join}
@@ -11468,6 +11474,8 @@ def warrants_rankings(kind: str | None = None):
                            m.underlying_code,
                            m.underlying_name,
                            m.warrant_type,
+                           m.expiry_date,
+                           (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
                            'TWSE' AS market
                     FROM tw_warrant_trade t
                     {tw_join}
@@ -11514,6 +11522,8 @@ def warrants_rankings(kind: str | None = None):
                                    COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                    COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                                    m.warrant_type,
+                                   m.expiry_date,
+                                   (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
                                    'TPEX' AS market
                             FROM tpex_warrant_daily_quotes t
                             {tpex_join}
@@ -11540,6 +11550,8 @@ def warrants_rankings(kind: str | None = None):
                                        m.underlying_code,
                                        m.underlying_name,
                                        m.warrant_type,
+                                       m.expiry_date,
+                                       (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
                                        'TWSE'::text AS market
                                 FROM tw_warrant_trade t
                                 {tw_join}
@@ -11552,6 +11564,8 @@ def warrants_rankings(kind: str | None = None):
                                        COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                        COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                                        m.warrant_type,
+                                       m.expiry_date,
+                                       (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
                                        'TPEX'::text AS market
                                 FROM tpex_warrant_daily_quotes t
                                 {tpex_join}
@@ -11575,6 +11589,8 @@ def warrants_rankings(kind: str | None = None):
                                    m.underlying_code,
                                    m.underlying_name,
                                    m.warrant_type,
+                                   m.expiry_date,
+                                   (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
                                    'TWSE' AS market
                             FROM tw_warrant_trade t
                             {tw_join}
@@ -11614,6 +11630,8 @@ def warrants_rankings(kind: str | None = None):
                 'change_pct': change_pct,
                 'underlying_code': row.get('underlying_code'),
                 'underlying_name': row.get('underlying_name'),
+                'expiry_date': _warrant_row_date(row.get('expiry_date')),
+                'days_to_expiry': _warrant_row_int(row.get('days_to_expiry')),
             })
 
         resp = jsonify({
