@@ -10450,7 +10450,15 @@ def warrants_portal_master_search():
         issuance_max = _portal_opt_float('issuanceMax')
         change_pct_min = _portal_opt_float('changePctMin')
         change_pct_max = _portal_opt_float('changePctMax')
-        sort = (request.args.get('sort') or 'expiry').strip().lower()
+        sort = (
+            request.args.get('sort')
+            or request.args.get('sortBy')
+            or 'expiry'
+        ).strip().lower()
+        if sort in ('changepct', 'chg_pct', 'pct'):
+            sort = 'change_pct'
+        if sort in ('change', 'chg'):
+            sort = 'price_change'
         sort_dir = (request.args.get('sortDir') or request.args.get('order') or 'asc').strip().lower()
         if sort_dir not in ('asc', 'desc'):
             sort_dir = 'asc'
@@ -10626,50 +10634,46 @@ def warrants_portal_master_search():
                        COALESCE(twpx.volume, tppx.trade_volume) AS volume,
                        CASE
                            WHEN COALESCE(twpx.close_price, tppx.close_price) IS NOT NULL
-                            AND COALESCE(twprev.prev_close, tpprev.prev_close) IS NOT NULL
+                            AND COALESCE(twpx.prev_close, tppx.prev_close) IS NOT NULL
                            THEN COALESCE(twpx.close_price, tppx.close_price)
-                                - COALESCE(twprev.prev_close, tpprev.prev_close)
+                                - COALESCE(twpx.prev_close, tppx.prev_close)
                        END AS price_change,
                        CASE
-                           WHEN COALESCE(twprev.prev_close, tpprev.prev_close) IS NOT NULL
-                            AND COALESCE(twprev.prev_close, tpprev.prev_close) <> 0
+                           WHEN COALESCE(twpx.prev_close, tppx.prev_close) IS NOT NULL
+                            AND COALESCE(twpx.prev_close, tppx.prev_close) <> 0
                             AND COALESCE(twpx.close_price, tppx.close_price) IS NOT NULL
                            THEN (
                                COALESCE(twpx.close_price, tppx.close_price)
-                               - COALESCE(twprev.prev_close, tpprev.prev_close)
-                           ) / COALESCE(twprev.prev_close, tpprev.prev_close) * 100.0
+                               - COALESCE(twpx.prev_close, tppx.prev_close)
+                           ) / COALESCE(twpx.prev_close, tppx.prev_close) * 100.0
                        END AS change_pct
                 FROM ({base}) m
                 LEFT JOIN (
-                    SELECT DISTINCT ON (warrant_code)
-                        warrant_code, trade_date, close_price, turnover, volume
-                    FROM tw_warrant_trade
-                    ORDER BY warrant_code, trade_date DESC
+                    SELECT warrant_code, trade_date, close_price, turnover, volume, prev_close
+                    FROM (
+                        SELECT
+                            warrant_code, trade_date, close_price, turnover, volume,
+                            LAG(close_price) OVER (PARTITION BY warrant_code ORDER BY trade_date) AS prev_close,
+                            ROW_NUMBER() OVER (PARTITION BY warrant_code ORDER BY trade_date DESC) AS rn
+                        FROM tw_warrant_trade
+                        WHERE close_price IS NOT NULL
+                          AND trade_date >= CURRENT_DATE - INTERVAL '45 days'
+                    ) tw_hist
+                    WHERE rn = 1
                 ) twpx ON twpx.warrant_code = m.warrant_code
                 LEFT JOIN (
-                    SELECT DISTINCT ON (warrant_code)
-                        warrant_code, trade_date, close_price, trade_value, trade_volume
-                    FROM tpex_warrant_daily_quotes
-                    ORDER BY warrant_code, trade_date DESC
+                    SELECT warrant_code, trade_date, close_price, trade_value, trade_volume, prev_close
+                    FROM (
+                        SELECT
+                            warrant_code, trade_date, close_price, trade_value, trade_volume,
+                            LAG(close_price) OVER (PARTITION BY warrant_code ORDER BY trade_date) AS prev_close,
+                            ROW_NUMBER() OVER (PARTITION BY warrant_code ORDER BY trade_date DESC) AS rn
+                        FROM tpex_warrant_daily_quotes
+                        WHERE close_price IS NOT NULL
+                          AND trade_date >= CURRENT_DATE - INTERVAL '45 days'
+                    ) tp_hist
+                    WHERE rn = 1
                 ) tppx ON tppx.warrant_code = m.warrant_code
-                LEFT JOIN LATERAL (
-                    SELECT p.close_price AS prev_close
-                    FROM tw_warrant_trade p
-                    WHERE p.warrant_code = m.warrant_code
-                      AND p.trade_date < COALESCE(twpx.trade_date, tppx.trade_date)
-                      AND p.close_price IS NOT NULL
-                    ORDER BY p.trade_date DESC
-                    LIMIT 1
-                ) twprev ON m.market = 'TWSE'
-                LEFT JOIN LATERAL (
-                    SELECT p.close_price AS prev_close
-                    FROM tpex_warrant_daily_quotes p
-                    WHERE p.warrant_code = m.warrant_code
-                      AND p.trade_date < COALESCE(twpx.trade_date, tppx.trade_date)
-                      AND p.close_price IS NOT NULL
-                    ORDER BY p.trade_date DESC
-                    LIMIT 1
-                ) tpprev ON m.market = 'TPEX'
             """
 
             outer_where = []
@@ -10783,7 +10787,8 @@ def warrants_portal_master_search():
                             'turnover': _warrant_row_num(r.get('trade_value')) if r.get('trade_value') is not None else prev.get('turnover'),
                             'volume': _warrant_row_int(r.get('trade_volume')) if r.get('trade_volume') is not None else prev.get('volume'),
                         }
-            if price_map:
+            # 價量／漲跌排序已在 SQL 完成；事後回填會改顯示值、讓畫面與排序對不上
+            if price_map and sort not in ('price_change', 'change', 'change_pct'):
                 _fill_price_map_change(cur, rows, price_map)
         finally:
             db_manager.disconnect()
