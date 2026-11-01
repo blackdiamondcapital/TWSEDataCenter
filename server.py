@@ -8590,6 +8590,28 @@ def _parse_twse_market_number(val):
         return None
 
 
+def _parse_twse_change_sign(val):
+    """MI_INDEX「漲跌(+/-)」常含 HTML；取出正負號。"""
+    if val is None:
+        return None
+    s = re.sub(r'<[^>]+>', '', str(val))
+    if '-' in s:
+        return -1
+    if '+' in s:
+        return 1
+    return None
+
+
+def _parse_twse_signed_price_change(row, idx):
+    chg = _parse_twse_market_number(row[idx['漲跌價差']]) if '漲跌價差' in idx else None
+    if chg is None:
+        return None
+    sign = _parse_twse_change_sign(row[idx['漲跌(+/-)']]) if '漲跌(+/-)' in idx else None
+    if sign:
+        return abs(chg) * sign
+    return chg
+
+
 def _parse_twse_roc_slash_date(text: str | None):
     """解析 115/07/01 → date。"""
     if not text:
@@ -8664,7 +8686,7 @@ def _parse_twse_mi_index_quotes(payload: dict) -> dict[str, dict]:
             'high_price': _parse_twse_market_number(row[idx['最高價']]) if '最高價' in idx else None,
             'low_price': _parse_twse_market_number(row[idx['最低價']]) if '最低價' in idx else None,
             'close_price': _parse_twse_market_number(row[idx['收盤價']]) if '收盤價' in idx else None,
-            'price_change': _parse_twse_market_number(row[idx['漲跌價差']]) if '漲跌價差' in idx else None,
+            'price_change': _parse_twse_signed_price_change(row, idx),
             'turnover': _parse_twse_market_number(row[idx['成交金額']]) if '成交金額' in idx else None,
             'volume': volume_lots,
         }
@@ -9032,7 +9054,7 @@ def _fetch_twse_warrant_stock_day(code: str, year: int, month: int) -> list[dict
             'high_price': _parse_twse_market_number(row[idx['最高價']]) if '最高價' in idx else None,
             'low_price': _parse_twse_market_number(row[idx['最低價']]) if '最低價' in idx else None,
             'close_price': _parse_twse_market_number(row[idx['收盤價']]) if '收盤價' in idx else None,
-            'price_change': _parse_twse_market_number(row[idx['漲跌價差']]) if '漲跌價差' in idx else None,
+            'price_change': _parse_twse_signed_price_change(row, idx),
         })
     return rows
 
@@ -10119,6 +10141,34 @@ def _warrant_price_change_from_row(close, price_change_raw):
     return chg, pct
 
 
+_TW_WARRANT_PREV_CLOSE_JOIN = """
+                LEFT JOIN LATERAL (
+                    SELECT p.close_price AS prev_close
+                    FROM tw_warrant_trade p
+                    WHERE p.warrant_code = t.warrant_code
+                      AND p.trade_date < t.trade_date
+                      AND p.close_price IS NOT NULL
+                    ORDER BY p.trade_date DESC
+                    LIMIT 1
+                ) twprev ON TRUE
+"""
+
+_TPEX_WARRANT_PREV_CLOSE_JOIN = """
+                LEFT JOIN LATERAL (
+                    SELECT p.close_price AS prev_close
+                    FROM tpex_warrant_daily_quotes p
+                    WHERE p.warrant_code = t.warrant_code
+                      AND p.trade_date < t.trade_date
+                      AND p.close_price IS NOT NULL
+                    ORDER BY p.trade_date DESC
+                    LIMIT 1
+                ) tpprev ON TRUE
+"""
+
+_TW_PRICE_CHANGE_SQL = 'COALESCE(t.close_price - twprev.prev_close, t.price_change) AS price_change'
+_TPEX_PRICE_CHANGE_SQL = 'COALESCE(t.close_price - tpprev.prev_close, t.price_change) AS price_change'
+
+
 @app.route('/api/warrants/portal/stats', methods=['GET'])
 def warrants_portal_stats():
     """權證雷達首頁統計：主檔筆數、認購認售、最新成交日。"""
@@ -11110,13 +11160,14 @@ def warrants_rankings(kind: str | None = None):
                     f"""
                     SELECT t.trade_date, t.warrant_code, t.warrant_name,
                            t.trade_value AS turnover, t.trade_volume AS volume,
-                           t.close_price, t.price_change,
+                           t.close_price, {_TPEX_PRICE_CHANGE_SQL},
                            COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                            COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                            m.warrant_type,
                            'TPEX' AS market
                     FROM tpex_warrant_daily_quotes t
                     {tpex_join}
+                    {_TPEX_WARRANT_PREV_CLOSE_JOIN}
                     WHERE t.trade_date = %s::date
                     ORDER BY {order_sql('turnover', 'volume')}
                     LIMIT %s
@@ -11135,24 +11186,26 @@ def warrants_rankings(kind: str | None = None):
                     f"""
                     SELECT * FROM (
                         SELECT t.trade_date, t.warrant_code, t.warrant_name,
-                               t.turnover, t.volume, t.close_price, t.price_change,
+                               t.turnover, t.volume, t.close_price, {_TW_PRICE_CHANGE_SQL},
                                m.underlying_code,
                                m.underlying_name,
                                m.warrant_type,
                                'TWSE'::text AS market
                         FROM tw_warrant_trade t
                         {tw_join}
+                        {_TW_WARRANT_PREV_CLOSE_JOIN}
                         WHERE t.trade_date = %s::date
                         UNION ALL
                         SELECT t.trade_date, t.warrant_code, t.warrant_name,
                                t.trade_value AS turnover, t.trade_volume AS volume, t.close_price,
-                               t.price_change,
+                               {_TPEX_PRICE_CHANGE_SQL},
                                COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                                m.warrant_type,
                                'TPEX'::text AS market
                         FROM tpex_warrant_daily_quotes t
                         {tpex_join}
+                        {_TPEX_WARRANT_PREV_CLOSE_JOIN}
                         WHERE t.trade_date = %s::date
                     ) ranked
                     ORDER BY {order_sql('turnover', 'volume')}
@@ -11168,13 +11221,14 @@ def warrants_rankings(kind: str | None = None):
                 cur.execute(
                     f"""
                     SELECT t.trade_date, t.warrant_code, t.warrant_name,
-                           t.turnover, t.volume, t.close_price, t.price_change,
+                           t.turnover, t.volume, t.close_price, {_TW_PRICE_CHANGE_SQL},
                            m.underlying_code,
                            m.underlying_name,
                            m.warrant_type,
                            'TWSE' AS market
                     FROM tw_warrant_trade t
                     {tw_join}
+                    {_TW_WARRANT_PREV_CLOSE_JOIN}
                     WHERE t.trade_date = %s::date
                     ORDER BY {order_sql('turnover', 'volume')}
                     LIMIT %s
@@ -11213,13 +11267,14 @@ def warrants_rankings(kind: str | None = None):
                             f"""
                             SELECT t.trade_date, t.warrant_code, t.warrant_name,
                                    t.trade_value AS turnover, t.trade_volume AS volume,
-                                   t.close_price, t.price_change,
+                                   t.close_price, {_TPEX_PRICE_CHANGE_SQL},
                                    COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                    COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                                    m.warrant_type,
                                    'TPEX' AS market
                             FROM tpex_warrant_daily_quotes t
                             {tpex_join}
+                            {_TPEX_WARRANT_PREV_CLOSE_JOIN}
                             WHERE t.trade_date = %s::date
                             ORDER BY {order_sql('turnover', 'volume')}
                             LIMIT %s
@@ -11238,24 +11293,26 @@ def warrants_rankings(kind: str | None = None):
                             f"""
                             SELECT * FROM (
                                 SELECT t.trade_date, t.warrant_code, t.warrant_name,
-                                       t.turnover, t.volume, t.close_price, t.price_change,
+                                       t.turnover, t.volume, t.close_price, {_TW_PRICE_CHANGE_SQL},
                                        m.underlying_code,
                                        m.underlying_name,
                                        m.warrant_type,
                                        'TWSE'::text AS market
                                 FROM tw_warrant_trade t
                                 {tw_join}
+                                {_TW_WARRANT_PREV_CLOSE_JOIN}
                                 WHERE t.trade_date = %s::date
                                 UNION ALL
                                 SELECT t.trade_date, t.warrant_code, t.warrant_name,
                                        t.trade_value AS turnover, t.trade_volume AS volume, t.close_price,
-                                       t.price_change,
+                                       {_TPEX_PRICE_CHANGE_SQL},
                                        COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                        COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
                                        m.warrant_type,
                                        'TPEX'::text AS market
                                 FROM tpex_warrant_daily_quotes t
                                 {tpex_join}
+                                {_TPEX_WARRANT_PREV_CLOSE_JOIN}
                                 WHERE t.trade_date = %s::date
                             ) ranked
                             ORDER BY {order_sql('turnover', 'volume')}
@@ -11271,13 +11328,14 @@ def warrants_rankings(kind: str | None = None):
                         cur.execute(
                             f"""
                             SELECT t.trade_date, t.warrant_code, t.warrant_name,
-                                   t.turnover, t.volume, t.close_price, t.price_change,
+                                   t.turnover, t.volume, t.close_price, {_TW_PRICE_CHANGE_SQL},
                                    m.underlying_code,
                                    m.underlying_name,
                                    m.warrant_type,
                                    'TWSE' AS market
                             FROM tw_warrant_trade t
                             {tw_join}
+                            {_TW_WARRANT_PREV_CLOSE_JOIN}
                             WHERE t.trade_date = %s::date
                             ORDER BY {order_sql('turnover', 'volume')}
                             LIMIT %s
