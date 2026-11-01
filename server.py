@@ -10374,6 +10374,12 @@ def warrants_portal_master_search():
         close_max = _portal_opt_float('closeMax')
         volume_min = _portal_opt_int('volumeMin')
         volume_max = _portal_opt_int('volumeMax')
+        turnover_min = _portal_opt_float('turnoverMin')
+        turnover_max = _portal_opt_float('turnoverMax')
+        issuance_min = _portal_opt_float('issuanceMin')
+        issuance_max = _portal_opt_float('issuanceMax')
+        change_pct_min = _portal_opt_float('changePctMin')
+        change_pct_max = _portal_opt_float('changePctMax')
         sort = (request.args.get('sort') or 'expiry').strip().lower()
         sort_dir = (request.args.get('sortDir') or request.args.get('order') or 'asc').strip().lower()
         if sort_dir not in ('asc', 'desc'):
@@ -10391,7 +10397,7 @@ def warrants_portal_master_search():
         try:
             cur = db_manager.connection.cursor()
 
-            def build_branch(from_sql: str):
+            def build_branch(from_sql: str, issuance_col: str = 'issuance_units_thousand'):
                 where = [
                     'expiry_date IS NOT NULL',
                     'expiry_date >= CURRENT_DATE',
@@ -10428,6 +10434,12 @@ def warrants_portal_master_search():
                 if days_max is not None:
                     where.append('(expiry_date - CURRENT_DATE) <= %s')
                     params_local.append(days_max)
+                if issuance_min is not None:
+                    where.append(f'{issuance_col} >= %s')
+                    params_local.append(issuance_min)
+                if issuance_max is not None:
+                    where.append(f'{issuance_col} <= %s')
+                    params_local.append(issuance_max)
                 where_sql = ' WHERE ' + ' AND '.join(where)
                 return f'{from_sql}{where_sql}', params_local
 
@@ -10472,12 +10484,12 @@ def warrants_portal_master_search():
 
             params: list = []
             if market == 'twse':
-                base, params = build_branch(tw_from)
+                base, params = build_branch(tw_from, 'issuance_units_thousand')
             elif market == 'tpex':
-                base, params = build_branch(tpex_from)
+                base, params = build_branch(tpex_from, 'accumulated_issuance')
             else:
-                tw_part, tw_params = build_branch(tw_from)
-                tpex_part, tpex_params = build_branch(tpex_from)
+                tw_part, tw_params = build_branch(tw_from, 'issuance_units_thousand')
+                tpex_part, tpex_params = build_branch(tpex_from, 'accumulated_issuance')
                 base = f'({tw_part}) UNION ALL ({tpex_part})'
                 params = tw_params + tpex_params
 
@@ -10519,6 +10531,10 @@ def warrants_portal_master_search():
                 or close_max is not None
                 or volume_min is not None
                 or volume_max is not None
+                or turnover_min is not None
+                or turnover_max is not None
+                or change_pct_min is not None
+                or change_pct_max is not None
             )
 
             px_join_sql = f"""
@@ -10589,6 +10605,18 @@ def warrants_portal_master_search():
             if volume_max is not None:
                 outer_where.append('COALESCE(volume, 0) <= %s')
                 outer_params.append(volume_max)
+            if turnover_min is not None:
+                outer_where.append('COALESCE(turnover, 0) >= %s')
+                outer_params.append(turnover_min)
+            if turnover_max is not None:
+                outer_where.append('COALESCE(turnover, 0) <= %s')
+                outer_params.append(turnover_max)
+            if change_pct_min is not None:
+                outer_where.append('change_pct >= %s')
+                outer_params.append(change_pct_min)
+            if change_pct_max is not None:
+                outer_where.append('change_pct <= %s')
+                outer_params.append(change_pct_max)
             outer_where_sql = (' WHERE ' + ' AND '.join(outer_where)) if outer_where else ''
 
             if need_px:
@@ -10732,6 +10760,12 @@ def warrants_portal_master_search():
                 'closeMax': close_max,
                 'volumeMin': volume_min,
                 'volumeMax': volume_max,
+                'turnoverMin': turnover_min,
+                'turnoverMax': turnover_max,
+                'issuanceMin': issuance_min,
+                'issuanceMax': issuance_max,
+                'changePctMin': change_pct_min,
+                'changePctMax': change_pct_max,
             },
         })
     except Exception as e:
