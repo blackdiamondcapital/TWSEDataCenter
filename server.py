@@ -10506,11 +10506,15 @@ def warrants_portal_master_search():
                 order_sql = f'ORDER BY volume {direction} {nulls}, warrant_code ASC'
             elif sort == 'turnover':
                 order_sql = f'ORDER BY turnover {direction} {nulls}, warrant_code ASC'
+            elif sort in ('price_change', 'change'):
+                order_sql = f'ORDER BY price_change {direction} {nulls}, warrant_code ASC'
+            elif sort == 'change_pct':
+                order_sql = f'ORDER BY change_pct {direction} {nulls}, warrant_code ASC'
             else:
                 order_sql = f'ORDER BY expiry_date {direction} {nulls}, warrant_code ASC'
 
             need_px = (
-                sort in ('close', 'volume', 'turnover')
+                sort in ('close', 'volume', 'turnover', 'price_change', 'change', 'change_pct')
                 or close_min is not None
                 or close_max is not None
                 or volume_min is not None
@@ -10522,7 +10526,22 @@ def warrants_portal_master_search():
                        COALESCE(twpx.close_price, tppx.close_price) AS close_price,
                        COALESCE(twpx.trade_date, tppx.trade_date) AS _px_trade_date,
                        COALESCE(twpx.turnover, tppx.trade_value) AS turnover,
-                       COALESCE(twpx.volume, tppx.trade_volume) AS volume
+                       COALESCE(twpx.volume, tppx.trade_volume) AS volume,
+                       CASE
+                           WHEN COALESCE(twpx.close_price, tppx.close_price) IS NOT NULL
+                            AND COALESCE(twprev.prev_close, tpprev.prev_close) IS NOT NULL
+                           THEN COALESCE(twpx.close_price, tppx.close_price)
+                                - COALESCE(twprev.prev_close, tpprev.prev_close)
+                       END AS price_change,
+                       CASE
+                           WHEN COALESCE(twprev.prev_close, tpprev.prev_close) IS NOT NULL
+                            AND COALESCE(twprev.prev_close, tpprev.prev_close) <> 0
+                            AND COALESCE(twpx.close_price, tppx.close_price) IS NOT NULL
+                           THEN (
+                               COALESCE(twpx.close_price, tppx.close_price)
+                               - COALESCE(twprev.prev_close, tpprev.prev_close)
+                           ) / COALESCE(twprev.prev_close, tpprev.prev_close) * 100.0
+                       END AS change_pct
                 FROM ({base}) m
                 LEFT JOIN (
                     SELECT DISTINCT ON (warrant_code)
@@ -10536,6 +10555,24 @@ def warrants_portal_master_search():
                     FROM tpex_warrant_daily_quotes
                     ORDER BY warrant_code, trade_date DESC
                 ) tppx ON tppx.warrant_code = m.warrant_code
+                LEFT JOIN LATERAL (
+                    SELECT p.close_price AS prev_close
+                    FROM tw_warrant_trade p
+                    WHERE p.warrant_code = m.warrant_code
+                      AND p.trade_date < COALESCE(twpx.trade_date, tppx.trade_date)
+                      AND p.close_price IS NOT NULL
+                    ORDER BY p.trade_date DESC
+                    LIMIT 1
+                ) twprev ON m.market = 'TWSE'
+                LEFT JOIN LATERAL (
+                    SELECT p.close_price AS prev_close
+                    FROM tpex_warrant_daily_quotes p
+                    WHERE p.warrant_code = m.warrant_code
+                      AND p.trade_date < COALESCE(twpx.trade_date, tppx.trade_date)
+                      AND p.close_price IS NOT NULL
+                    ORDER BY p.trade_date DESC
+                    LIMIT 1
+                ) tpprev ON m.market = 'TPEX'
             """
 
             outer_where = []
@@ -10582,11 +10619,19 @@ def warrants_portal_master_search():
                     code = r.get('warrant_code')
                     if not code:
                         continue
+                    chg, pct = _warrant_price_change_from_row(
+                        _warrant_row_num(r.get('close_price')),
+                        r.get('price_change'),
+                    )
+                    if pct is None:
+                        pct = _warrant_row_num(r.get('change_pct'))
                     price_map[code] = {
                         'latest_trade_date': _warrant_row_date(r.get('_px_trade_date')),
                         'close_price': _warrant_row_num(r.get('close_price')),
                         'turnover': _warrant_row_num(r.get('turnover')),
                         'volume': _warrant_row_int(r.get('volume')),
+                        'price_change': chg,
+                        'change_pct': pct,
                     }
 
             codes = [r.get('warrant_code') for r in rows if r.get('warrant_code')]
