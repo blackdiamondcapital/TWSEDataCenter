@@ -11700,6 +11700,275 @@ def warrants_rankings(kind: str | None = None):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+_WARRANT_RETURN_LAG = {
+    'daily': 1,
+    'day': 1,
+    'd': 1,
+    'weekly': 5,
+    'week': 5,
+    'w': 5,
+    'monthly': 21,
+    'month': 21,
+    'm': 21,
+}
+
+
+@app.route('/api/warrants/returns', methods=['GET', 'POST'])
+def warrants_returns():
+    """權證報酬排行：日／週／月（以交易日根數 1／5／21 計算漲跌幅）。"""
+    try:
+        body = request.get_json(silent=True) or {}
+
+        def pick(*keys, default=''):
+            for k in keys:
+                if k in body and body.get(k) not in (None, ''):
+                    return body.get(k)
+                if request.args.get(k) not in (None, ''):
+                    return request.args.get(k)
+            return default
+
+        period_raw = str(pick('period', default='daily') or 'daily').strip().lower()
+        lag = _WARRANT_RETURN_LAG.get(period_raw)
+        if not lag:
+            return jsonify({'success': False, 'error': 'period 僅支援 daily / weekly / monthly'}), 400
+        lookback_cal = {1: 21, 5: 45, 21: 80}.get(lag, 45)
+        market = str(pick('market', default='both') or 'both').strip().lower()
+        raw = str(pick('wtype', 'warrantType', 'warrant_type', default='') or '').strip().lower()
+        if raw in ('認購', 'call', 'c'):
+            wtype = '認購'
+        elif raw in ('認售', 'put', 'p'):
+            wtype = '認售'
+        else:
+            wtype = ''
+        ranking_type = str(pick('rankingType', 'ranking_type', default='gainers') or 'gainers').strip().lower()
+        desc = ranking_type not in ('losers', 'down', '跌幅')
+        try:
+            limit = int(pick('limit', default=100) or 100)
+        except Exception:
+            limit = 100
+        limit = max(1, min(200, limit))
+        date_str = str(pick('date', default='') or '').strip() or None
+
+        db_manager = DatabaseManager.from_request_args(request.args)
+        if not db_manager.connect():
+            return jsonify({'success': False, 'error': '資料庫連接失敗'}), 500
+
+        try:
+            cur = db_manager.connection.cursor()
+            if not date_str:
+                if market == 'tpex':
+                    cur.execute('SELECT MAX(trade_date) AS d FROM tpex_warrant_daily_quotes')
+                elif market in {'both', 'all'}:
+                    cur.execute(
+                        """
+                        SELECT MAX(trade_date) AS d FROM (
+                            SELECT trade_date FROM tw_warrant_trade
+                            UNION ALL
+                            SELECT trade_date FROM tpex_warrant_daily_quotes
+                        ) t
+                        """
+                    )
+                else:
+                    cur.execute('SELECT MAX(trade_date) AS d FROM tw_warrant_trade')
+                date_str = _warrant_row_date((cur.fetchone() or {}).get('d'))
+            if not date_str:
+                return jsonify({
+                    'success': True,
+                    'date': None,
+                    'period': 'weekly' if lag == 5 else ('monthly' if lag == 21 else 'daily'),
+                    'market': market,
+                    'type': wtype or None,
+                    'rankingType': 'losers' if not desc else 'gainers',
+                    'rows': [],
+                })
+
+            period_key = 'weekly' if lag == 5 else ('monthly' if lag == 21 else 'daily')
+            direction = 'DESC' if desc else 'ASC'
+            start_sql = f"%s::date - {int(lookback_cal)}"
+            tw_cte = f"""
+                SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                       t.turnover, t.volume, t.close_price,
+                       LAG(t.close_price, {int(lag)}) OVER (
+                           PARTITION BY t.warrant_code ORDER BY t.trade_date
+                       ) AS prev_close,
+                       'TWSE'::text AS market
+                FROM tw_warrant_trade t
+                WHERE t.trade_date BETWEEN {start_sql} AND %s::date
+            """
+            tpex_cte = f"""
+                SELECT t.trade_date, t.warrant_code, t.warrant_name,
+                       t.trade_value AS turnover, t.trade_volume AS volume, t.close_price,
+                       LAG(t.close_price, {int(lag)}) OVER (
+                           PARTITION BY t.warrant_code ORDER BY t.trade_date
+                       ) AS prev_close,
+                       'TPEX'::text AS market
+                FROM tpex_warrant_daily_quotes t
+                WHERE t.trade_date BETWEEN {start_sql} AND %s::date
+            """
+            tw_join = (
+                f'LEFT JOIN tw_warrant_master m ON m.warrant_code = t.warrant_code AND {_WARRANT_NAME_EQ_M}'
+            )
+            tpex_join = (
+                f'LEFT JOIN tpex_warrant_master m ON m.warrant_code = t.warrant_code AND {_WARRANT_NAME_EQ_M}'
+            )
+            type_where = (
+                'AND COALESCE(m.warrant_type, mx.warrant_type) = %s'
+                if wtype else ''
+            )
+
+            select_sql = f"""
+                SELECT
+                    t.trade_date, t.warrant_code, t.warrant_name, t.turnover, t.volume,
+                    t.close_price, t.prev_close, t.market,
+                    (t.close_price - t.prev_close) AS price_change,
+                    CASE
+                        WHEN t.prev_close IS NULL OR t.prev_close = 0 THEN NULL
+                        ELSE ((t.close_price - t.prev_close) / t.prev_close) * 100
+                    END AS change_pct,
+                    COALESCE(m.underlying_code, mx.underlying_code) AS underlying_code,
+                    COALESCE(m.underlying_name, mx.underlying_name) AS underlying_name,
+                    {_RANK_TYPE_SQL} AS warrant_type,
+                    {_RANK_EXPIRY_SQL} AS expiry_date,
+                    {_RANK_DAYS_SQL} AS days_to_expiry
+                FROM picked t
+                {{join_m}}
+                {{join_x}}
+                WHERE t.trade_date = %s::date
+                  AND t.prev_close IS NOT NULL
+                  AND t.close_price IS NOT NULL
+                  {type_where}
+                ORDER BY change_pct {direction} NULLS LAST, t.turnover DESC NULLS LAST, t.warrant_code ASC
+                LIMIT %s
+            """
+
+            def run_query():
+                if market == 'tpex':
+                    params = [date_str, date_str, date_str]
+                    if wtype:
+                        params.append(wtype)
+                    params.append(limit)
+                    cur.execute(
+                        f"""
+                        WITH picked AS (
+                            {tpex_cte}
+                        )
+                        {select_sql.format(join_m=tpex_join, join_x=_RANK_XJOIN_TW)}
+                        """,
+                        params,
+                    )
+                elif market in {'both', 'all'}:
+                    params = [date_str, date_str, date_str, date_str, date_str]
+                    if wtype:
+                        params.append(wtype)
+                    params.append(limit)
+                    cur.execute(
+                        f"""
+                        WITH picked AS (
+                            SELECT * FROM ({tw_cte}) tw
+                            UNION ALL
+                            SELECT * FROM ({tpex_cte}) otc
+                        )
+                        {select_sql.format(join_m=tw_join, join_x=_RANK_XJOIN_TPEX)}
+                        """,
+                        params,
+                    )
+                else:
+                    params = [date_str, date_str, date_str]
+                    if wtype:
+                        params.append(wtype)
+                    params.append(limit)
+                    cur.execute(
+                        f"""
+                        WITH picked AS (
+                            {tw_cte}
+                        )
+                        {select_sql.format(join_m=tw_join, join_x=_RANK_XJOIN_TPEX)}
+                        """,
+                        params,
+                    )
+                return cur.fetchall() or []
+
+            rows_raw = run_query()
+            if not rows_raw:
+                if market == 'tpex':
+                    cur.execute('SELECT MAX(trade_date) AS d FROM tpex_warrant_daily_quotes')
+                elif market in {'both', 'all'}:
+                    cur.execute(
+                        """
+                        SELECT MAX(trade_date) AS d FROM (
+                            SELECT trade_date FROM tw_warrant_trade
+                            UNION ALL
+                            SELECT trade_date FROM tpex_warrant_daily_quotes
+                        ) t
+                        """
+                    )
+                else:
+                    cur.execute('SELECT MAX(trade_date) AS d FROM tw_warrant_trade')
+                fallback_date = _warrant_row_date((cur.fetchone() or {}).get('d'))
+                if fallback_date and fallback_date != date_str:
+                    date_str = fallback_date
+                    rows_raw = run_query()
+        finally:
+            db_manager.disconnect()
+
+        rows = []
+        for row in rows_raw:
+            row_type = row.get('warrant_type')
+            if wtype and row_type and row_type != wtype:
+                continue
+            close_price = _warrant_row_num(row.get('close_price'))
+            prev_close = _warrant_row_num(row.get('prev_close'))
+            price_change = _warrant_row_num(row.get('price_change'))
+            change_pct = _warrant_row_num(row.get('change_pct'))
+            if price_change is None and close_price is not None and prev_close is not None:
+                price_change = close_price - prev_close
+            if change_pct is None and price_change is not None and prev_close:
+                change_pct = (price_change / prev_close) * 100
+            expiry_date = _warrant_row_date(row.get('expiry_date'))
+            days_to_expiry = _warrant_row_int(row.get('days_to_expiry'))
+            if expiry_date:
+                try:
+                    y, mo, d = [int(x) for x in expiry_date.split('-')]
+                    tw_today = datetime.now(timezone(timedelta(hours=8))).date()
+                    days_to_expiry = (date(y, mo, d) - tw_today).days
+                except Exception:
+                    pass
+            rows.append({
+                'rank': len(rows) + 1,
+                'market': row.get('market'),
+                'trade_date': _warrant_row_date(row.get('trade_date')),
+                'warrant_code': row.get('warrant_code'),
+                'warrant_name': row.get('warrant_name'),
+                'warrant_type': row_type,
+                'turnover': _warrant_row_num(row.get('turnover')),
+                'volume': _warrant_row_int(row.get('volume')),
+                'close_price': close_price,
+                'price_change': price_change,
+                'change_pct': change_pct,
+                'underlying_code': row.get('underlying_code'),
+                'underlying_name': row.get('underlying_name'),
+                'expiry_date': expiry_date,
+                'days_to_expiry': days_to_expiry,
+            })
+
+        resp = jsonify({
+            'success': True,
+            'date': date_str,
+            'period': period_key,
+            'lag': lag,
+            'market': market,
+            'type': wtype or None,
+            'kind': 'put' if wtype == '認售' else ('call' if wtype == '認購' else 'all'),
+            'rankingType': 'losers' if not desc else 'gainers',
+            'rows': rows,
+        })
+        resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+        return resp
+    except Exception as e:
+        logger.exception('權證 returns 失敗')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/warrants/timeseries', methods=['GET'])
 def warrants_timeseries():
     """單檔權證成交時間序列。"""
