@@ -10168,6 +10168,29 @@ _TPEX_WARRANT_PREV_CLOSE_JOIN = """
 _TW_PRICE_CHANGE_SQL = 'COALESCE(t.close_price - twprev.prev_close, t.price_change) AS price_change'
 _TPEX_PRICE_CHANGE_SQL = 'COALESCE(t.close_price - tpprev.prev_close, t.price_change) AS price_change'
 
+# 權證代號會回收；主檔若還是舊券、名稱對不上就不要沿用到期日。
+_WARRANT_NAME_EQ_M = (
+    "regexp_replace(COALESCE(m.warrant_name, ''), '\\s+', '', 'g') "
+    "= regexp_replace(COALESCE(t.warrant_name, ''), '\\s+', '', 'g') "
+    "AND BTRIM(COALESCE(t.warrant_name, '')) <> ''"
+)
+_WARRANT_NAME_EQ_MX = (
+    "regexp_replace(COALESCE(mx.warrant_name, ''), '\\s+', '', 'g') "
+    "= regexp_replace(COALESCE(t.warrant_name, ''), '\\s+', '', 'g') "
+    "AND BTRIM(COALESCE(t.warrant_name, '')) <> ''"
+)
+_RANK_XJOIN_TPEX = (
+    f'LEFT JOIN tpex_warrant_master mx ON mx.warrant_code = t.warrant_code '
+    f'AND {_WARRANT_NAME_EQ_MX}'
+)
+_RANK_XJOIN_TW = (
+    f'LEFT JOIN tw_warrant_master mx ON mx.warrant_code = t.warrant_code '
+    f'AND {_WARRANT_NAME_EQ_MX}'
+)
+_RANK_TYPE_SQL = 'COALESCE(m.warrant_type, mx.warrant_type)'
+_RANK_EXPIRY_SQL = 'COALESCE(m.expiry_date, mx.expiry_date)'
+_RANK_DAYS_SQL = f'({_RANK_EXPIRY_SQL} - CURRENT_DATE)'
+
 
 def _apply_ranking_prev_close(cur, rows_raw, date_str):
     """用前一交易日收盤回填漲跌；不依賴 price_change 欄是否有值。"""
@@ -11381,13 +11404,23 @@ def warrants_rankings(kind: str | None = None):
                         'rows': [],
                     })
 
-            # 有類型篩選時用 INNER JOIN，避免漏接主檔時混入錯類型
+            # 有類型篩選時用 INNER JOIN；名稱必須對上，避免回收代號對到舊主檔
             if wtype:
-                tw_join = 'INNER JOIN tw_warrant_master m ON m.warrant_code = t.warrant_code AND m.warrant_type = %s'
-                tpex_join = 'INNER JOIN tpex_warrant_master m ON m.warrant_code = t.warrant_code AND m.warrant_type = %s'
+                tw_join = (
+                    'INNER JOIN tw_warrant_master m ON m.warrant_code = t.warrant_code '
+                    f'AND m.warrant_type = %s AND {_WARRANT_NAME_EQ_M}'
+                )
+                tpex_join = (
+                    'INNER JOIN tpex_warrant_master m ON m.warrant_code = t.warrant_code '
+                    f'AND m.warrant_type = %s AND {_WARRANT_NAME_EQ_M}'
+                )
             else:
-                tw_join = 'LEFT JOIN tw_warrant_master m ON m.warrant_code = t.warrant_code'
-                tpex_join = 'LEFT JOIN tpex_warrant_master m ON m.warrant_code = t.warrant_code'
+                tw_join = (
+                    f'LEFT JOIN tw_warrant_master m ON m.warrant_code = t.warrant_code AND {_WARRANT_NAME_EQ_M}'
+                )
+                tpex_join = (
+                    f'LEFT JOIN tpex_warrant_master m ON m.warrant_code = t.warrant_code AND {_WARRANT_NAME_EQ_M}'
+                )
 
             def order_sql(turnover_expr: str, volume_expr: str) -> str:
                 if metric == 'turnover':
@@ -11406,12 +11439,13 @@ def warrants_rankings(kind: str | None = None):
                            t.close_price, {_TPEX_PRICE_CHANGE_SQL},
                            COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                            COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
-                           m.warrant_type,
-                           m.expiry_date,
-                           (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
+                           {_RANK_TYPE_SQL} AS warrant_type,
+                           {_RANK_EXPIRY_SQL} AS expiry_date,
+                           {_RANK_DAYS_SQL} AS days_to_expiry,
                            'TPEX' AS market
                     FROM tpex_warrant_daily_quotes t
                     {tpex_join}
+                    {_RANK_XJOIN_TW}
                     {_TPEX_WARRANT_PREV_CLOSE_JOIN}
                     WHERE t.trade_date = %s::date
                     ORDER BY {order_sql('turnover', 'volume')}
@@ -11434,12 +11468,13 @@ def warrants_rankings(kind: str | None = None):
                                t.turnover, t.volume, t.close_price, {_TW_PRICE_CHANGE_SQL},
                                m.underlying_code,
                                m.underlying_name,
-                               m.warrant_type,
-                               m.expiry_date,
-                               (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
+                               {_RANK_TYPE_SQL} AS warrant_type,
+                               {_RANK_EXPIRY_SQL} AS expiry_date,
+                               {_RANK_DAYS_SQL} AS days_to_expiry,
                                'TWSE'::text AS market
                         FROM tw_warrant_trade t
                         {tw_join}
+                        {_RANK_XJOIN_TPEX}
                         {_TW_WARRANT_PREV_CLOSE_JOIN}
                         WHERE t.trade_date = %s::date
                         UNION ALL
@@ -11448,12 +11483,13 @@ def warrants_rankings(kind: str | None = None):
                                {_TPEX_PRICE_CHANGE_SQL},
                                COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
-                               m.warrant_type,
-                               m.expiry_date,
-                               (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
+                               {_RANK_TYPE_SQL} AS warrant_type,
+                               {_RANK_EXPIRY_SQL} AS expiry_date,
+                               {_RANK_DAYS_SQL} AS days_to_expiry,
                                'TPEX'::text AS market
                         FROM tpex_warrant_daily_quotes t
                         {tpex_join}
+                        {_RANK_XJOIN_TW}
                         {_TPEX_WARRANT_PREV_CLOSE_JOIN}
                         WHERE t.trade_date = %s::date
                     ) ranked
@@ -11473,12 +11509,13 @@ def warrants_rankings(kind: str | None = None):
                            t.turnover, t.volume, t.close_price, {_TW_PRICE_CHANGE_SQL},
                            m.underlying_code,
                            m.underlying_name,
-                           m.warrant_type,
-                           m.expiry_date,
-                           (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
+                           {_RANK_TYPE_SQL} AS warrant_type,
+                           {_RANK_EXPIRY_SQL} AS expiry_date,
+                           {_RANK_DAYS_SQL} AS days_to_expiry,
                            'TWSE' AS market
                     FROM tw_warrant_trade t
                     {tw_join}
+                    {_RANK_XJOIN_TPEX}
                     {_TW_WARRANT_PREV_CLOSE_JOIN}
                     WHERE t.trade_date = %s::date
                     ORDER BY {order_sql('turnover', 'volume')}
@@ -11521,12 +11558,13 @@ def warrants_rankings(kind: str | None = None):
                                    t.close_price, {_TPEX_PRICE_CHANGE_SQL},
                                    COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                    COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
-                                   m.warrant_type,
-                                   m.expiry_date,
-                                   (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
+                                   {_RANK_TYPE_SQL} AS warrant_type,
+                                   {_RANK_EXPIRY_SQL} AS expiry_date,
+                                   {_RANK_DAYS_SQL} AS days_to_expiry,
                                    'TPEX' AS market
                             FROM tpex_warrant_daily_quotes t
                             {tpex_join}
+                            {_RANK_XJOIN_TW}
                             {_TPEX_WARRANT_PREV_CLOSE_JOIN}
                             WHERE t.trade_date = %s::date
                             ORDER BY {order_sql('turnover', 'volume')}
@@ -11549,12 +11587,13 @@ def warrants_rankings(kind: str | None = None):
                                        t.turnover, t.volume, t.close_price, {_TW_PRICE_CHANGE_SQL},
                                        m.underlying_code,
                                        m.underlying_name,
-                                       m.warrant_type,
-                                       m.expiry_date,
-                                       (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
+                                       {_RANK_TYPE_SQL} AS warrant_type,
+                                       {_RANK_EXPIRY_SQL} AS expiry_date,
+                                       {_RANK_DAYS_SQL} AS days_to_expiry,
                                        'TWSE'::text AS market
                                 FROM tw_warrant_trade t
                                 {tw_join}
+                                {_RANK_XJOIN_TPEX}
                                 {_TW_WARRANT_PREV_CLOSE_JOIN}
                                 WHERE t.trade_date = %s::date
                                 UNION ALL
@@ -11563,12 +11602,13 @@ def warrants_rankings(kind: str | None = None):
                                        {_TPEX_PRICE_CHANGE_SQL},
                                        COALESCE(t.underlying_code, m.underlying_code) AS underlying_code,
                                        COALESCE(t.underlying_name, m.underlying_name) AS underlying_name,
-                                       m.warrant_type,
-                                       m.expiry_date,
-                                       (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
+                                       {_RANK_TYPE_SQL} AS warrant_type,
+                                       {_RANK_EXPIRY_SQL} AS expiry_date,
+                                       {_RANK_DAYS_SQL} AS days_to_expiry,
                                        'TPEX'::text AS market
                                 FROM tpex_warrant_daily_quotes t
                                 {tpex_join}
+                                {_RANK_XJOIN_TW}
                                 {_TPEX_WARRANT_PREV_CLOSE_JOIN}
                                 WHERE t.trade_date = %s::date
                             ) ranked
@@ -11588,12 +11628,13 @@ def warrants_rankings(kind: str | None = None):
                                    t.turnover, t.volume, t.close_price, {_TW_PRICE_CHANGE_SQL},
                                    m.underlying_code,
                                    m.underlying_name,
-                                   m.warrant_type,
-                                   m.expiry_date,
-                                   (m.expiry_date - CURRENT_DATE) AS days_to_expiry,
+                                   {_RANK_TYPE_SQL} AS warrant_type,
+                                   {_RANK_EXPIRY_SQL} AS expiry_date,
+                                   {_RANK_DAYS_SQL} AS days_to_expiry,
                                    'TWSE' AS market
                             FROM tw_warrant_trade t
                             {tw_join}
+                            {_RANK_XJOIN_TPEX}
                             {_TW_WARRANT_PREV_CLOSE_JOIN}
                             WHERE t.trade_date = %s::date
                             ORDER BY {order_sql('turnover', 'volume')}
@@ -11616,6 +11657,15 @@ def warrants_rankings(kind: str | None = None):
             price_change, change_pct = _warrant_price_change_from_row(
                 close_price, row.get('price_change'),
             )
+            expiry_date = _warrant_row_date(row.get('expiry_date'))
+            days_to_expiry = _warrant_row_int(row.get('days_to_expiry'))
+            if expiry_date:
+                try:
+                    y, mo, d = [int(x) for x in expiry_date.split('-')]
+                    tw_today = datetime.now(timezone(timedelta(hours=8))).date()
+                    days_to_expiry = (date(y, mo, d) - tw_today).days
+                except Exception:
+                    pass
             rows.append({
                 'rank': len(rows) + 1,
                 'market': row.get('market'),
@@ -11630,8 +11680,8 @@ def warrants_rankings(kind: str | None = None):
                 'change_pct': change_pct,
                 'underlying_code': row.get('underlying_code'),
                 'underlying_name': row.get('underlying_name'),
-                'expiry_date': _warrant_row_date(row.get('expiry_date')),
-                'days_to_expiry': _warrant_row_int(row.get('days_to_expiry')),
+                'expiry_date': expiry_date,
+                'days_to_expiry': days_to_expiry,
             })
 
         resp = jsonify({
