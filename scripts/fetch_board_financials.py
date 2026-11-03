@@ -545,9 +545,6 @@ def main() -> int:
         end = parse_iso(args.to_date) or date.today()
         start = parse_iso(args.from_date) or (end - timedelta(days=max(0, int(args.days) - 1)))
         windows.append((start, end))
-    if start > end:
-        log("❌ from-date 不可晚於 to-date")
-        return 1
     for start, end in windows:
         if start > end:
             log("❌ 日期起迄錯誤")
