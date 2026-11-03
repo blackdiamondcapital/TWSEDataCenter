@@ -297,7 +297,14 @@ def month_chunks(start: date, end: date) -> list[tuple[date, date]]:
     return chunks
 
 
-def fetch_t05st01(start: date, end: date, stock: str = "", sleep_s: float = 0.85) -> list[dict]:
+def fetch_t05st01(
+    start: date,
+    end: date,
+    stock: str = "",
+    sleep_s: float = 0.85,
+    batch_size: int = 50,
+    on_batch=None,
+) -> list[dict]:
     sess = new_session()
     try:
         sess.get(MOPS_HOME, timeout=20)
@@ -305,7 +312,23 @@ def fetch_t05st01(start: date, end: date, stock: str = "", sleep_s: float = 0.85
         log(f"⚠️ t05st01 預熱失敗：{exc}")
     markets = ("all",) if stock else ("sii", "otc")
     records = []
+    pending: list[dict] = []
     seen = set()
+    parsed_n = 0
+    fail_n = 0
+    processed_n = 0
+
+    def flush(reason: str) -> None:
+        nonlocal pending
+        if not pending:
+            return
+        if on_batch:
+            written = on_batch(list(pending))
+            log(
+                f"💾 已寫入 {written} 筆（累計解析 {parsed_n}、失敗 {fail_n}）{reason}"
+            )
+        pending = []
+
     for chunk_from, chunk_to in month_chunks(start, end):
         for typek in markets:
             label = stock or typek
@@ -316,11 +339,12 @@ def fetch_t05st01(start: date, end: date, stock: str = "", sleep_s: float = 0.85
                 time.sleep(sleep_s)
                 continue
             log(f"… t05st01 {chunk_from}~{chunk_to} {label} 董事會財報 {len(rows)} 則")
-            for row in rows:
+            for i, row in enumerate(rows, 1):
                 key = (row["co_id"], row["spoke_date"], row["spoke_time"], row["seq_no"])
                 if key in seen:
                     continue
                 seen.add(key)
+                processed_n += 1
                 try:
                     rec = fetch_detail(sess, row)
                 except Exception as exc:
@@ -328,8 +352,23 @@ def fetch_t05st01(start: date, end: date, stock: str = "", sleep_s: float = 0.85
                     rec = None
                 if rec:
                     records.append(rec)
+                    pending.append(rec)
+                    parsed_n += 1
+                else:
+                    fail_n += 1
+                if processed_n % 25 == 0 or i == len(rows):
+                    log(
+                        f"⏳ 進度 {chunk_from}~{chunk_to} {label} "
+                        f"{i}/{len(rows)}｜本 run 已處理 {processed_n} "
+                        f"解析 {parsed_n} 失敗 {fail_n}｜最近 {row.get('co_id')}"
+                    )
+                if len(pending) >= max(1, int(batch_size)):
+                    flush(f"｜批次 {chunk_from} {label}")
                 time.sleep(sleep_s)
+            flush(f"｜區間 {chunk_from}~{chunk_to} {label} 結束")
             time.sleep(0.4)
+    flush("｜收尾")
+    log(f"抓取迴圈結束：解析 {parsed_n} 筆、失敗 {fail_n}、處理 {processed_n} 則")
     return records
 
 
@@ -530,6 +569,7 @@ def main() -> int:
     parser.add_argument("--to-date", dest="to_date", help="YYYY-MM-DD")
     parser.add_argument("--periods", help="例如 2026Q1,2026Q2（用法定申報窗口當發言日期）")
     parser.add_argument("--sleep", type=float, default=0.7, help="每則詳細資料間隔秒數")
+    parser.add_argument("--batch-size", type=int, default=50, help="每累積 N 筆就 upsert（預設 50）")
     parser.add_argument("--allow-empty", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -563,10 +603,27 @@ def main() -> int:
     log(f"📦 {TABLE_NAME}")
     log("=" * 72)
 
+    upserted = 0
+
+    def on_batch(recs: list[dict]) -> int:
+        nonlocal upserted
+        n = upsert_records(recs, db_url)
+        upserted += n
+        return n
+
     records: list[dict] = []
     try:
         for start, end in windows:
-            records.extend(fetch_t05st01(start, end, stock=stock, sleep_s=max(0.2, float(args.sleep))))
+            records.extend(
+                fetch_t05st01(
+                    start,
+                    end,
+                    stock=stock,
+                    sleep_s=max(0.2, float(args.sleep)),
+                    batch_size=max(1, int(args.batch_size)),
+                    on_batch=None if args.dry_run else on_batch,
+                )
+            )
     except Exception as exc:
         log(f"❌ 抓取失敗：{exc}")
         import traceback
@@ -584,14 +641,7 @@ def main() -> int:
             f"營收={rec.get('revenue')} EPS={rec.get('eps')}"
         )
         return 0
-    try:
-        n = upsert_records(records, db_url)
-    except Exception as exc:
-        log(f"❌ 寫入失敗：{exc}")
-        import traceback
-        traceback.print_exc()
-        return 1
-    log(f"✅ 已 upsert {TABLE_NAME}：{n} 筆")
+    log(f"✅ 已 upsert {TABLE_NAME}：{upserted} 筆")
     return 0
 
 
