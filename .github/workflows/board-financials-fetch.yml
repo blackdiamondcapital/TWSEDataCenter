@@ -1,0 +1,78 @@
+name: Board Financials Fetch
+
+# 觀測站歷史重大訊息 t05st01 → 第31款董事會通過財務報告
+on:
+  schedule:
+    # 台北 18:00、21:30（財報季盤後／晚間公告）
+    - cron: '0 10 * * 1-5'
+    - cron: '30 13 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: '抓最近幾日（未填 from/to 時使用）'
+        required: false
+        default: '3'
+        type: string
+      from_date:
+        description: '起日 YYYY-MM-DD'
+        required: false
+        type: string
+      to_date:
+        description: '迄日 YYYY-MM-DD'
+        required: false
+        type: string
+      stock:
+        description: '公司代號（空白=全市場）'
+        required: false
+        type: string
+      periods:
+        description: '例如 2026Q1 或 2026Q1,2026Q2（優先於 from/to）'
+        required: false
+        type: string
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  fetch-board-financials:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary
+      - name: Parse fields self-test
+        run: python3 -u scripts/fetch_board_financials.py --self-test
+      - name: Fetch t05st01 and upsert
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          PYTHONUNBUFFERED: 1
+          BOARD_FINANCIALS_TABLE: tw_board_financials
+        run: |
+          ARGS=(--allow-empty --sleep 0.55)
+          DAYS="${{ github.event.inputs.days }}"
+          FROM="${{ github.event.inputs.from_date }}"
+          TO="${{ github.event.inputs.to_date }}"
+          STOCK="${{ github.event.inputs.stock }}"
+          PERIODS="${{ github.event.inputs.periods }}"
+          if [ -n "$PERIODS" ]; then
+            ARGS+=(--periods "$PERIODS")
+          elif [ -n "$FROM" ] && [ -n "$TO" ]; then
+            ARGS+=(--from-date "$FROM" --to-date "$TO")
+          elif [ -n "$DAYS" ]; then
+            ARGS+=(--days "$DAYS")
+          else
+            ARGS+=(--days 2)
+          fi
+          if [ -n "$STOCK" ]; then
+            ARGS+=(--stock "$STOCK")
+          fi
+          python3 -u scripts/fetch_board_financials.py "${ARGS[@]}"
+      - name: Notify on failure
+        if: failure()
+        run: echo "❌ 第31款董事會財報抓取失敗  run=${{ github.run_id }}"
