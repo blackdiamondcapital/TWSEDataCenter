@@ -29,12 +29,17 @@ on:
         description: '例如 2026Q1 或 2026Q1,2026Q2（優先於 from/to）'
         required: false
         type: string
+      year:
+        description: '回填整年四季（例如 2025）；與 periods 二擇一，會 Q1→Q4 依序跑避免打爆觀測站'
+        required: false
+        type: string
 
 env:
   TZ: Asia/Taipei
 
 jobs:
   fetch-board-financials:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.year == '')
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -76,3 +81,34 @@ jobs:
       - name: Notify on failure
         if: failure()
         run: echo "❌ 第31款董事會財報抓取失敗  run=${{ github.run_id }}"
+
+  backfill-year:
+    if: github.event_name == 'workflow_dispatch' && inputs.year != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        season: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary
+      - name: Fetch ${{ inputs.year }}Q${{ matrix.season }}
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          PYTHONUNBUFFERED: 1
+          BOARD_FINANCIALS_TABLE: tw_board_financials
+        run: |
+          YEAR="${{ inputs.year }}"
+          YEAR="${YEAR//[^0-9]/}"
+          python3 -u scripts/fetch_board_financials.py --allow-empty --sleep 0.55 --periods "${YEAR}Q${{ matrix.season }}"
+      - name: Notify on failure
+        if: failure()
+        run: echo "❌ ${{ inputs.year }}Q${{ matrix.season }} 董事會財報抓取失敗  run=${{ github.run_id }}"
