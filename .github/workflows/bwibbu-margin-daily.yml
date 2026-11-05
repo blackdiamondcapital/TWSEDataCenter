@@ -1,0 +1,86 @@
+name: Daily BWIBBU and Margin Fetch
+
+on:
+  schedule:
+    # 台北週一至週五 18:30 = UTC 10:30
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      skip_bwibbu:
+        description: '略過本益比／殖利率（BWIBBU）'
+        required: false
+        default: false
+        type: boolean
+      skip_margin:
+        description: '略過融資融券'
+        required: false
+        default: false
+        type: boolean
+      margin_from:
+        description: '融資融券起日（空白=庫內最新日之後）'
+        required: false
+        type: string
+      until:
+        description: '補到哪一天（空白=股價最新交易日）'
+        required: false
+        type: string
+      include_weekend:
+        description: '週末也執行'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: bwibbu-margin-daily
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Taipei
+  PYTHONUNBUFFERED: '1'
+  NEON_MARGIN_TRADES_TABLE: margin_trades
+  MARGIN_TRADES_TABLE: margin_trades
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Backfill BWIBBU and margin_trades
+        env:
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+        run: |
+          if [ -z "$NEON_DATABASE_URL" ]; then
+            echo "未設定 NEON_DATABASE_URL"
+            exit 1
+          fi
+          ARGS=(python3 -u scripts/backfill_bwibbu_margin_to_latest.py --sleep 0.45)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.skip_bwibbu }}" = "true" ]; then
+              ARGS+=(--skip-bwibbu)
+            fi
+            if [ "${{ github.event.inputs.skip_margin }}" = "true" ]; then
+              ARGS+=(--skip-margin)
+            fi
+            if [ -n "${{ github.event.inputs.margin_from }}" ]; then
+              ARGS+=(--margin-from "${{ github.event.inputs.margin_from }}")
+            fi
+            if [ -n "${{ github.event.inputs.until }}" ]; then
+              ARGS+=(--until "${{ github.event.inputs.until }}")
+            fi
+            if [ "${{ github.event.inputs.include_weekend }}" = "true" ]; then
+              ARGS+=(--include-weekend)
+            fi
+          fi
+          echo "Running: ${ARGS[*]}"
+          "${ARGS[@]}"
