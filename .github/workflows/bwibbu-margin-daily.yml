@@ -2,8 +2,10 @@ name: Daily BWIBBU and Margin Fetch
 
 on:
   schedule:
-    # 台北週一至週五 21:30 = UTC 13:30
-    - cron: '30 13 * * 1-5'
+    # 主跑：台北週一至週五 22:00 = UTC 14:00（融資融券約 21:00–21:30 出爐）
+    - cron: '0 14 * * 1-5'
+    # 補跑：台北週二至週六 07:30 = UTC 23:30（吃 GitHub 延遲與週五漏網）
+    - cron: '30 23 * * 1-5'
   workflow_dispatch:
     inputs:
       skip_bwibbu:
