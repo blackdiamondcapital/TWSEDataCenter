@@ -109,13 +109,22 @@ def backfill_margin(stock_api, db, dates: list[date], sleep_seconds: float) -> d
     return {"inserted": inserted, "empty": empty, "failed": failed, "days": len(dates)}
 
 
+def weekday_range(after: date, until: date) -> list[date]:
+    days = []
+    day = after + timedelta(days=1)
+    while day <= until:
+        if day.weekday() < 5:
+            days.append(day)
+        day += timedelta(days=1)
+    return days
+
+
 def run(args: argparse.Namespace) -> int:
     from server import DatabaseManager, stock_api
 
+    # GitHub 週五排程常延到週六凌晨；週末仍應補齊庫內缺的交易日。
     now = datetime.now()
-    if now.weekday() >= 5 and not args.include_weekend:
-        logger.info("週末非交易日，略過（%s）", now.strftime("%Y-%m-%d %H:%M"))
-        return 0
+    logger.info("開始補齊 BWIBBU／融資融券（%s）", now.strftime("%Y-%m-%d %H:%M"))
 
     db = DatabaseManager(use_local=False)
     if not db.connect():
@@ -140,13 +149,13 @@ def run(args: argparse.Namespace) -> int:
         logger.info("股價最新交易日 %s；BWIBBU 庫內 %s；融資融券 庫內 %s", latest, bwibbu_from, margin_from)
 
         if not args.skip_bwibbu:
-            days = trading_dates(cur, bwibbu_from, latest)
+            days = trading_dates(cur, bwibbu_from, latest) or weekday_range(bwibbu_from, latest)
             logger.info("BWIBBU 待補 %d 個交易日", len(days))
             stats = backfill_bwibbu(stock_api, db, days, args.sleep)
             logger.info("BWIBBU 結果 %s", stats)
 
         if not args.skip_margin:
-            days = trading_dates(cur, margin_from, latest)
+            days = trading_dates(cur, margin_from, latest) or weekday_range(margin_from, latest)
             logger.info("融資融券 待補 %d 個交易日", len(days))
             stats = backfill_margin(stock_api, db, days, args.sleep)
             logger.info("融資融券 結果 %s", stats)
@@ -168,7 +177,7 @@ def main() -> int:
     parser.add_argument("--sleep", type=float, default=0.45)
     parser.add_argument("--skip-bwibbu", action="store_true")
     parser.add_argument("--skip-margin", action="store_true")
-    parser.add_argument("--include-weekend", action="store_true", help="週末也執行（預設略過）")
+    parser.add_argument("--include-weekend", action="store_true", help="相容舊參數；週末一律補缺的交易日")
     return run(parser.parse_args())
 
 
