@@ -40,10 +40,12 @@ def main() -> int:
         "t86-daily": "dc-t86",
         "bwibbu-margin-daily": "dc-bwibbu-margin",
         "board-financials-fetch": "dc-board-financials",
-        "monthly-revenue-fetch": "dc-monthly-revenue",
         "quarterly-statements-fetch": "dc-quarterly-statements",
     }
     normalized_workflow = args.workflow.removesuffix(".yml")
+    if normalized_workflow == "monthly-revenue-fetch":
+        print("略過遺留月營收排程監控回報")
+        return 0
     payload = {
         "job_key": job_keys.get(normalized_workflow, normalized_workflow),
         "status": args.status,
