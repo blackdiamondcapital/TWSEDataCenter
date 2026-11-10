@@ -92,6 +92,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Report heartbeat started
+        if: matrix.batch_index == 0
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+          HEARTBEAT_SLOT: ${{ github.event_name == 'schedule' && 'primary' || 'manual' }}
+        run: python3 scripts/report_etl_heartbeat.py --status started --workflow etf-daily-price-fetch --slot "$HEARTBEAT_SLOT"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -132,3 +140,13 @@ jobs:
           path: etf-daily-batch-${{ matrix.batch_index }}.log
           if-no-files-found: ignore
           retention-days: 7
+
+      # 同一 GitHub run 的 matrix shard 共用 run_id；API 以該 key upsert 並合併 metadata。
+      - name: Report heartbeat final
+        if: always()
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+          HEARTBEAT_SLOT: ${{ github.event_name == 'schedule' && 'primary' || 'manual' }}
+          HEARTBEAT_STATUS: ${{ job.status }}
+        run: python3 scripts/report_etl_heartbeat.py --status "$HEARTBEAT_STATUS" --workflow etf-daily-price-fetch --slot "$HEARTBEAT_SLOT"

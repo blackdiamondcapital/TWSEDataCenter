@@ -77,6 +77,13 @@ jobs:
       should_run: ${{ steps.check.outputs.should_run }}
       period: ${{ steps.check.outputs.period }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Report heartbeat started
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+        run: python3 scripts/report_etl_heartbeat.py --status started --workflow quarterly-statements-fetch --slot filing-window
       - name: Check filing-window range
         id: check
         run: |
@@ -126,6 +133,18 @@ jobs:
                   fh.write("should_run=false\n")
                   fh.write("period=\n")
           PY
+      - name: Report heartbeat skipped outside filing window
+        if: always() && steps.check.outcome == 'success' && steps.check.outputs.should_run != 'true'
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+        run: python3 scripts/report_etl_heartbeat.py --status skipped --workflow quarterly-statements-fetch --slot filing-window
+      - name: Report heartbeat gate failure
+        if: always() && steps.check.outcome == 'failure'
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+        run: python3 scripts/report_etl_heartbeat.py --status failure --workflow quarterly-statements-fetch --slot filing-window
 
   scheduled-shards:
     needs: gate
@@ -233,6 +252,32 @@ jobs:
             --to-period "${{ needs.gate.outputs.period }}" \
             --shard-index "${{ matrix.shard_index }}" \
             --shard-count 4
+
+  scheduled-heartbeat-final:
+    needs:
+      - gate
+      - scheduled-shards
+      - scheduled-ratios
+    if: always() && github.event_name == 'schedule' && needs.gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Report heartbeat final
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+          DATA_AS_OF: ${{ needs.gate.outputs.period }}
+          SHARDS_RESULT: ${{ needs.scheduled-shards.result }}
+          RATIOS_RESULT: ${{ needs.scheduled-ratios.result }}
+        run: |
+          STATUS=success
+          if [ "$SHARDS_RESULT" = "cancelled" ] || [ "$RATIOS_RESULT" = "cancelled" ]; then
+            STATUS=cancelled
+          elif [ "$SHARDS_RESULT" != "success" ] || [ "$RATIOS_RESULT" != "success" ]; then
+            STATUS=failure
+          fi
+          python3 scripts/report_etl_heartbeat.py --status "$STATUS" --workflow quarterly-statements-fetch --slot filing-window --data-as-of "$DATA_AS_OF"
 
   manual-fetch:
     if: github.event_name == 'workflow_dispatch'

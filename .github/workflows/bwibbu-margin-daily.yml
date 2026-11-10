@@ -48,6 +48,24 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve heartbeat slot
+        id: heartbeat
+        shell: bash
+        run: |
+          SLOT=manual
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            case "${{ github.event.schedule }}" in
+              "0 14 * * 1-5") SLOT=primary ;;
+              "30 23 * * 1-5") SLOT=catchup ;;
+            esac
+          fi
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+      - name: Report heartbeat started
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+          HEARTBEAT_SLOT: ${{ steps.heartbeat.outputs.slot }}
+        run: python3 scripts/report_etl_heartbeat.py --status started --workflow bwibbu-margin-daily --slot "$HEARTBEAT_SLOT"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
@@ -86,3 +104,11 @@ jobs:
           fi
           echo "Running: ${ARGS[*]}"
           "${ARGS[@]}"
+      - name: Report heartbeat final
+        if: always()
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+          HEARTBEAT_SLOT: ${{ steps.heartbeat.outputs.slot }}
+          HEARTBEAT_STATUS: ${{ job.status }}
+        run: python3 scripts/report_etl_heartbeat.py --status "$HEARTBEAT_STATUS" --workflow bwibbu-margin-daily --slot "$HEARTBEAT_SLOT"

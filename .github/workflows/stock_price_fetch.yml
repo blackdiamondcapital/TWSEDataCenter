@@ -18,6 +18,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Report heartbeat started
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+          HEARTBEAT_SLOT: ${{ github.event_name == 'schedule' && 'primary' || 'manual' }}
+        run: python3 scripts/report_etl_heartbeat.py --status started --workflow stock_price_fetch --slot "$HEARTBEAT_SLOT"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -1024,3 +1031,12 @@ jobs:
           echo "❌ 資料抓取失敗，請檢查日誌"
           echo "Run ID: ${{ github.run_id }}"
           echo "Run Number: ${{ github.run_number }}"
+
+      - name: Report heartbeat final
+        if: always()
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          ETL_REPORT_SECRET: ${{ secrets.ETL_REPORT_SECRET }}
+          HEARTBEAT_SLOT: ${{ github.event_name == 'schedule' && 'primary' || 'manual' }}
+          HEARTBEAT_STATUS: ${{ job.status }}
+        run: python3 scripts/report_etl_heartbeat.py --status "$HEARTBEAT_STATUS" --workflow stock_price_fetch --slot "$HEARTBEAT_SLOT"
